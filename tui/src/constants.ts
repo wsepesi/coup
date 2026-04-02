@@ -26,41 +26,41 @@ type ColorPalette = {
 
 const COLORS_DARK: ColorPalette = {
   bg:            "#111111",
-  border:        "#444444",
-  textDefault:   "#CCCCCC",
-  textDim:       "#666666",
+  border:        "#555555",
+  textDefault:   "#DDDDDD",
+  textDim:       "#888888",
   textBright:    "#FFFFFF",
   you:           "#00FFAA",
-  enemy:         "#CCCCCC",
-  bot:           "#888888",
-  dead:          "#AA0000",
-  coinGain:      "#00BB00",
-  coinLoss:      "#FF4444",
+  enemy:         "#DDDDDD",
+  bot:           "#AAAAAA",
+  dead:          "#CC0000",
+  coinGain:      "#00DD00",
+  coinLoss:      "#FF5555",
   challengeWin:  "#00FF00",
-  challengeFail: "#FF4444",
-  duke:          "#AA00FF",
-  assassin:      "#FF0000",
-  captain:       "#0088FF",
-  ambassador:    "#00CC44",
-  contessa:      "#FF66AA",
+  challengeFail: "#FF5555",
+  duke:          "#FFB020",
+  assassin:      "#FF3333",
+  captain:       "#3399FF",
+  ambassador:    "#00DD55",
+  contessa:      "#FF77BB",
   cursor:        "#FFFF00",
 };
 
 const COLORS_LIGHT: ColorPalette = {
   bg:            "#F5F5F0",
-  border:        "#AAAAAA",
+  border:        "#999999",
   textDefault:   "#222222",
-  textDim:       "#888888",
+  textDim:       "#777777",
   textBright:    "#000000",
   you:           "#007755",
   enemy:         "#333333",
-  bot:           "#555555",
+  bot:           "#444444",
   dead:          "#CC0000",
   coinGain:      "#007700",
   coinLoss:      "#CC0000",
   challengeWin:  "#007700",
   challengeFail: "#CC0000",
-  duke:          "#7700CC",
+  duke:          "#997700",
   assassin:      "#CC0000",
   captain:       "#0055CC",
   ambassador:    "#007733",
@@ -68,7 +68,7 @@ const COLORS_LIGHT: ColorPalette = {
   cursor:        "#CC8800",
 };
 
-export let COLORS: ColorPalette = { ...COLORS_LIGHT };
+export let COLORS: ColorPalette = { ...COLORS_DARK };
 
 export function setTheme(mode: "light" | "dark") {
   Object.assign(COLORS, mode === "dark" ? COLORS_DARK : COLORS_LIGHT);

@@ -11,8 +11,8 @@ import {
   Phase,
   Action,
   actionTarget,
-  actionCategory,
   claimedRole,
+  blockCardType,
   CARD_NAMES,
   CardType,
   renderEvent,
@@ -22,7 +22,7 @@ import {
 import { createBot, resetBotCounter } from "@coup/game-client";
 
 import { computePlayerPositions, getTableCenter, type PlayerPosition } from "./layout.js";
-import { COLORS } from "./constants.js";
+import { COLORS, getCardColors } from "./constants.js";
 import { renderTable } from "./renderer/table.js";
 import { renderCenter } from "./renderer/center.js";
 import { renderHand } from "./renderer/hand.js";
@@ -66,18 +66,26 @@ export async function runGame(
     }
   }
 
-  const history = new HistoryTicker(3);
+  const historyLines = Math.max(3, Math.min(8, Math.floor(h * 0.12)));
+  const history = new HistoryTicker(historyLines);
   let turnCount = 0;
   const eliminationOrder: { seat: number; turn: number }[] = [];
   let prevAlive = new Array(numPlayers).fill(true);
 
+  // Claims tracking: seat → set of claimed card types
+  const claimsMap = new Map<number, Set<CardType>>();
+
+  // Fast-forward: when human is eliminated, optionally skip animations
+  let fastForward = fast;
+  let humanElimPromptShown = false;
+
   // Layout: constrain zones to avoid overlap
-  const tableH = Math.floor(h * 0.6);
+  const tableH = Math.floor(h * 0.55);
   const handH = 7; // "You" label + 5-line card + coins
   const handY = tableH - handH;
   const centerMaxY = handY - 2; // center box must end above the hand
   const historyY = tableH;
-  const historyH = 4;
+  const historyH = historyLines + 1;
   const actionY = historyY + historyH;
   const actionH = h - actionY;
   const positions = computePlayerPositions(numPlayers, w, h, tableH - handH);
@@ -117,8 +125,8 @@ export async function runGame(
     const seedLabel = `seed: ${seedStr}`;
     buf.drawText(seedLabel, w - seedLabel.length - 1, 0, RGBA.fromHex(COLORS.textDim));
 
-    // Table (other players) with turn indicator
-    renderTable(buf, snapshot, positions, humanSeat, targetSeat, playerName);
+    // Table (other players) with turn indicator and claimed cards
+    renderTable(buf, snapshot, positions, humanSeat, targetSeat, playerName, claimsMap);
 
     // Center text
     if (centerText) {
@@ -159,7 +167,24 @@ export async function runGame(
     prevAlive = snapshot.players.map((p) => p.alive);
   }
 
-  function logAction(action: number, seat: number) {
+  function logAction(action: number, seat: number, phase?: Phase) {
+    // Track claims
+    const role = claimedRole(action);
+    if (role != null) {
+      if (!claimsMap.has(seat)) claimsMap.set(seat, new Set());
+      claimsMap.get(seat)!.add(role);
+    }
+    const bCard = blockCardType(action);
+    if (bCard != null) {
+      if (!claimsMap.has(seat)) claimsMap.set(seat, new Set());
+      claimsMap.get(seat)!.add(bCard);
+    }
+
+    // Suppress individual discard logs during exchange — logged as single event after
+    if (phase === Phase.ExchangeDiscard && action >= Action.DiscardSlot0 && action <= Action.DiscardSlot3) {
+      return;
+    }
+
     const target = actionTarget(action);
     const tName = target != null ? playerName(target) : undefined;
     const event = actionToEvent(action, seat, playerName(seat), isHuman(seat), target, tName, target != null ? isHuman(target) : undefined);
@@ -175,13 +200,39 @@ export async function runGame(
 
     const active = snapshot.activePlayer;
 
-    if (active === humanSeat) {
-      const action = await humanTurn(game, snapshot, buf, waitForKey, humanSeat, w, h, actionY, actionH, redraw, actionContextText, playerName, isHuman, history);
-      logAction(action, humanSeat);
+    // Check if human was just eliminated — offer fast-forward
+    const humanAlive = snapshot.players[humanSeat].alive;
+    if (!humanAlive && !humanElimPromptShown) {
+      humanElimPromptShown = true;
+      redraw(snapshot, ["You have been", "eliminated!"]);
+      await sleep(500, false);
+      const promptText = "Press F to fast-forward, or any key to watch";
+      buf.drawText(promptText, Math.floor(w / 2) - Math.floor(promptText.length / 2), actionY + 2, RGBA.fromHex(COLORS.textBright));
+      const key = await waitForKey();
+      if (key.name === "f") {
+        fastForward = true;
+      }
+    }
+
+    if (active === humanSeat && humanAlive) {
+      const hadPending = _pendingExchangeSlot != null;
+      const action = await humanTurn(game, snapshot, buf, waitForKey, humanSeat, w, h, actionY, actionH, redraw, actionContextText, playerName, isHuman, history, _pendingExchangeSlot);
+      if (hadPending) _pendingExchangeSlot = null;
+      logAction(action, humanSeat, snapshot.phase);
       game.step(action);
+      // Log exchange completion when phase transitions away
+      if (snapshot.phase === Phase.ExchangeDiscard) {
+        const newPhase = game.getSnapshot().phase;
+        if (newPhase !== Phase.ExchangeDiscard) {
+          history.push(`You complete Exchange.`);
+        }
+      }
       if (snapshot.phase === Phase.MainAction) turnCount++;
+    } else if (active === humanSeat && !humanAlive) {
+      // Dead human should not be active — skip
+      break;
     } else {
-      await botTurn(game, snapshot, active, agents[active]!, buf, waitForKey, humanSeat, w, h, actionY, actionH, redraw, actionContextText, history, playerName, isHuman, logAction, fast, positions, agents);
+      await botTurn(game, snapshot, active, agents[active]!, buf, waitForKey, humanSeat, w, h, actionY, actionH, redraw, actionContextText, history, playerName, isHuman, logAction, fastForward, positions, agents);
       if (snapshot.phase === Phase.MainAction) turnCount++;
     }
   }
@@ -246,8 +297,14 @@ async function humanTurn(
   playerName: (s: number) => string,
   isHuman: (s: number) => boolean,
   history: HistoryTicker,
+  pendingExchangeSlotRef?: number | null,
 ): Promise<number> {
   const phase = snapshot.phase;
+
+  // If we have a pending second exchange discard, return it immediately
+  if (phase === Phase.ExchangeDiscard && pendingExchangeSlotRef != null) {
+    return pendingExchangeSlotRef;
+  }
 
   if (phase === Phase.MainAction) {
     const options = getActionOptions(snapshot, humanSeat);
@@ -284,7 +341,12 @@ async function humanTurn(
     return chosen.action;
   }
 
-  // Reactive phases (challenge/block/lose card/exchange)
+  // Ambassador Exchange: show all 4 cards, pick 2 to discard
+  if (phase === Phase.ExchangeDiscard) {
+    return await handleExchangeDiscard(buf, waitForKey, snapshot, humanSeat, w, actionY, actionH, redraw, history, h);
+  }
+
+  // Reactive phases (challenge/block/lose card)
   const options = getActionOptions(snapshot, humanSeat);
   if (options.length === 0) return Action.Pass;
 
@@ -307,6 +369,115 @@ async function humanTurn(
 
   return options[result]?.action ?? Action.Pass;
 }
+
+async function handleExchangeDiscard(
+  buf: OptimizedBuffer,
+  waitForKey: () => Promise<KeyEvent>,
+  snapshot: GameSnapshot,
+  humanSeat: number,
+  w: number,
+  actionY: number,
+  actionH: number,
+  redraw: Function,
+  history: HistoryTicker,
+  screenH: number,
+): Promise<number> {
+  const player = snapshot.players[humanSeat];
+  const cardColors = getCardColors();
+
+  interface ExCard { type: CardType; slot: number; source: "yours" | "drawn"; }
+  const allCards: ExCard[] = [];
+  for (let i = 0; i < 2; i++) {
+    if (player.cards[i].alive) {
+      allCards.push({ type: player.cards[i].type, slot: i, source: "yours" });
+    }
+  }
+  if (snapshot.exchangeCards) {
+    allCards.push({ type: snapshot.exchangeCards[0], slot: 2, source: "drawn" });
+    allCards.push({ type: snapshot.exchangeCards[1], slot: 3, source: "drawn" });
+  }
+
+  const selected = new Set<number>();
+  let cursor = 0;
+  const cardW = 11;
+  const gap = 1;
+  const totalW = allCards.length * cardW + (allCards.length - 1) * gap;
+  const startX = Math.floor(w / 2) - Math.floor(totalW / 2);
+
+  function render() {
+    redraw(snapshot, ["Ambassador Exchange", "Select 2 to DISCARD"]);
+
+    // Draw separator
+    buf.drawText("═".repeat(w), 0, actionY, RGBA.fromHex(COLORS.border));
+
+    const header = "Select 2 cards to discard (Space to toggle, Enter to confirm):";
+    buf.drawText(header, Math.floor(w / 2) - Math.floor(header.length / 2), actionY + 1, RGBA.fromHex(COLORS.textDefault));
+
+    const cardY = actionY + 3;
+    for (let i = 0; i < allCards.length; i++) {
+      const card = allCards[i];
+      const cx = startX + i * (cardW + gap);
+      const isCursor = i === cursor;
+      const isSel = selected.has(i);
+
+      const borderColor = isCursor
+        ? RGBA.fromHex(COLORS.textBright)
+        : isSel
+          ? RGBA.fromHex(COLORS.cursor)
+          : RGBA.fromHex(COLORS.border);
+
+      buf.drawBox({
+        x: cx, y: cardY, width: cardW, height: 5,
+        border: true, borderColor,
+        backgroundColor: RGBA.fromHex(COLORS.bg), shouldFill: true,
+      });
+
+      const name = CARD_NAMES[card.type];
+      const cc = RGBA.fromHex(cardColors[card.type]);
+      buf.drawText(name, cx + Math.floor((cardW - name.length) / 2), cardY + 1, cc);
+      const src = `(${card.source})`;
+      buf.drawText(src, cx + Math.floor((cardW - src.length) / 2), cardY + 2, RGBA.fromHex(COLORS.textDim));
+
+      const checkbox = isSel ? "[X]" : "[ ]";
+      const cbColor = isSel ? RGBA.fromHex(COLORS.cursor) : RGBA.fromHex(COLORS.textDim);
+      buf.drawText(checkbox, cx + Math.floor((cardW - 3) / 2), cardY + 3, cbColor);
+    }
+
+    const hint = selected.size === 2
+      ? "Press Enter to confirm"
+      : `Toggle ${2 - selected.size} more card${2 - selected.size !== 1 ? "s" : ""}`;
+    buf.drawText(hint, Math.floor(w / 2) - Math.floor(hint.length / 2), cardY + 6, RGBA.fromHex(COLORS.textDefault));
+
+    // History hint
+    buf.drawText("(H) history", w - 14, actionY + 1, RGBA.fromHex(COLORS.textDim));
+  }
+
+  render();
+
+  while (true) {
+    const key = await waitForKey();
+    if (key.name === "left") cursor = Math.max(0, cursor - 1);
+    else if (key.name === "right") cursor = Math.min(allCards.length - 1, cursor + 1);
+    else if (key.name === " " || key.name === "space") {
+      if (selected.has(cursor)) {
+        selected.delete(cursor);
+      } else if (selected.size < 2) {
+        selected.add(cursor);
+      }
+    } else if (key.name === "return" && selected.size === 2) {
+      const slots = Array.from(selected).map(i => allCards[i].slot).sort((a, b) => a - b);
+      // Return first discard, store second via module-level side channel
+      _pendingExchangeSlot = Action.DiscardSlot0 + slots[1];
+      return Action.DiscardSlot0 + slots[0];
+    } else if (key.name === "h") {
+      await showFullHistory(buf, waitForKey, history, w, screenH);
+    }
+    render();
+  }
+}
+
+// Module-level side channel for exchange second discard
+let _pendingExchangeSlot: number | null = null;
 
 async function selectFromGrid(
   buf: OptimizedBuffer,
@@ -398,7 +569,7 @@ async function botTurn(
   history: HistoryTicker,
   playerName: (s: number) => string,
   isHuman: (s: number) => boolean,
-  logAction: (a: number, s: number) => void,
+  logAction: (a: number, s: number, p?: Phase) => void,
   fast: boolean,
   positions: PlayerPosition[],
   agents: (Agent | null)[],
@@ -418,7 +589,7 @@ async function botTurn(
   const mask = game.validMask;
   const action = await agent.chooseAction(obs, mask);
 
-  logAction(action, botSeat);
+  logAction(action, botSeat, snapshot.phase);
   game.step(action);
 
   // Show result
@@ -436,22 +607,39 @@ async function botTurn(
     if (currentSnap.phase === Phase.MainAction) break;
 
     if (currentActive === humanSeat) {
+      const hadPending = _pendingExchangeSlot != null;
       const humanAction = await humanTurn(
-        game, currentSnap, buf, waitForKey, humanSeat, w, h, actionY, actionH, redraw, actionContextText, playerName, isHuman, history,
+        game, currentSnap, buf, waitForKey, humanSeat, w, h, actionY, actionH, redraw, actionContextText, playerName, isHuman, history, _pendingExchangeSlot,
       );
-      logAction(humanAction, humanSeat);
+      if (hadPending) _pendingExchangeSlot = null;
+      logAction(humanAction, humanSeat, currentSnap.phase);
       game.step(humanAction);
+      // Log exchange completion
+      if (currentSnap.phase === Phase.ExchangeDiscard) {
+        const np = game.getSnapshot().phase;
+        if (np !== Phase.ExchangeDiscard) {
+          history.push(`You complete Exchange.`);
+        }
+      }
       redraw(game.getSnapshot());
       await sleep(150, fast);
     } else {
       // Another bot responds
       const respAgent = agents[currentActive];
       if (!respAgent) break;
+      const prevPhase = currentSnap.phase;
       const obs2 = game.observe(currentActive);
       const mask2 = game.validMask;
       const action2 = await respAgent.chooseAction(obs2, mask2);
-      logAction(action2, currentActive);
+      logAction(action2, currentActive, currentSnap.phase);
       game.step(action2);
+      // Log exchange completion for bots
+      if (prevPhase === Phase.ExchangeDiscard) {
+        const np = game.getSnapshot().phase;
+        if (np !== Phase.ExchangeDiscard) {
+          history.push(`${playerName(currentActive)} completes Exchange.`);
+        }
+      }
       redraw(game.getSnapshot());
       await sleep(150, fast);
     }

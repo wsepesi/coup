@@ -18,8 +18,8 @@ export function computePlayerPositions(
   const positions: PlayerPosition[] = [];
   const cx = Math.floor(termWidth / 2);
   const cy = Math.floor(tableHeight / 2);
-  const rx = Math.floor(termWidth * 0.35); // horizontal radius
-  const ry = Math.floor(tableHeight * 0.35); // vertical radius
+  const rx = Math.floor(termWidth * 0.30); // horizontal radius
+  const ry = Math.floor(tableHeight * 0.30); // vertical radius
 
   // Predefined angle layouts per player count
   // Seat 0 at bottom (angle = PI/2 from top, or 270° in standard, we use radians from top going clockwise)
@@ -130,8 +130,8 @@ export function getTableCenter(termWidth: number, tableHeight: number) {
 
 // Player card display width
 export const PLAYER_DISPLAY_WIDTH = 22;
-export const PLAYER_DISPLAY_HEIGHT = 3;
+export const PLAYER_DISPLAY_HEIGHT = 4;
 export const HAND_DISPLAY_WIDTH = 24;
 export const HAND_DISPLAY_HEIGHT = 5;
-export const CENTER_BOX_WIDTH = 27;
+export const CENTER_BOX_WIDTH = 38;
 export const CENTER_BOX_HEIGHT = 7;

@@ -2,9 +2,9 @@
 
 import { OptimizedBuffer, RGBA } from "@opentui/core";
 import type { GameSnapshot } from "@coup/game-client";
-import { describeAction, actionTarget } from "@coup/game-client";
+import { describeAction, actionTarget, claimedRole, CardType } from "@coup/game-client";
 import type { PlayerPosition } from "../layout.js";
-import { COLORS, CARD_ABBREV } from "../constants.js";
+import { COLORS, CARD_ABBREV, getCardColors } from "../constants.js";
 import { PLAYER_DISPLAY_WIDTH } from "../layout.js";
 
 const col = (hex: string) => RGBA.fromHex(hex);
@@ -16,6 +16,7 @@ export function renderTable(
   humanSeat: number,
   targetSeat?: number,
   playerNames?: (seat: number) => string,
+  claimsMap?: Map<number, Set<CardType>>,
 ): void {
   for (const pos of positions) {
     if (pos.seat === humanSeat) continue;
@@ -85,13 +86,28 @@ export function renderTable(
     const coinStr = ` ${player.coins}●`;
     buffer.drawText(coinStr, px + cardStr.length, cardLine, col(COLORS.textDefault));
 
-    // --- Line 3: turn action indicator ---
+    // --- Line 3: claimed cards ---
+    const claims = claimsMap?.get(pos.seat);
+    if (claims && claims.size > 0) {
+      const cardColors = getCardColors();
+      let claimX = px;
+      for (const cardType of claims) {
+        const abbrev = CARD_ABBREV[cardType] ?? "??";
+        buffer.drawText(abbrev, claimX, py + 2, col(cardColors[cardType] ?? COLORS.textDim));
+        claimX += abbrev.length + 1;
+      }
+    }
+
+    // --- Line 4: turn action indicator ---
     if (isTurnPlayer && !isDead && snapshot.pendingAction >= 0) {
       const target = actionTarget(snapshot.pendingAction);
       const targetName = target != null && playerNames ? playerNames(target) : undefined;
       const actionDesc = describeShortAction(snapshot.pendingAction, targetName);
       if (actionDesc) {
-        buffer.drawText(`→ ${actionDesc}`, px, py + 2, col(COLORS.cursor));
+        const role = claimedRole(snapshot.pendingAction);
+        const arrowColor = role != null ? col(getCardColors()[role]) : col(COLORS.textBright);
+        buffer.drawText("→", px, py + 3, arrowColor);
+        buffer.drawText(` ${actionDesc}`, px + 1, py + 3, col(COLORS.textBright));
       }
     }
   }

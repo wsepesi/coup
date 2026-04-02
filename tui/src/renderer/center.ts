@@ -27,12 +27,33 @@ export function renderCenter(
     shouldFill: true,
   });
 
-  // Draw each text line centered within the box
+  // Word-wrap and draw each text line centered within the box
   const innerWidth = CENTER_BOX_WIDTH - 2;
-  const startY = by + 1 + Math.floor((CENTER_BOX_HEIGHT - 2 - text.length) / 2);
+  const wrapped: string[] = [];
+  for (const line of text) {
+    if (line.length <= innerWidth) {
+      wrapped.push(line);
+    } else {
+      const words = line.split(" ");
+      let current = "";
+      for (const word of words) {
+        if (current.length + (current ? 1 : 0) + word.length > innerWidth) {
+          if (current) wrapped.push(current);
+          current = word.slice(0, innerWidth);
+        } else {
+          current = current ? current + " " + word : word;
+        }
+      }
+      if (current) wrapped.push(current);
+    }
+  }
 
-  for (let i = 0; i < text.length; i++) {
-    const line = text[i];
+  const maxLines = CENTER_BOX_HEIGHT - 2;
+  const lines = wrapped.slice(0, maxLines);
+  const startY = by + 1 + Math.floor((CENTER_BOX_HEIGHT - 2 - lines.length) / 2);
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const tx = bx + 1 + Math.floor((innerWidth - line.length) / 2);
     buffer.drawText(line, tx, startY + i, col(COLORS.textDefault));
   }

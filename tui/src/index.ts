@@ -10,7 +10,7 @@ import { setTheme, MIN_TERM_WIDTH, MIN_TERM_HEIGHT } from "./constants.js";
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
-  if (args.dark) setTheme("dark");
+  if (args.light) setTheme("light");
 
   const cols = process.stdout.columns || 100;
   const rows = process.stdout.rows || 30;
@@ -120,7 +120,7 @@ interface CliArgs {
   difficulty?: "easy" | "medium" | "hard";
   seed?: string;
   fast?: boolean;
-  dark?: boolean;
+  light?: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -134,7 +134,7 @@ function parseArgs(argv: string[]): CliArgs {
       case "--difficulty": args.difficulty = next as any; i++; break;
       case "--seed": args.seed = next; i++; break;
       case "--fast": args.fast = true; break;
-      case "--dark": args.dark = true; break;
+      case "--light": args.light = true; break;
     }
   }
   return args;
