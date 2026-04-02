@@ -59,7 +59,7 @@ export class HistoryTicker {
     buffer.clear(bg);
 
     // Title bar
-    const title = " History (↑↓ scroll, H/ESC close) ";
+    const title = " History (↑↓ scroll, C copy, H/ESC close) ";
     buffer.drawText("═".repeat(width), 0, 0, borderColor, bg);
     buffer.drawText(title, Math.floor((width - title.length) / 2), 0, brightColor, bg);
 
@@ -93,5 +93,9 @@ export class HistoryTicker {
 
   get length(): number {
     return this.entries.length;
+  }
+
+  getAllEntries(): string[] {
+    return this.entries.slice();
   }
 }

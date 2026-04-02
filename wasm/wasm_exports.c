@@ -28,3 +28,6 @@ int wasm_gamelog_struct_size(void) { return (int)sizeof(GameLog); }
 int wasm_history_struct_size(void) { return (int)sizeof(HistoryBuffer); }
 int wasm_textactionmap_struct_size(void) { return (int)sizeof(TextActionMap); }
 int wasm_chanceoutcome_struct_size(void) { return (int)sizeof(ChanceOutcome); }
+
+void wasm_set_refund_on_challenge(Game *g, int flag) { game_set_refund_on_challenge(g, flag); }
+int wasm_get_refund_on_challenge(const Game *g) { return game_get_refund_on_challenge(g); }

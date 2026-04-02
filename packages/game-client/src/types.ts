@@ -72,7 +72,10 @@ export interface GameSnapshot {
   winner: number;
   validMask: number;
   deckSize: number;
+  deckCards?: Record<CardType, number>;
   exchangeCards?: [CardType, CardType];
+  blocker?: number;
+  blockCard?: CardType;
 }
 
 // Action category helpers

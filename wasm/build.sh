@@ -63,6 +63,8 @@ emcc "$C_DIR/coup_core.c" "$C_DIR/text_render.c" "$SCRIPT_DIR/wasm_exports.c" \
     "_wasm_history_struct_size",
     "_wasm_textactionmap_struct_size",
     "_wasm_chanceoutcome_struct_size",
+    "_wasm_set_refund_on_challenge",
+    "_wasm_get_refund_on_challenge",
     "_malloc",
     "_free"
   ]' \

@@ -58,6 +58,9 @@ export async function runGame(
     : config.seat;
 
   const game = new CoupGame(numPlayers, seed);
+  if (config.houseRules && !config.houseRules.refundOnChallenge) {
+    game.setRefundOnChallenge(false);
+  }
 
   const agents: (Agent | null)[] = [];
   for (let i = 0; i < numPlayers; i++) {
@@ -120,6 +123,7 @@ export async function runGame(
   let fastForward = fast;
   if (fast) speedIdx = SPEED_LEVELS.length - 1;
   let humanElimPromptShown = false;
+  let godMode = false;
   const spectating = humanSeat < 0 || humanSeat >= numPlayers;
 
   function currentSpeedName(): string {
@@ -136,6 +140,7 @@ export async function runGame(
       if (k.name === "f") { speedIdx = SPEED_LEVELS.length - 1; fastForward = true; }
       else if (k.name === "," || k.name === "<") { speedIdx = Math.max(0, speedIdx - 1); }
       else if (k.name === "." || k.name === ">") { speedIdx = Math.min(SPEED_LEVELS.length - 1, speedIdx + 1); }
+      else if (k.name === "g") { godMode = !godMode; }
     });
     await Promise.race([timeout, keyPress]);
   }
@@ -198,7 +203,7 @@ export async function runGame(
     buf.drawText(seedLabel, w - seedLabel.length - 1, 0, RGBA.fromHex(COLORS.textDim));
 
     // Table (other players) with turn indicator and claimed cards
-    renderTable(buf, snapshot, positions, humanSeat, targetSeat, playerName, claimsMap, lastActionMap);
+    renderTable(buf, snapshot, positions, humanSeat, targetSeat, playerName, claimsMap, lastActionMap, godMode);
 
     // Center text
     if (centerText) {
@@ -212,6 +217,21 @@ export async function runGame(
     const trackerY = Math.max(tableTop, handY - trackerH);
     if (trackerH >= 3 && trackerY >= tableTop) {
       renderDeckTracker(buf, snapshot.deckSize, deckEvents, trackerX, trackerY, trackerW, trackerH);
+    }
+
+    // God mode: deck composition
+    if (godMode && snapshot.deckCards) {
+      const cardColors = getCardColors();
+      const deckY = (trackerH >= 3 && trackerY >= tableTop) ? trackerY + trackerH : handY - 2;
+      let dx = trackerX;
+      buf.drawText("Deck:", dx, deckY, RGBA.fromHex(COLORS.textBright));
+      dx += 6;
+      for (const ct of [CardType.Duke, CardType.Assassin, CardType.Captain, CardType.Ambassador, CardType.Contessa]) {
+        const abbrev = CARD_ABBREV[ct];
+        const count = snapshot.deckCards[ct] ?? 0;
+        buf.drawText(`${abbrev}:${count}`, dx, deckY, RGBA.fromHex(cardColors[ct]));
+        dx += abbrev.length + 2 + 1; // abbrev + ":N" + space
+      }
     }
 
     // Your hand
@@ -246,8 +266,12 @@ export async function runGame(
     // Spectator hint with speed indicator
     if (spectating || (!spectating && !snapshot.players[humanSeat]?.alive)) {
       const speed = `[${currentSpeedName()}]`;
-      const hint = fastForward ? "" : `< > speed ${speed}   (F) skip to end   (H) history`;
+      const godLabel = godMode ? " [GOD]" : "";
+      const hint = fastForward ? "" : `< > speed ${speed}   (F) skip to end   (G) god mode${godLabel}   (H) history`;
       buf.drawText(hint, Math.floor(w / 2) - Math.floor(hint.length / 2), actionY + 2, RGBA.fromHex(COLORS.textDim));
+      if (godMode && !fastForward) {
+        buf.drawText("[GOD]", Math.floor(w / 2) - Math.floor(hint.length / 2) + hint.indexOf("[GOD]"), actionY + 2, RGBA.fromHex(COLORS.cursor));
+      }
     }
   }
 
@@ -305,15 +329,23 @@ export async function runGame(
     flushPasses();
 
     let target = actionTarget(action);
-    // For challenges, the target is the turn player (the one who made the claim)
+    // For challenges, determine target based on phase
     let challengedCard: CardType | undefined;
     if (action === Action.Challenge && target == null) {
       const snap = game.getSnapshot();
-      target = snap.turnPlayer;
-      const claimed = claimedRole(snap.pendingAction);
-      if (claimed != null) {
-        challengedCard = claimed;
-        pendingChallenge = { challenger: seat, claimant: snap.turnPlayer, claimedCard: claimed };
+      if (snap.phase === Phase.ChallengeBlock && snap.blocker != null && snap.blockCard != null) {
+        // Challenging the block — target is the blocker, card is the block card
+        target = snap.blocker;
+        challengedCard = snap.blockCard;
+        pendingChallenge = { challenger: seat, claimant: snap.blocker, claimedCard: snap.blockCard };
+      } else {
+        // Challenging the original action — target is the turn player
+        target = snap.turnPlayer;
+        const claimed = claimedRole(snap.pendingAction);
+        if (claimed != null) {
+          challengedCard = claimed;
+          pendingChallenge = { challenger: seat, claimant: snap.turnPlayer, claimedCard: claimed };
+        }
       }
     }
 
@@ -410,7 +442,7 @@ export async function runGame(
 
   trackEliminations(game.getSnapshot());
 
-  return showGameOver(buf, waitForKey, game, humanSeat, seedStr, turnCount, eliminationOrder, playerName, w, h);
+  return showGameOver(buf, waitForKey, game, humanSeat, seedStr, turnCount, eliminationOrder, playerName, w, h, history);
 }
 
 // Build descriptive header text for reactive phases
@@ -760,6 +792,24 @@ async function showFullHistory(
     if (name === "h" || name === "escape") return;
     if (name === "up") scrollOffset = Math.max(0, scrollOffset - 1);
     else if (name === "down") scrollOffset++;
+    else if (name === "c") {
+      const text = history.getAllEntries().map((e, i) => `${i + 1}. ${e}`).join("\n");
+      try {
+        const cmd = process.platform === "darwin" ? "pbcopy" : process.platform === "win32" ? "clip" : "xclip -selection clipboard";
+        const proc = Bun.spawn(cmd.split(" "), { stdin: "pipe" });
+        proc.stdin.write(text);
+        proc.stdin.end();
+        await proc.exited;
+        // Flash "Copied!" feedback
+        const bg = RGBA.fromHex(COLORS.bg);
+        const bright = RGBA.fromHex(COLORS.textBright);
+        const msg = " Copied to clipboard! ";
+        buf.drawText(msg, Math.floor((w - msg.length) / 2), Math.floor(h / 2), bright, bg);
+        await new Promise(r => setTimeout(r, 800));
+      } catch {
+        // silently ignore if clipboard not available
+      }
+    }
     render();
   }
 }
@@ -891,6 +941,7 @@ async function showGameOver(
   playerName: (s: number) => string,
   w: number,
   h: number,
+  history: HistoryTicker,
 ): Promise<GameOverChoice> {
   const winner = game.winner;
 
@@ -921,6 +972,10 @@ async function showGameOver(
     if (name === "r") return "replay";
     if (name === "n") return "new";
     if (name === "q") return "quit";
+    if (name === "h") {
+      await showFullHistory(buf, waitForKey, history, w, h);
+      renderGameOver(buf, result, w, h);
+    }
   }
 }
 

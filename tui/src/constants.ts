@@ -45,7 +45,7 @@ const COLORS_DARK: ColorPalette = {
   captain:       "#3399FF",
   ambassador:    "#00DD55",
   contessa:      "#FF77BB",
-  cursor:        "#FFFF00",
+  cursor:        "#CCCCCC",
 };
 
 const COLORS_LIGHT: ColorPalette = {
@@ -68,7 +68,7 @@ const COLORS_LIGHT: ColorPalette = {
   captain:       "#0055CC",
   ambassador:    "#007733",
   contessa:      "#CC3377",
-  cursor:        "#B05000",
+  cursor:        "#444444",
 };
 
 export let COLORS: ColorPalette = { ...COLORS_LIGHT };

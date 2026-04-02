@@ -79,6 +79,14 @@ export function actionTarget(action: number): number | null {
   return null;
 }
 
+export function claimedRole(action: number): number | null {
+  if (action === ACTION_TAX) return DUKE;
+  if (action === ACTION_EXCHANGE) return AMBASSADOR;
+  if (action >= ACTION_STEAL_P0 && action <= ACTION_STEAL_P0 + 5) return CAPTAIN;
+  if (action >= ACTION_ASSASSINATE_P0 && action <= ACTION_ASSASSINATE_P0 + 5) return ASSASSIN;
+  return null;
+}
+
 export function actionLabel(action: number, playerNames: string[]): string {
   if (action === ACTION_INCOME) return "Income";
   if (action === ACTION_FOREIGN_AID) return "Foreign Aid";
@@ -117,6 +125,10 @@ export function actionLabel(action: number, playerNames: string[]): string {
 
 export type BotDifficulty = "easy" | "medium";
 
+export interface HouseRules {
+  refundOnChallenge?: boolean;
+}
+
 export interface PlayerSlot {
   username: string;
   seat: number;
@@ -127,16 +139,18 @@ export interface PlayerSlot {
 
 // Client -> Server messages
 export type ClientMessage =
-  | { type: "create"; username: string; numPlayers: number; numBots: number; botDifficulty: BotDifficulty }
+  | { type: "create"; username: string; numPlayers: number; numBots: number; botDifficulty: BotDifficulty; houseRules?: HouseRules }
   | { type: "join"; username: string; code: string }
   | { type: "quick_play"; username: string }
   | { type: "action"; action: number }
-  | { type: "start" };
+  | { type: "start" }
+  | { type: "house_rules"; houseRules: HouseRules }
+  | { type: "forfeit" };
 
 // Server -> Client messages
 export type ServerMessage =
   | { type: "room_created"; code: string }
-  | { type: "lobby"; code: string; players: PlayerSlot[] }
+  | { type: "lobby"; code: string; players: PlayerSlot[]; houseRules?: HouseRules; isHost?: boolean }
   | {
       type: "state";
       yourSeat: number;
@@ -154,12 +168,21 @@ export type ServerMessage =
       isYourTurn: boolean;
       availableActions: { id: number; label: string }[];
       history: { text: string; turn: number }[];
+      claims: Record<number, string[]>;
       context?: string;
       pendingAction?: number;
       deckSize: number;
     }
-  | { type: "game_over"; winner: number; winnerName: string; finalStandings: { seat: number; name: string; alive: boolean }[] }
-  | { type: "error"; message: string };
+  | {
+      type: "game_over";
+      winner: number;
+      winnerName: string;
+      finalStandings: { seat: number; name: string; alive: boolean; eliminatedTurn?: number }[];
+      totalTurns: number;
+      history: { text: string; turn: number }[];
+    }
+  | { type: "error"; message: string }
+  | { type: "forfeited"; by: string };
 
 // ---- Env type ----
 export interface Env {

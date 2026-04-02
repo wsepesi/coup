@@ -1,9 +1,10 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { useParams, useSearchParams, useRouter } from "next/navigation";
 import { useWebSocket } from "@/lib/ws";
-import type { ServerMessage, LobbyPlayer } from "@/lib/types";
+import { useKeyboard } from "@/hooks/useKeyboard";
+import type { ServerMessage, LobbyPlayer, ClientMessage, HouseRules } from "@/lib/types";
 
 export default function LobbyPage() {
   const params = useParams();
@@ -15,16 +16,32 @@ export default function LobbyPage() {
     rawCode === "new" ? "" : rawCode
   );
   const [players, setPlayers] = useState<LobbyPlayer[]>([]);
+  const [houseRules, setHouseRules] = useState<HouseRules>({ refundOnChallenge: true });
   const [error, setError] = useState<string | null>(null);
   const [isHost, setIsHost] = useState(false);
   const [phase, setPhase] = useState<"matchmaker" | "game">(
     rawCode === "new" ? "matchmaker" : "game"
   );
-  const [joined, setJoined] = useState(false);
+  // Store all search params in state/refs so they survive the URL rewrite from matchmaker
+  const [username] = useState(() =>
+    searchParams.get("username")
+    ?? (typeof window !== "undefined" ? localStorage.getItem("coup_username") : null)
+    ?? "anonymous"
+  );
+  const [action] = useState(() => searchParams.get("action"));
+  const initParams = useRef({
+    numPlayers: Number(searchParams.get("numPlayers") ?? 6),
+    numBots: Number(searchParams.get("numBots") ?? 0),
+    botDifficulty: (searchParams.get("botDifficulty") ?? "medium") as "easy" | "medium",
+  });
 
-  const username = searchParams.get("username") ?? "anonymous";
-  const action = searchParams.get("action");
-  const autoStart = searchParams.get("autoStart") === "true";
+  // Timeout for matchmaker phase
+  const [matchmakerTimedOut, setMatchmakerTimedOut] = useState(false);
+  useEffect(() => {
+    if (phase !== "matchmaker") return;
+    const timer = setTimeout(() => setMatchmakerTimedOut(true), 8000);
+    return () => clearTimeout(timer);
+  }, [phase]);
 
   // Matchmaker connection
   const onMatchmakerMessage = useCallback((msg: ServerMessage) => {
@@ -34,7 +51,6 @@ export default function LobbyPage() {
         setIsHost(true);
         window.history.replaceState(null, "", `/lobby/${msg.code}`);
         setPhase("game");
-        setJoined(false);
         break;
       case "error":
         setError(msg.message);
@@ -46,27 +62,24 @@ export default function LobbyPage() {
     path: "/ws/matchmaker",
     enabled: phase === "matchmaker",
     onMessage: onMatchmakerMessage,
+    onConnect: useCallback((send: (msg: ClientMessage) => void) => {
+      if (action === "create") {
+        send({
+          type: "create",
+          username,
+          ...initParams.current,
+        });
+      }
+    }, [action, username]),
   });
-
-  useEffect(() => {
-    if (phase !== "matchmaker" || matchmaker.status !== "connected" || joined) return;
-    if (action === "create") {
-      matchmaker.send({
-        type: "create",
-        username,
-        numPlayers: Number(searchParams.get("numPlayers") ?? 6),
-        numBots: Number(searchParams.get("numBots") ?? 0),
-        botDifficulty: (searchParams.get("botDifficulty") ?? "medium") as "easy" | "medium",
-      });
-    }
-    setJoined(true);
-  }, [phase, matchmaker.status, joined, action, username, searchParams, matchmaker.send]);
 
   // Game room connection
   const onGameMessage = useCallback((msg: ServerMessage) => {
     switch (msg.type) {
       case "lobby":
         setPlayers(msg.players);
+        if (msg.houseRules) setHouseRules(msg.houseRules);
+        if (msg.isHost != null) setIsHost(msg.isHost);
         break;
       case "state":
         router.push(`/game/${roomCode || rawCode}`);
@@ -78,39 +91,31 @@ export default function LobbyPage() {
   }, [roomCode, rawCode, router]);
 
   const gameWsCode = roomCode || (rawCode !== "new" ? rawCode : "");
+  const gameJoined = useRef(false);
   const game = useWebSocket({
     path: `/ws/game/${gameWsCode}`,
     enabled: phase === "game" && !!gameWsCode,
     onMessage: onGameMessage,
+    onConnect: useCallback((send: (msg: ClientMessage) => void) => {
+      send({ type: "join", username, code: gameWsCode });
+      gameJoined.current = true;
+    }, [username, gameWsCode]),
   });
 
-  const gameJoined = useRef(false);
-  useEffect(() => {
-    if (phase !== "game" || game.status !== "connected" || gameJoined.current) return;
-    game.send({ type: "join", username, code: gameWsCode });
-    gameJoined.current = true;
-  }, [phase, game.status, username, gameWsCode, game.send]);
 
-  const numBots = Number(searchParams.get("numBots") ?? 0);
-  const isBotGame = numBots > 0 && autoStart;
-
-  // Auto-start for bot games once we've joined
-  const autoStarted = useRef(false);
-  useEffect(() => {
-    if (autoStart && isHost && game.status === "connected" && gameJoined.current && !autoStarted.current) {
-      // Small delay to ensure join message is processed
-      const timer = setTimeout(() => {
-        game.send({ type: "start" });
-        autoStarted.current = true;
-      }, 300);
-      return () => clearTimeout(timer);
-    }
-  }, [autoStart, isHost, game.status, game.send]);
-
-  const handleStart = () => game.send({ type: "start" });
+  const handleStart = useCallback(() => game.send({ type: "start" }), [game]);
   const copyCode = () => { if (roomCode) navigator.clipboard.writeText(roomCode); };
 
-  const humanCount = players.filter(p => !p.isBot).length;
+  // Keyboard: Enter to start, Escape to leave
+  useKeyboard(
+    {
+      Enter: () => { if (isHost && players.length >= 1) handleStart(); },
+      Escape: () => router.push("/"),
+    },
+    [isHost, players.length, handleStart, router],
+  );
+
+  const humanCount = Math.max(1, players.filter(p => !p.isBot).length);
   const botCount = players.filter(p => p.isBot).length;
 
   return (
@@ -125,6 +130,26 @@ export default function LobbyPage() {
               copy
             </button>
           </div>
+        ) : matchmakerTimedOut ? (
+          <div className="space-y-2">
+            <span className="text-dead">Failed to create room.</span>
+            <div className="flex gap-3 justify-center">
+              <button
+                onClick={() => { setMatchmakerTimedOut(false); window.location.reload(); }}
+                className="text-text-dim hover:text-text-default text-xs border border-border-term px-2 py-0.5"
+              >
+                retry
+              </button>
+              <button
+                onClick={() => router.push("/")}
+                className="text-text-dim hover:text-text-default text-xs border border-border-term px-2 py-0.5"
+              >
+                back
+              </button>
+            </div>
+          </div>
+        ) : matchmaker.status === "reconnecting" ? (
+          <span className="text-text-dim">Connection lost. Retrying...</span>
         ) : (
           <span className="text-text-dim">Creating room...</span>
         )}
@@ -165,6 +190,41 @@ export default function LobbyPage() {
         )}
       </div>
 
+      {/* House Rules */}
+      <div className="w-full max-w-md border border-border-term mb-4">
+        <div className="border-b border-border-term px-3 py-1 text-text-dim text-xs">
+          {"// "}house rules
+        </div>
+        <div className="px-3 py-2">
+          <label className="flex items-center justify-between text-sm">
+            <span className="text-text-default">Refund coins on challenge</span>
+            {isHost ? (
+              <button
+                onClick={() => {
+                  const updated = { ...houseRules, refundOnChallenge: !houseRules.refundOnChallenge };
+                  setHouseRules(updated);
+                  game.send({ type: "house_rules", houseRules: updated });
+                }}
+                className={`px-2 py-0.5 text-xs border transition-colors ${
+                  houseRules.refundOnChallenge
+                    ? "border-you text-you"
+                    : "border-border-term text-text-dim"
+                }`}
+              >
+                {houseRules.refundOnChallenge ? "ON" : "OFF"}
+              </button>
+            ) : (
+              <span className={`text-xs ${houseRules.refundOnChallenge ? "text-you" : "text-text-dim"}`}>
+                {houseRules.refundOnChallenge ? "ON" : "OFF"}
+              </span>
+            )}
+          </label>
+          <p className="text-text-dim text-xs mt-1">
+            Refund coins when action claim is successfully challenged (official rule)
+          </p>
+        </div>
+      </div>
+
       {/* Host controls */}
       <div className="w-full max-w-md space-y-2">
         {isHost && (
@@ -180,7 +240,7 @@ export default function LobbyPage() {
           onClick={() => router.push("/")}
           className="w-full text-text-dim hover:text-text-default text-sm"
         >
-          {"< leave"}
+          {"< leave"} <span className="text-text-dim text-xs">(ESC)</span>
         </button>
       </div>
     </div>

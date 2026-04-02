@@ -3,7 +3,7 @@
 import { CliRenderer, resolveRenderLib, RGBA } from "@opentui/core";
 import { FrameBufferRenderable } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
-import { SetupScreen, showRulesScreen, type GameConfig } from "./setup.js";
+import { SetupScreen, showRulesScreen, showExtrasScreen, type GameConfig } from "./setup.js";
 import { runGame } from "./game-loop.js";
 import { setTheme, MIN_TERM_WIDTH, MIN_TERM_HEIGHT } from "./constants.js";
 
@@ -73,6 +73,7 @@ async function main() {
         seat: args.seat ?? 0,
         difficulty: args.difficulty ?? "medium",
         seed: args.seed ?? "",
+        houseRules: { refundOnChallenge: true },
       };
     } else {
       config = await showSetup(fb, waitForKey, cols, rows);
@@ -120,6 +121,11 @@ async function showSetup(
     }
     if (result === "rules") {
       await showRulesScreen(buf, waitForKey, width, height);
+      render();
+      continue;
+    }
+    if (result === "extras") {
+      await showExtrasScreen(buf, waitForKey, width, height, setup);
       render();
       continue;
     }

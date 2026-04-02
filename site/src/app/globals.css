@@ -13,7 +13,7 @@
   --coin-loss: #CC0000;
   --challenge-win: #007700;
   --challenge-fail: #CC0000;
-  --cursor: #B05000;
+  --cursor: #444444;
 
   --role-duke: #997700;
   --role-assassin: #CC0000;
@@ -35,7 +35,7 @@
   --color-coin-loss: #CC0000;
   --color-challenge-win: #007700;
   --color-challenge-fail: #CC0000;
-  --color-cursor: #B05000;
+  --color-cursor: #444444;
   --color-role-duke: #997700;
   --color-role-assassin: #CC0000;
   --color-role-captain: #0055CC;
@@ -89,8 +89,27 @@ html, body {
 
 /* Glow effect for action buttons */
 @keyframes glow-pulse {
-  0%, 100% { box-shadow: 0 0 4px rgba(176, 80, 0, 0.2); }
-  50% { box-shadow: 0 0 12px rgba(176, 80, 0, 0.5); }
+  0%, 100% { box-shadow: 0 0 4px rgba(68, 68, 68, 0.2); }
+  50% { box-shadow: 0 0 12px rgba(68, 68, 68, 0.5); }
+}
+
+/* Braille spinner for bot thinking */
+@keyframes spin-braille {
+  0% { content: "⠋"; }
+  10% { content: "⠙"; }
+  20% { content: "⠹"; }
+  30% { content: "⠸"; }
+  40% { content: "⠼"; }
+  50% { content: "⠴"; }
+  60% { content: "⠦"; }
+  70% { content: "⠧"; }
+  80% { content: "⠇"; }
+  90% { content: "⠏"; }
+}
+
+.animate-spin-slow {
+  display: inline-block;
+  animation: spin-braille 1s step-end infinite;
 }
 
 /* Scrollbar styling */

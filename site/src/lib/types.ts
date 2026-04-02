@@ -1,5 +1,9 @@
 // ── Server → Client messages ──────────────────────────────────────
 
+export interface HouseRules {
+  refundOnChallenge?: boolean;
+}
+
 export interface LobbyPlayer {
   seat: number;
   username: string;
@@ -35,11 +39,12 @@ export interface Standing {
   seat: number;
   name: string;
   alive: boolean;
+  eliminatedTurn?: number;
 }
 
 export type ServerMessage =
   | { type: "room_created"; code: string }
-  | { type: "lobby"; code: string; players: LobbyPlayer[] }
+  | { type: "lobby"; code: string; players: LobbyPlayer[]; houseRules?: HouseRules; isHost?: boolean }
   | {
       type: "state";
       yourSeat: number;
@@ -50,6 +55,7 @@ export type ServerMessage =
       isYourTurn: boolean;
       availableActions: ActionInfo[];
       history: HistoryEntry[];
+      claims: Record<number, string[]>;
       context?: string;
       pendingAction?: number;
       deckSize: number;
@@ -59,8 +65,11 @@ export type ServerMessage =
       winner: number;
       winnerName: string;
       finalStandings: Standing[];
+      totalTurns: number;
+      history: HistoryEntry[];
     }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "forfeited"; by: string };
 
 // ── Client → Server messages ──────────────────────────────────────
 
@@ -74,7 +83,9 @@ export type ClientMessage =
     }
   | { type: "join"; username: string; code: string }
   | { type: "action"; action: number }
-  | { type: "start" };
+  | { type: "start" }
+  | { type: "house_rules"; houseRules: HouseRules }
+  | { type: "forfeit" };
 
 // ── Game state for React ──────────────────────────────────────────
 
@@ -87,6 +98,7 @@ export interface GameState {
   isYourTurn: boolean;
   availableActions: ActionInfo[];
   history: HistoryEntry[];
+  claims: Record<number, string[]>;
   context?: string;
   pendingAction?: number;
   deckSize: number;

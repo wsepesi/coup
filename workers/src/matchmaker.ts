@@ -29,7 +29,7 @@ function generateCode(): string {
   return code;
 }
 
-export class Matchmaker implements DurableObject {
+export class Matchmaker {
   private state: DurableObjectState;
   private env: Env;
   private rooms = new Map<string, RoomInfo>();
@@ -46,50 +46,63 @@ export class Matchmaker implements DurableObject {
     if (url.pathname === "/ws") {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      this.state.acceptWebSocket(server);
+      server.accept();
+      server.addEventListener("message", (event) => {
+        this.handleWsMessage(server, event.data);
+      });
+      server.addEventListener("close", () => {
+        this.handleWsClose(server);
+      });
+      server.addEventListener("error", () => {
+        this.handleWsError(server);
+      });
       return new Response(null, { status: 101, webSocket: client });
     }
 
     return new Response("Not found", { status: 404 });
   }
 
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    if (typeof message !== "string") return;
+  private async handleWsMessage(ws: WebSocket, data: string | ArrayBuffer): Promise<void> {
+    if (typeof data !== "string") return;
 
     let msg: any;
     try {
-      msg = JSON.parse(message);
+      msg = JSON.parse(data);
     } catch {
       this.send(ws, { type: "error", message: "Invalid JSON" });
       return;
     }
 
-    switch (msg.type) {
-      case "create":
-        await this.handleCreate(ws, msg);
-        break;
-      case "join":
-        await this.handleJoin(ws, msg);
-        break;
-      case "quick_play":
-        this.handleQuickPlay(ws, msg);
-        break;
-      default:
-        this.send(ws, { type: "error", message: `Unknown message type: ${msg.type}` });
+    try {
+      switch (msg.type) {
+        case "create":
+          await this.handleCreate(ws, msg);
+          break;
+        case "join":
+          await this.handleJoin(ws, msg);
+          break;
+        case "quick_play":
+          this.handleQuickPlay(ws, msg);
+          break;
+        default:
+          this.send(ws, { type: "error", message: `Unknown message type: ${msg.type}` });
+      }
+    } catch (e: any) {
+      console.error("[Matchmaker] message error:", e.message, e.stack);
+      this.send(ws, { type: "error", message: "Internal error: " + (e.message || "unknown") });
     }
   }
 
-  async webSocketClose(ws: WebSocket): Promise<void> {
-    // Remove from quick queue if present
+  private handleWsClose(ws: WebSocket): void {
     this.quickQueue = this.quickQueue.filter(e => e.ws !== ws);
   }
 
-  async webSocketError(ws: WebSocket): Promise<void> {
+  private handleWsError(ws: WebSocket): void {
     this.quickQueue = this.quickQueue.filter(e => e.ws !== ws);
   }
 
   private async handleCreate(ws: WebSocket, msg: any): Promise<void> {
-    const { username, numPlayers, numBots, botDifficulty } = msg;
+    const { username, numPlayers, numBots, botDifficulty, houseRules } = msg;
 
     if (!username || typeof username !== "string") {
       this.send(ws, { type: "error", message: "Username required" });
@@ -119,6 +132,7 @@ export class Matchmaker implements DurableObject {
         numBots: nb,
         botDifficulty: diff,
         hostUsername: username,
+        houseRules: houseRules || {},
       }),
     }));
 

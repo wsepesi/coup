@@ -1706,8 +1706,427 @@ static void fuzz_heuristic_bot_games(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Test: house rules — refund on challenge flag get/set                */
+/* ------------------------------------------------------------------ */
+
+static void test_refund_flag_getset(void) {
+    printf("test_refund_flag_getset ... ");
+
+    Game g;
+    game_init(&g, 2, 1, 1);
+
+    /* Default should be ON (official rules) */
+    assert(game_get_refund_on_challenge(&g) == 1);
+
+    /* Can set to OFF */
+    game_set_refund_on_challenge(&g, 0);
+    assert(game_get_refund_on_challenge(&g) == 0);
+
+    /* Can set back to ON */
+    game_set_refund_on_challenge(&g, 1);
+    assert(game_get_refund_on_challenge(&g) == 1);
+
+    /* Setting the flag doesn't corrupt game state — play a game after toggling */
+    game_set_refund_on_challenge(&g, 0);
+    game_set_refund_on_challenge(&g, 1);
+    /* Game should still be in valid state */
+    assert(get_phase(&g) == PHASE_MAIN_ACTION);
+    assert(player_coins(&g, 0) == 2);
+    assert(player_coins(&g, 1) == 2);
+
+    printf("PASS\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Test: assassinate challenge refund — flag ON (official rules)       */
+/* ------------------------------------------------------------------ */
+
+static void test_assassinate_challenge_refund_on(void) {
+    printf("test_assassinate_challenge_refund_on ... ");
+
+    Game g;
+    game_init(&g, 2, 1, 1);
+
+    /* Default is ON (official) — verify */
+    assert(game_get_refund_on_challenge(&g) == 1);
+
+    /* Force hands: P0 has Captain+Ambassador (no Assassin), P1 has Duke+Contessa */
+    set_player_card0_type(&g, 0, CAPTAIN);
+    set_player_card1_type(&g, 0, AMBASSADOR);
+    set_player_card0_type(&g, 1, DUKE);
+    set_player_card1_type(&g, 1, CONTESSA);
+
+    /* Fix deck: dealt CAPTAIN, AMBASSADOR, DUKE, CONTESSA */
+    deck_set_count(&g, DUKE, 2);
+    deck_set_count(&g, ASSASSIN, 3);
+    deck_set_count(&g, CAPTAIN, 2);
+    deck_set_count(&g, AMBASSADOR, 2);
+    deck_set_count(&g, CONTESSA, 2);
+    assert(deck_total(&g) == 11);
+
+    /* Give P0 enough coins for assassination */
+    set_player_coins(&g, 0, 3);
+
+    int coins_before = player_coins(&g, 0);
+    assert(coins_before == 3);
+
+    /* P0 claims Assassin to assassinate P1 — BLUFF! P0 has no Assassin */
+    step_deterministic(&g, ACT_ASSASSINATE_P0 + 1); /* target P1 */
+    assert(get_phase(&g) == PHASE_CHALLENGE_ACTION);
+
+    /* 3 coins deducted immediately */
+    assert(player_coins(&g, 0) == 0);
+
+    /* P1 challenges */
+    step_deterministic(&g, ACT_CHALLENGE);
+
+    /* P0 doesn't have Assassin — challenge succeeds, P0 loses card */
+    assert(get_phase(&g) == PHASE_LOSE_CARD);
+    assert(get_active_player(&g) == 0);
+
+    /* With refund ON: coins should be refunded already */
+    assert(player_coins(&g, 0) == 3);
+
+    /* P0 discards slot 0 */
+    step_deterministic(&g, ACT_DISCARD_SLOT0);
+
+    /* Turn should advance to P1 */
+    assert(get_phase(&g) == PHASE_MAIN_ACTION);
+    assert(get_turn_player(&g) == 1);
+
+    /* Coins should still be 3 (refunded) */
+    assert(player_coins(&g, 0) == 3);
+
+    printf("PASS\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Test: assassinate challenge NO refund — flag OFF (house rule)       */
+/* ------------------------------------------------------------------ */
+
+static void test_assassinate_challenge_refund_off(void) {
+    printf("test_assassinate_challenge_refund_off ... ");
+
+    Game g;
+    game_init(&g, 2, 1, 1);
+
+    /* Turn off refund (house rule: no refund) */
+    game_set_refund_on_challenge(&g, 0);
+    assert(game_get_refund_on_challenge(&g) == 0);
+
+    /* Force hands: P0 has Captain+Ambassador (no Assassin), P1 has Duke+Contessa */
+    set_player_card0_type(&g, 0, CAPTAIN);
+    set_player_card1_type(&g, 0, AMBASSADOR);
+    set_player_card0_type(&g, 1, DUKE);
+    set_player_card1_type(&g, 1, CONTESSA);
+
+    /* Fix deck */
+    deck_set_count(&g, DUKE, 2);
+    deck_set_count(&g, ASSASSIN, 3);
+    deck_set_count(&g, CAPTAIN, 2);
+    deck_set_count(&g, AMBASSADOR, 2);
+    deck_set_count(&g, CONTESSA, 2);
+    assert(deck_total(&g) == 11);
+
+    /* Give P0 enough coins for assassination */
+    set_player_coins(&g, 0, 3);
+
+    /* P0 claims Assassin to assassinate P1 — BLUFF! */
+    step_deterministic(&g, ACT_ASSASSINATE_P0 + 1);
+    assert(get_phase(&g) == PHASE_CHALLENGE_ACTION);
+    assert(player_coins(&g, 0) == 0); /* deducted immediately */
+
+    /* P1 challenges */
+    step_deterministic(&g, ACT_CHALLENGE);
+
+    /* P0 doesn't have Assassin — challenge succeeds, P0 loses card */
+    assert(get_phase(&g) == PHASE_LOSE_CARD);
+    assert(get_active_player(&g) == 0);
+
+    /* With refund OFF: coins should NOT be refunded */
+    assert(player_coins(&g, 0) == 0);
+
+    /* P0 discards slot 0 */
+    step_deterministic(&g, ACT_DISCARD_SLOT0);
+
+    /* Turn advances, coins still 0 */
+    assert(get_phase(&g) == PHASE_MAIN_ACTION);
+    assert(player_coins(&g, 0) == 0);
+
+    printf("PASS\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Test: successful assassinate (unchallenged) — coins not refunded    */
+/* ------------------------------------------------------------------ */
+
+static void test_assassinate_unchallenged_no_refund(void) {
+    printf("test_assassinate_unchallenged_no_refund ... ");
+
+    Game g;
+    game_init(&g, 2, 1, 1);
+
+    /* Flag ON — but action goes through, so no refund */
+    assert(game_get_refund_on_challenge(&g) == 1);
+
+    /* Force hands: P0 has Assassin+Captain, P1 has Duke+Ambassador */
+    set_player_card0_type(&g, 0, ASSASSIN);
+    set_player_card1_type(&g, 0, CAPTAIN);
+    set_player_card0_type(&g, 1, DUKE);
+    set_player_card1_type(&g, 1, AMBASSADOR);
+
+    deck_set_count(&g, DUKE, 2);
+    deck_set_count(&g, ASSASSIN, 2);
+    deck_set_count(&g, CAPTAIN, 2);
+    deck_set_count(&g, AMBASSADOR, 2);
+    deck_set_count(&g, CONTESSA, 3);
+    assert(deck_total(&g) == 11);
+
+    set_player_coins(&g, 0, 3);
+
+    /* P0 assassinates P1 */
+    step_deterministic(&g, ACT_ASSASSINATE_P0 + 1);
+    assert(get_phase(&g) == PHASE_CHALLENGE_ACTION);
+    assert(player_coins(&g, 0) == 0);
+
+    /* P1 passes (does not challenge) */
+    step_deterministic(&g, ACT_PASS);
+
+    /* Goes to block phase or resolve. P1 could block with Contessa.
+       P1 doesn't have Contessa, but let's pass to resolve. */
+    if (get_phase(&g) == PHASE_BLOCK) {
+        step_deterministic(&g, ACT_PASS);
+    }
+
+    /* Resolve: P1 loses a card */
+    assert(get_phase(&g) == PHASE_LOSE_CARD);
+    assert(get_active_player(&g) == 1);
+
+    /* Coins should still be 0 — assassination was paid, not refunded */
+    assert(player_coins(&g, 0) == 0);
+
+    printf("PASS\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Test: non-assassinate challenge — tax bluff, no coin effect         */
+/* ------------------------------------------------------------------ */
+
+static void test_tax_challenge_no_refund_needed(void) {
+    printf("test_tax_challenge_no_refund_needed ... ");
+
+    Game g;
+    game_init(&g, 2, 1, 1);
+    assert(game_get_refund_on_challenge(&g) == 1);
+
+    /* P0 has Captain+Ambassador (no Duke) */
+    set_player_card0_type(&g, 0, CAPTAIN);
+    set_player_card1_type(&g, 0, AMBASSADOR);
+    set_player_card0_type(&g, 1, DUKE);
+    set_player_card1_type(&g, 1, CONTESSA);
+
+    deck_set_count(&g, DUKE, 2);
+    deck_set_count(&g, ASSASSIN, 3);
+    deck_set_count(&g, CAPTAIN, 2);
+    deck_set_count(&g, AMBASSADOR, 2);
+    deck_set_count(&g, CONTESSA, 2);
+
+    int coins_before = player_coins(&g, 0);
+
+    /* P0 claims Tax (Duke) — bluff */
+    step_deterministic(&g, ACT_TAX);
+    assert(get_phase(&g) == PHASE_CHALLENGE_ACTION);
+
+    /* Tax doesn't cost coins, so coins unchanged */
+    assert(player_coins(&g, 0) == coins_before);
+
+    /* P1 challenges */
+    step_deterministic(&g, ACT_CHALLENGE);
+
+    /* P0 loses card, coins unchanged (tax costs nothing) */
+    assert(get_phase(&g) == PHASE_LOSE_CARD);
+    assert(player_coins(&g, 0) == coins_before);
+
+    printf("PASS\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* Fuzz: games complete with refund flag ON (official rules)           */
+/* ------------------------------------------------------------------ */
+
+static void fuzz_refund_on_games(void) {
+    printf("fuzz_refund_on_games ... ");
+
+    int games_completed = 0;
+    for (int seed = 1; seed <= 500; seed++) {
+        Game g;
+        game_init(&g, (seed % 5) + 2, (uint64_t)seed, (uint64_t)(seed + 1000));
+        /* Default is ON */
+        assert(game_get_refund_on_challenge(&g) == 1);
+
+        int steps = 0;
+        while (!is_done(&g) && steps < MAX_STEPS) {
+            assert(!is_chance_node(&g));
+            int a = first_legal_action(&g);
+            step_with_rng(&g, a);
+            steps++;
+
+            /* Coins should never go negative */
+            for (int p = 0; p < get_num_players_ext(&g); p++) {
+                assert(player_coins(&g, p) >= 0);
+            }
+        }
+        assert(is_done(&g));
+        games_completed++;
+    }
+
+    printf("PASS (%d games completed)\n", games_completed);
+}
+
+/* ------------------------------------------------------------------ */
+/* Fuzz: games complete with refund flag OFF (house rule)              */
+/* ------------------------------------------------------------------ */
+
+static void fuzz_refund_off_games(void) {
+    printf("fuzz_refund_off_games ... ");
+
+    int games_completed = 0;
+    for (int seed = 1; seed <= 500; seed++) {
+        Game g;
+        game_init(&g, (seed % 5) + 2, (uint64_t)seed, (uint64_t)(seed + 1000));
+        game_set_refund_on_challenge(&g, 0);
+
+        int steps = 0;
+        while (!is_done(&g) && steps < MAX_STEPS) {
+            assert(!is_chance_node(&g));
+            int a = first_legal_action(&g);
+            step_with_rng(&g, a);
+            steps++;
+
+            for (int p = 0; p < get_num_players_ext(&g); p++) {
+                assert(player_coins(&g, p) >= 0);
+            }
+        }
+        assert(is_done(&g));
+        games_completed++;
+    }
+
+    printf("PASS (%d games completed)\n", games_completed);
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* Test: Assassinate -> Block Contessa -> Challenge block (blocker has card) */
+/* ------------------------------------------------------------------ */
+
+static void test_assassinate_block_challenge_block_stands(void) {
+    printf("test_assassinate_block_challenge_block_stands ... ");
+
+    /* 6-player game: player 0 assassinates player 3,
+       player 3 blocks with Contessa (and HAS it),
+       player 1 challenges the block — should lose. */
+    Game g;
+    game_init(&g, 6, 100, 100);
+
+    /* Force known hands */
+    set_player_card0_type(&g, 0, ASSASSIN);   /* Matt — has Assassin */
+    set_player_card1_type(&g, 0, DUKE);
+    set_player_card0_type(&g, 1, CAPTAIN);    /* Takumi — will challenge */
+    set_player_card1_type(&g, 1, AMBASSADOR);
+    set_player_card0_type(&g, 2, DUKE);       /* Lucia */
+    set_player_card1_type(&g, 2, CAPTAIN);
+    set_player_card0_type(&g, 3, CONTESSA);   /* Oscar — has Contessa */
+    set_player_card1_type(&g, 3, DUKE);
+    set_player_card0_type(&g, 4, AMBASSADOR); /* Silke */
+    set_player_card1_type(&g, 4, ASSASSIN);
+    set_player_card0_type(&g, 5, CAPTAIN);    /* Player 5 */
+    set_player_card1_type(&g, 5, CONTESSA);
+
+    /* Fix deck counts to be consistent */
+    deck_set_count(&g, DUKE, 0);
+    deck_set_count(&g, ASSASSIN, 1);
+    deck_set_count(&g, CAPTAIN, 0);
+    deck_set_count(&g, AMBASSADOR, 1);
+    deck_set_count(&g, CONTESSA, 1);
+
+    /* Verify Oscar is alive with 2 influence */
+    assert(player_is_alive(&g, 3));
+    assert(player_card0_alive(&g, 3) && player_card1_alive(&g, 3));
+
+    /* Player 0 coins must be >= 3 for assassination */
+    set_player_coins(&g, 0, 3);
+
+    /* Step 1: Player 0 assassinates player 3 */
+    assert(get_phase(&g) == PHASE_MAIN_ACTION);
+    assert(get_turn_player(&g) == 0);
+    step_deterministic(&g, ACT_ASSASSINATE_P0 + 3);
+
+    /* Should enter PHASE_CHALLENGE_ACTION */
+    assert(get_phase(&g) == PHASE_CHALLENGE_ACTION);
+
+    /* Step 2: All other players pass the challenge window */
+    /* Players cycle: 1, 2, 3, 4, 5 (skipping turn player 0) */
+    for (int i = 0; i < 5; i++) {
+        assert(get_phase(&g) == PHASE_CHALLENGE_ACTION);
+        step_deterministic(&g, ACT_PASS);
+    }
+
+    /* Step 3: Should be in PHASE_BLOCK, Oscar (player 3) is active */
+    assert(get_phase(&g) == PHASE_BLOCK);
+    assert(get_active_player(&g) == 3);
+
+    /* Oscar blocks with Contessa */
+    step_deterministic(&g, ACT_BLOCK_CONTESSA);
+
+    /* Step 4: PHASE_CHALLENGE_BLOCK — players can challenge Oscar's Contessa */
+    assert(get_phase(&g) == PHASE_CHALLENGE_BLOCK);
+
+    /* Turn player (0) goes first in challenge cycle, then others skip blocker (3) */
+    /* Player 0 passes */
+    assert(get_active_player(&g) == 0);
+    step_deterministic(&g, ACT_PASS);
+
+    /* Player 1 (Takumi) challenges! */
+    assert(get_active_player(&g) == 1);
+    step_deterministic(&g, ACT_CHALLENGE);
+
+    /* Oscar HAS Contessa => challenger (player 1) must lose a card */
+    assert(get_phase(&g) == PHASE_LOSE_CARD);
+    assert(get_active_player(&g) == 1);  /* Takumi loses, NOT Oscar */
+
+    /* Takumi discards slot 0 */
+    step_deterministic(&g, ACT_DISCARD_SLOT0);
+
+    /* Oscar should get a redraw (shuffle Contessa back, draw new) */
+    assert(get_phase(&g) == PHASE_CHANCE_REDRAW);
+    assert(get_active_player(&g) == 3);  /* Oscar gets redraw */
+
+    /* Resolve the chance node */
+    ChanceOutcome outcomes[MAX_CHANCE_OUTCOMES];
+    int n = chance_outcomes(&g, outcomes);
+    assert(n > 0);
+    apply_chance(&g, outcomes[0].outcome);
+
+    /* Block stands => assassination cancelled, turn advances */
+    assert(get_phase(&g) == PHASE_MAIN_ACTION);
+
+    /* Oscar must still be alive with both cards */
+    assert(player_is_alive(&g, 3));
+    assert(player_card1_alive(&g, 3));  /* card1 was never touched */
+
+    /* Takumi lost card 0 */
+    assert(!player_card0_alive(&g, 1));
+    assert(player_card1_alive(&g, 1));
+
+    /* Player 0's coins were spent (3 coins for assassinate) but NOT refunded
+       since the action was blocked (not challenge-cancelled) */
+    assert(player_coins(&g, 0) == 0);
+
+    printf("PASS\n");
+}
 
 int main(void) {
     printf("=== Coup Engine Tests ===\n\n");
@@ -1728,6 +2147,12 @@ int main(void) {
     test_card_conservation();
     test_exchange_discard_slot3_first();
     test_exchange_discard_no_deadlock();
+    test_refund_flag_getset();
+    test_assassinate_challenge_refund_on();
+    test_assassinate_challenge_refund_off();
+    test_assassinate_unchallenged_no_refund();
+    test_tax_challenge_no_refund_needed();
+    test_assassinate_block_challenge_block_stands();
 
     printf("\n--- Fuzz / stress tests ---\n\n");
     fuzz_valid_actions_nonempty();
@@ -1742,6 +2167,8 @@ int main(void) {
     fuzz_no_info_leak();
     fuzz_game_end_invariants();
     fuzz_heuristic_bot_games();
+    fuzz_refund_on_games();
+    fuzz_refund_off_games();
 
     printf("\n=== All tests passed ===\n");
     return 0;

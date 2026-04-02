@@ -14,15 +14,19 @@ interface UseWebSocketOptions {
   /** If false/undefined, don't connect yet */
   enabled?: boolean;
   onMessage?: (msg: ServerMessage) => void;
+  onConnect?: (send: (msg: ClientMessage) => void) => void;
 }
 
-export function useWebSocket({ path, enabled = true, onMessage }: UseWebSocketOptions) {
+export function useWebSocket({ path, enabled = true, onMessage, onConnect }: UseWebSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttempts = useRef(0);
+  const disposed = useRef(false);
   const onMessageRef = useRef(onMessage);
   onMessageRef.current = onMessage;
+  const onConnectRef = useRef(onConnect);
+  onConnectRef.current = onConnect;
 
   const connect = useCallback(() => {
     if (!enabled) return;
@@ -40,11 +44,20 @@ export function useWebSocket({ path, enabled = true, onMessage }: UseWebSocketOp
     wsRef.current = ws;
 
     ws.onopen = () => {
+      // Ignore if this WS is already stale
+      if (wsRef.current !== ws) return;
       setStatus("connected");
       reconnectAttempts.current = 0;
+      onConnectRef.current?.((msg: ClientMessage) => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(msg));
+        }
+      });
     };
 
     ws.onmessage = (event) => {
+      // Ignore messages from stale connections
+      if (wsRef.current !== ws) return;
       try {
         const msg = JSON.parse(event.data) as ServerMessage;
         onMessageRef.current?.(msg);
@@ -54,8 +67,15 @@ export function useWebSocket({ path, enabled = true, onMessage }: UseWebSocketOp
     };
 
     ws.onclose = () => {
-      setStatus("disconnected");
+      // Ignore if this is a stale WS (a newer one has replaced it)
+      if (wsRef.current !== ws) return;
       wsRef.current = null;
+
+      // Don't reconnect if disposed (cleanup was called)
+      if (disposed.current) {
+        setStatus("disconnected");
+        return;
+      }
 
       // Reconnect with exponential backoff (max 10s)
       const delay = Math.min(1000 * 2 ** reconnectAttempts.current, 10000);
@@ -83,12 +103,15 @@ export function useWebSocket({ path, enabled = true, onMessage }: UseWebSocketOp
       reconnectTimer.current = null;
     }
     reconnectAttempts.current = 0;
-    wsRef.current?.close();
+    disposed.current = true;
+    const ws = wsRef.current;
     wsRef.current = null;
+    ws?.close();
     setStatus("disconnected");
   }, []);
 
   useEffect(() => {
+    disposed.current = false;
     connect();
     return () => {
       disconnect();

@@ -4,11 +4,16 @@ import { RGBA } from "@opentui/core";
 import type { OptimizedBuffer } from "@opentui/core";
 import { COLORS } from "./constants.js";
 
+export interface HouseRules {
+  refundOnChallenge: boolean;
+}
+
 export interface GameConfig {
   players: number;
   seat: number;
   difficulty: "easy" | "medium" | "hard" | "hard+";
   seed: string;
+  houseRules: HouseRules;
 }
 
 interface SetupField {
@@ -26,7 +31,7 @@ export class SetupScreen {
   private config: GameConfig;
 
   constructor() {
-    this.config = { players: 6, seat: 0, difficulty: "hard", seed: "" };
+    this.config = { players: 6, seat: 0, difficulty: "hard", seed: "", houseRules: { refundOnChallenge: true } };
     this.fields = [
       { label: "Players", value: "6", min: 2, max: 6 },
       { label: "Your seat", value: "Random", options: this.buildSeatOptions(6) },
@@ -41,10 +46,20 @@ export class SetupScreen {
     return opts;
   }
 
-  handleKey(name: string): "start" | "rules" | null {
+  getHouseRules(): HouseRules {
+    return { ...this.config.houseRules };
+  }
+
+  setHouseRules(rules: HouseRules) {
+    this.config.houseRules = { ...rules };
+  }
+
+  handleKey(name: string): "start" | "rules" | "extras" | null {
     switch (name) {
       case "r":
         return "rules";
+      case "e":
+        return "extras";
       case "up":
         this.selectedField = Math.max(0, this.selectedField - 1);
         break;
@@ -129,7 +144,7 @@ export class SetupScreen {
 
     buffer.clear(bg);
 
-    const boxW = 50;
+    const boxW = 56;
     const boxH = 14;
     const bx = Math.floor((width - boxW) / 2);
     const by = Math.floor((height - boxH) / 2);
@@ -190,7 +205,7 @@ export class SetupScreen {
     );
 
     // Help text
-    const help = "↑↓ ◀▶ navigate  Enter confirm  (R) rules";
+    const help = "↑↓ ◀▶ navigate  Enter confirm  (R) rules  (E) extras";
     buffer.drawText(help, bx + Math.floor((boxW - help.length) / 2), by + boxH - 2, dim, bg);
   }
 }
@@ -398,6 +413,94 @@ export async function showRulesScreen(
     else if (key.name === "down") scrollOffset = Math.min(maxScroll, scrollOffset + 1);
     else if (key.name === "pageup" || key.name === " ") scrollOffset = Math.max(0, scrollOffset - contentH);
     else if (key.name === "pagedown") scrollOffset = Math.min(maxScroll, scrollOffset + contentH);
+    render();
+  }
+}
+
+// ── Extras (House Rules) screen ──────────────────────────────────────
+
+interface ExtrasToggle {
+  label: string;
+  description: string;
+  key: keyof HouseRules;
+  value: boolean;
+}
+
+export async function showExtrasScreen(
+  buffer: OptimizedBuffer,
+  waitForKey: () => Promise<{ name: string }>,
+  width: number,
+  height: number,
+  setup: SetupScreen,
+): Promise<void> {
+  const bg = RGBA.fromHex(COLORS.bg);
+  const bright = RGBA.fromHex(COLORS.textBright);
+  const textColor = RGBA.fromHex(COLORS.textDefault);
+  const dim = RGBA.fromHex(COLORS.textDim);
+  const border = RGBA.fromHex(COLORS.border);
+  const cursor = RGBA.fromHex(COLORS.cursor);
+  const selBg = RGBA.fromHex(COLORS.selectionBg);
+
+  const rules = setup.getHouseRules();
+  const toggles: ExtrasToggle[] = [
+    { label: "Refund on challenge", description: "Refund coins on failed action claim (official)", key: "refundOnChallenge", value: rules.refundOnChallenge },
+  ];
+  let selected = 0;
+
+  function render() {
+    buffer.clear(bg);
+
+    const boxW = 56;
+    const boxH = 8 + toggles.length * 2;
+    const bx = Math.floor((width - boxW) / 2);
+    const by = Math.floor((height - boxH) / 2);
+
+    buffer.drawBox({
+      x: bx, y: by, width: boxW, height: boxH,
+      border: true, borderColor: border, backgroundColor: bg,
+      borderStyle: "double", shouldFill: true,
+    });
+
+    const title = "House Rules";
+    buffer.drawText(title, bx + Math.floor((boxW - title.length) / 2), by + 2, bright, bg);
+    buffer.drawText("─────", bx + Math.floor((boxW - 5) / 2), by + 3, dim, bg);
+
+    for (let i = 0; i < toggles.length; i++) {
+      const t = toggles[i];
+      const fy = by + 5 + i * 2;
+      const isSel = i === selected;
+      const rowBg = isSel ? selBg : bg;
+      const fg = isSel ? bright : textColor;
+
+      if (isSel) {
+        buffer.fillRect(bx + 2, fy, boxW - 4, 1, selBg);
+      }
+
+      const indicator = t.value ? "[ON] " : "[OFF]";
+      buffer.drawText(`${t.label}:`, bx + 4, fy, fg, rowBg);
+      buffer.drawText(indicator, bx + 4 + t.label.length + 2, fy, isSel ? cursor : dim, rowBg);
+      buffer.drawText(t.description, bx + 4, fy + 1, dim, bg);
+    }
+
+    const help = "↑↓ navigate  ◀▶/Space toggle  E/ESC close";
+    buffer.drawText(help, bx + Math.floor((boxW - help.length) / 2), by + boxH - 2, dim, bg);
+  }
+
+  render();
+
+  while (true) {
+    const key = await waitForKey();
+    if (key.name === "e" || key.name === "escape" || key.name === "return") {
+      const updated: HouseRules = { refundOnChallenge: false };
+      for (const t of toggles) updated[t.key] = t.value;
+      setup.setHouseRules(updated);
+      return;
+    }
+    if (key.name === "up") selected = Math.max(0, selected - 1);
+    else if (key.name === "down") selected = Math.min(toggles.length - 1, selected + 1);
+    else if (key.name === "left" || key.name === "right" || key.name === " ") {
+      toggles[selected].value = !toggles[selected].value;
+    }
     render();
   }
 }

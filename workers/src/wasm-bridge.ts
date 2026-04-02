@@ -174,6 +174,18 @@ export class CoupWasm {
   exchangeCard0(): number { return this.exp.wasm_get_exchange_card0(this.gamePtr); }
   exchangeCard1(): number { return this.exp.wasm_get_exchange_card1(this.gamePtr); }
 
+  // House rules: set refund_on_challenge flag via direct memory access
+  // _pad field is at byte offset 20 in Game struct (uint16), bit 13 is the flag
+  setRefundOnChallenge(flag: boolean): void {
+    const PAD_OFFSET = 20;  // 6*2 (players) + 2 (deck) + 2 (phase_state) + 2 (aux) + 2 (aux2)
+    const dv = new DataView(this.exp.memory.buffer);
+    const current = dv.getUint16(this.gamePtr + PAD_OFFSET, true);
+    const updated = flag
+      ? current | (1 << 13)
+      : current & ~(1 << 13);
+    dv.setUint16(this.gamePtr + PAD_OFFSET, updated, true);
+  }
+
   observe(playerId: number): Float32Array {
     this.exp.observe(this.gamePtr, playerId, this.historyPtr, this.obsPtr);
     const floats = new Float32Array(this.exp.memory.buffer, this.obsPtr, 407);

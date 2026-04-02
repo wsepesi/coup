@@ -208,6 +208,14 @@ static void set_claimed_card_stored(Game *g, int c) {
     g->_pad = (g->_pad & ~(uint16_t)(0x7 << 10)) | (uint16_t)((c & 0x7) << 10);
 }
 
+/* House rule: refund coins on successful challenge — _pad bit 13 */
+static int get_refund_on_challenge(const Game *g) {
+    return (g->_pad >> 13) & 0x1;
+}
+static void set_refund_on_challenge(Game *g, int flag) {
+    g->_pad = (g->_pad & ~(uint16_t)(0x1 << 13)) | (uint16_t)((flag & 0x1) << 13);
+}
+
 /* After lose_card completes */
 static void after_lose_card(Game *g) {
     if (check_game_over(g)) return;
@@ -404,6 +412,9 @@ void game_init(Game *g, int num_players, uint64_t deal_seed, uint64_t proc_seed)
     set_pending_action(g, 0);
     set_first_discard(g, FIRST_DISCARD_NONE);
 
+    /* Default: refund coins on successful challenge (official rules) */
+    set_refund_on_challenge(g, 1);
+
     /* Seed the procedural RNG */
     xoshiro256_seed(&g->rng, proc_seed);
 
@@ -566,6 +577,11 @@ void step_deterministic(Game *g, int action) {
                 set_lose_card_context(g, LC_CLAIMANT_REDRAW);
             } else {
                 /* Claimant doesn't have it — claimant loses, action cancelled */
+                if (get_refund_on_challenge(g)) {
+                    int pa = get_pending_action(g);
+                    if (pa >= ACT_ASSASSINATE_P0 && pa <= ACT_ASSASSINATE_P0 + 5)
+                        set_player_coins(g, claimant, player_coins(g, claimant) + 3);
+                }
                 set_phase(g, PHASE_LOSE_CARD);
                 set_active_player(g, claimant);
                 set_lose_card_context(g, LC_ADVANCE_TURN);
@@ -936,6 +952,22 @@ int get_num_players_ext(const Game *g) {
 
 int get_deck_total(const Game *g) {
     return deck_total(g);
+}
+
+int get_blocker_ext(const Game *g) {
+    return get_blocker(g);
+}
+
+int get_block_card_ext(const Game *g) {
+    return get_block_card(g);
+}
+
+void game_set_refund_on_challenge(Game *g, int flag) {
+    set_refund_on_challenge(g, flag);
+}
+
+int game_get_refund_on_challenge(const Game *g) {
+    return get_refund_on_challenge(g);
 }
 
 /* ---- Observation ---- */

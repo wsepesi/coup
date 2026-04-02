@@ -13,7 +13,7 @@ export const THEME = {
   coinLoss: "#FF5555",
   challengeWin: "#00FF00",
   challengeFail: "#FF5555",
-  cursor: "#FFFF00",
+  cursor: "#CCCCCC",
 } as const;
 
 // ── Card / role definitions ───────────────────────────────────────

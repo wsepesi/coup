@@ -65,6 +65,22 @@ function openLib() {
       args: [FFIType.ptr],
       returns: FFIType.i32,
     },
+    get_blocker_ext: {
+      args: [FFIType.ptr],
+      returns: FFIType.i32,
+    },
+    get_block_card_ext: {
+      args: [FFIType.ptr],
+      returns: FFIType.i32,
+    },
+    game_set_refund_on_challenge: {
+      args: [FFIType.ptr, FFIType.i32],
+      returns: FFIType.void,
+    },
+    game_get_refund_on_challenge: {
+      args: [FFIType.ptr],
+      returns: FFIType.i32,
+    },
   });
 }
 

@@ -170,9 +170,29 @@ export class CoupGame {
     return ((aux >> 9) & 0x7) as CardType;
   }
 
+  get blocker(): number {
+    return getLib().symbols.get_blocker_ext(this.gamePtr) as number;
+  }
+
+  get blockCard(): CardType {
+    return getLib().symbols.get_block_card_ext(this.gamePtr) as CardType;
+  }
+
   get deckSize(): number {
     const lib = getLib();
     return lib.symbols.get_deck_total(this.gamePtr) as number;
+  }
+
+  getDeckCards(): Record<CardType, number> {
+    const u16 = new Uint16Array(this.gameBuffer);
+    const deck = u16[6];
+    return {
+      [CardType.Duke]: (deck >> (CardType.Duke * 2)) & 0x3,
+      [CardType.Assassin]: (deck >> (CardType.Assassin * 2)) & 0x3,
+      [CardType.Captain]: (deck >> (CardType.Captain * 2)) & 0x3,
+      [CardType.Ambassador]: (deck >> (CardType.Ambassador * 2)) & 0x3,
+      [CardType.Contessa]: (deck >> (CardType.Contessa * 2)) & 0x3,
+    } as Record<CardType, number>;
   }
 
   getSnapshot(): GameSnapshot {
@@ -187,8 +207,17 @@ export class CoupGame {
       exchangeCards = [this.getExchangeCard(0), this.getExchangeCard(1)];
     }
 
+    // Include blocker info during ChallengeBlock phase
+    const phase = this.phase;
+    let blocker: number | undefined;
+    let blockCard: CardType | undefined;
+    if (phase === Phase.ChallengeBlock) {
+      blocker = this.blocker;
+      blockCard = this.blockCard;
+    }
+
     return {
-      phase: this.phase,
+      phase,
       activePlayer: this.activePlayer,
       turnPlayer: this.turnPlayer,
       pendingAction: this.pendingAction,
@@ -198,8 +227,19 @@ export class CoupGame {
       winner: this.winner,
       validMask: this.validMask,
       deckSize: this.deckSize,
+      deckCards: this.getDeckCards(),
       exchangeCards,
+      blocker,
+      blockCard,
     };
+  }
+
+  setRefundOnChallenge(flag: boolean) {
+    getLib().symbols.game_set_refund_on_challenge(this.gamePtr, flag ? 1 : 0);
+  }
+
+  getRefundOnChallenge(): boolean {
+    return getLib().symbols.game_get_refund_on_challenge(this.gamePtr) !== 0;
   }
 
   // Get valid actions as array of action indices

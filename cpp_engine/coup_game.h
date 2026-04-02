@@ -287,8 +287,12 @@ class CoupGame : public Game {
     return {kObservationTensorSize};
   }
 
+ public:
+  bool refund_on_challenge() const { return refund_on_challenge_; }
+
  private:
   int num_players_;
+  bool refund_on_challenge_;
 };
 
 }  // namespace coup

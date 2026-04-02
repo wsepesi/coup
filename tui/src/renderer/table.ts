@@ -18,6 +18,7 @@ export function renderTable(
   playerNames?: (seat: number) => string,
   claimsMap?: Map<number, Set<CardType>>,
   lastActionMap?: Map<number, number>,
+  godMode?: boolean,
 ): void {
   for (const pos of positions) {
     if (pos.seat === humanSeat) continue;
@@ -68,24 +69,31 @@ export function renderTable(
     buffer.drawText(indicator, px + label.length + 1, py, indicatorColor);
 
     // --- Line 2: cards + coins ---
-    let cardStr = "";
+    const cardLine = py + 1;
+    let cardX = px;
+    const cardColors = getCardColors();
     for (let i = 0; i < 2; i++) {
       const card = player.cards[i];
-      if (i > 0) cardStr += " ";
-      if (card.alive) {
-        cardStr += "▓▓";
+      if (i > 0) { buffer.drawText(" ", cardX, cardLine, col(COLORS.textDim)); cardX += 1; }
+      if (card.alive && godMode) {
+        const abbrev = CARD_ABBREV[card.type] ?? "??";
+        const txt = `[${abbrev}]`;
+        buffer.drawText(txt, cardX, cardLine, col(cardColors[card.type]));
+        cardX += txt.length;
+      } else if (card.alive) {
+        buffer.drawText("▓▓", cardX, cardLine, col(COLORS.textDim));
+        cardX += 2;
       } else {
         const abbrev = CARD_ABBREV[card.type] ?? "??";
-        cardStr += `[${abbrev}]`;
+        const txt = `[${abbrev}]`;
+        buffer.drawText(txt, cardX, cardLine, col(COLORS.textDim));
+        cardX += txt.length;
       }
     }
 
-    const cardLine = py + 1;
-    buffer.drawText(cardStr, px, cardLine, col(COLORS.textDim));
-
     // Coins after cards
     const coinStr = ` ${player.coins}●`;
-    buffer.drawText(coinStr, px + cardStr.length, cardLine, col(COLORS.textDefault));
+    buffer.drawText(coinStr, cardX, cardLine, col(COLORS.textDefault));
 
     // --- Line 3: claimed cards ---
     const claims = claimsMap?.get(pos.seat);

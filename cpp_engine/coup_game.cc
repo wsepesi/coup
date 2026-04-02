@@ -29,7 +29,8 @@ const GameType kGameType{
     /*provides_observation_string=*/true,
     /*provides_observation_tensor=*/true,
     /*parameter_specification=*/
-    {{"players", GameParameter(2)}},
+    {{"players", GameParameter(2)},
+     {"refund_on_challenge", GameParameter(true)}},
 };
 
 std::shared_ptr<const Game> Factory(const GameParameters& params) {
@@ -57,7 +58,8 @@ const char* CardName(int type) {
 
 CoupGame::CoupGame(const GameParameters& params)
     : Game(kGameType, params),
-      num_players_(ParameterValue<int>("players")) {
+      num_players_(ParameterValue<int>("players")),
+      refund_on_challenge_(ParameterValue<bool>("refund_on_challenge")) {
   assert(num_players_ >= kMinPlayers && num_players_ <= kMaxPlayers);
 }
 
@@ -523,6 +525,11 @@ void CoupState::ApplyChallengeAction(Action action) {
     } else {
       // Claimant doesn't have the card. Claimant loses influence.
       // Action is cancelled.
+      if (parent_game()->refund_on_challenge() &&
+          pending_action_ >= kAssassinatePlayer0 &&
+          pending_action_ <= kAssassinatePlayer0 + 5) {
+        players_[turn_player_].coins += kAssassinateCost;
+      }
       lose_card_player_ = turn_player_;
       active_player_ = turn_player_;
       phase_ = kLoseCard;

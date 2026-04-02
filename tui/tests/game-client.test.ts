@@ -392,6 +392,83 @@ describe("Fuzz: mixed difficulty bots", () => {
   });
 });
 
+describe("House rules: refund on challenge", () => {
+  test("default is ON (official rules)", () => {
+    const g = new CoupGame(2, 42n);
+    expect(g.getRefundOnChallenge()).toBe(true);
+  });
+
+  test("can toggle flag", () => {
+    const g = new CoupGame(2, 42n);
+    g.setRefundOnChallenge(false);
+    expect(g.getRefundOnChallenge()).toBe(false);
+    g.setRefundOnChallenge(true);
+    expect(g.getRefundOnChallenge()).toBe(true);
+  });
+
+  test("game completes with refund ON", () => {
+    const g = new CoupGame(4, 42n);
+    // Default ON
+    expect(g.getRefundOnChallenge()).toBe(true);
+    let steps = 0;
+    while (!g.done && steps < 500) {
+      const actions = g.getValidActions();
+      g.step(actions[0]);
+      steps++;
+    }
+    expect(g.done).toBe(true);
+  });
+
+  test("game completes with refund OFF", () => {
+    const g = new CoupGame(4, 42n);
+    g.setRefundOnChallenge(false);
+    let steps = 0;
+    while (!g.done && steps < 500) {
+      const actions = g.getValidActions();
+      g.step(actions[0]);
+      steps++;
+    }
+    expect(g.done).toBe(true);
+  });
+
+  test("coins never go negative with refund ON", () => {
+    for (let s = 0; s < 50; s++) {
+      const seed = BigInt(7000 + s);
+      const numPlayers = 2 + (s % 5);
+      const g = new CoupGame(numPlayers, seed);
+      let steps = 0;
+      while (!g.done && steps < 1000) {
+        const snap = g.getSnapshot();
+        for (let p = 0; p < numPlayers; p++) {
+          expect(snap.players[p].coins).toBeGreaterThanOrEqual(0);
+        }
+        const actions = g.getValidActions();
+        g.step(actions[Math.floor(Math.random() * actions.length)]);
+        steps++;
+      }
+    }
+  });
+
+  test("coins never go negative with refund OFF", () => {
+    for (let s = 0; s < 50; s++) {
+      const seed = BigInt(8000 + s);
+      const numPlayers = 2 + (s % 5);
+      const g = new CoupGame(numPlayers, seed);
+      g.setRefundOnChallenge(false);
+      let steps = 0;
+      while (!g.done && steps < 1000) {
+        const snap = g.getSnapshot();
+        for (let p = 0; p < numPlayers; p++) {
+          expect(snap.players[p].coins).toBeGreaterThanOrEqual(0);
+        }
+        const actions = g.getValidActions();
+        g.step(actions[Math.floor(Math.random() * actions.length)]);
+        steps++;
+      }
+    }
+  });
+});
+
 describe("Fuzz: snapshot invariants across random actions", () => {
   const SEEDS = 50;
   const MAX_STEPS = 1000;

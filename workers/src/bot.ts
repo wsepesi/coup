@@ -126,7 +126,7 @@ function chooseMainAction(
   if (myCards.includes(CAPTAIN)) {
     const stealTargets = actions.filter(a => a >= ACTION_STEAL_P0 && a <= ACTION_STEAL_P0 + 5);
     if (stealTargets.length > 0) {
-      return pickTarget(stealTargets, ACTION_STEAL_P0, wasm, "richest");
+      return pickTarget(stealTargets, ACTION_STEAL_P0, wasm, "weakest");
     }
   }
 
@@ -138,8 +138,11 @@ function chooseMainAction(
     }
   }
 
-  // Foreign Aid as fallback
-  if (actions.includes(ACTION_FOREIGN_AID)) return ACTION_FOREIGN_AID;
+  // Foreign Aid as fallback — but only if all 3 Dukes are known dead (face-up),
+  // otherwise someone could block with a Duke
+  if (actions.includes(ACTION_FOREIGN_AID) && countRevealedDukes(seat, wasm) >= 3) {
+    return ACTION_FOREIGN_AID;
+  }
 
   // Income as last resort
   if (actions.includes(ACTION_INCOME)) return ACTION_INCOME;
@@ -225,6 +228,17 @@ function pickTarget(
     }
   }
   return best;
+}
+
+function countRevealedDukes(seat: number, wasm: CoupWasm): number {
+  let count = 0;
+  const numPlayers = wasm.getNumPlayers();
+  for (let p = 0; p < numPlayers; p++) {
+    // Dead cards are visible to all — check if dead card is a Duke
+    if (!wasm.playerCard0Alive(p) && wasm.playerCard0Type(p) === DUKE) count++;
+    if (!wasm.playerCard1Alive(p) && wasm.playerCard1Type(p) === DUKE) count++;
+  }
+  return count;
 }
 
 function getOwnCards(seat: number, wasm: CoupWasm): number[] {

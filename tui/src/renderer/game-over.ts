@@ -65,6 +65,6 @@ export function renderGameOver(
   y += 2;
 
   // Options
-  const optLine = "[R] Replay same seed    [N] New game    [Q] Quit";
+  const optLine = "[R] Replay same seed    [N] New game    [H] History    [Q] Quit";
   buffer.drawText(optLine, cx - Math.floor(optLine.length / 2), y, text, bg);
 }

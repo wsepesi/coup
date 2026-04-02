@@ -243,6 +243,14 @@ int get_winner(const Game *g);
 int get_num_players_ext(const Game *g);
 int get_deck_total(const Game *g);
 
+/* Block state (for display during PHASE_CHALLENGE_BLOCK) */
+int get_blocker_ext(const Game *g);
+int get_block_card_ext(const Game *g);
+
+/* House rules */
+void game_set_refund_on_challenge(Game *g, int flag);
+int game_get_refund_on_challenge(const Game *g);
+
 #ifdef __cplusplus
 }
 #endif
