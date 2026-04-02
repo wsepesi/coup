@@ -8,6 +8,7 @@ type ColorPalette = {
   textDefault: string;
   textDim: string;
   textBright: string;
+  selectionBg: string;
   you: string;
   enemy: string;
   bot: string;
@@ -30,6 +31,7 @@ const COLORS_DARK: ColorPalette = {
   textDefault:   "#DDDDDD",
   textDim:       "#888888",
   textBright:    "#FFFFFF",
+  selectionBg:   "#444455",
   you:           "#00FFAA",
   enemy:         "#DDDDDD",
   bot:           "#AAAAAA",
@@ -52,6 +54,7 @@ const COLORS_LIGHT: ColorPalette = {
   textDefault:   "#222222",
   textDim:       "#777777",
   textBright:    "#000000",
+  selectionBg:   "#A8A898",
   you:           "#007755",
   enemy:         "#333333",
   bot:           "#444444",
@@ -65,10 +68,10 @@ const COLORS_LIGHT: ColorPalette = {
   captain:       "#0055CC",
   ambassador:    "#007733",
   contessa:      "#CC3377",
-  cursor:        "#CC8800",
+  cursor:        "#B05000",
 };
 
-export let COLORS: ColorPalette = { ...COLORS_DARK };
+export let COLORS: ColorPalette = { ...COLORS_LIGHT };
 
 export function setTheme(mode: "light" | "dark") {
   Object.assign(COLORS, mode === "dark" ? COLORS_DARK : COLORS_LIGHT);

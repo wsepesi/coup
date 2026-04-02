@@ -1538,6 +1538,174 @@ static void fuzz_no_info_leak(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Fuzz 11: game-end invariants — alive count and winner consistency   */
+/* ------------------------------------------------------------------ */
+
+/* Count alive players (alive_count is static in coup_core.c) */
+static int count_alive(const Game *g) {
+    int c = 0;
+    int np = get_num_players(g);
+    for (int i = 0; i < np; i++)
+        if (player_is_alive(g, i)) c++;
+    return c;
+}
+
+static void fuzz_game_end_invariants(void) {
+    printf("fuzz_game_end_invariants ... ");
+    int timeout_games = 0;
+    int normal_games = 0;
+
+    for (uint64_t seed = 1; seed <= 1000; seed++) {
+        fuzz_rng_state = (uint32_t)(seed * 2718281828u);
+        int np = 2 + (fuzz_rand() % 5);
+        Game g;
+        game_init(&g, np, seed, seed + 7);
+
+        int steps = 0;
+        int prev_alive = np;
+        while (!is_done(&g) && steps < MAX_STEPS) {
+            /* Alive count should never increase */
+            int ac = count_alive(&g);
+            if (ac > prev_alive) {
+                fprintf(stderr, "FAIL: alive count increased from %d to %d at "
+                        "seed=%llu step=%d\n", prev_alive, ac,
+                        (unsigned long long)seed, steps);
+                exit(1);
+            }
+            prev_alive = ac;
+
+            /* Deck should never go negative */
+            int dt = deck_total(&g);
+            if (dt < 0) {
+                fprintf(stderr, "FAIL: negative deck %d at seed=%llu step=%d\n",
+                        dt, (unsigned long long)seed, steps);
+                exit(1);
+            }
+
+            /* Total cards check — skip during chance/exchange phases where
+               cards are temporarily in a buffer outside deck+hands */
+            int phase = get_phase(&g);
+            if (phase != PHASE_CHANCE_EXCHANGE && phase != PHASE_EXCHANGE_DISCARD &&
+                phase != PHASE_CHANCE_REDRAW) {
+                int alive_cards = 0;
+                int dead_cards = 0;
+                for (int p = 0; p < np; p++) {
+                    if (player_card0_alive(&g, p)) alive_cards++;
+                    else dead_cards++;
+                    if (player_card1_alive(&g, p)) alive_cards++;
+                    else dead_cards++;
+                }
+                if (dt + alive_cards + dead_cards != 15) {
+                    fprintf(stderr, "FAIL: card total %d+%d+%d != 15 at seed=%llu step=%d phase=%d\n",
+                            dt, alive_cards, dead_cards, (unsigned long long)seed, steps, phase);
+                    exit(1);
+                }
+            }
+
+            if (is_chance_node(&g)) {
+                ChanceOutcome out[MAX_CHANCE_OUTCOMES];
+                int n = chance_outcomes(&g, out);
+                if (n <= 0) break;
+                apply_chance(&g, out[fuzz_rand() % n].outcome);
+            } else {
+                int a = random_legal_action(&g);
+                if (a < 0) break;
+                step_deterministic(&g, a);
+            }
+            steps++;
+        }
+
+        if (!is_done(&g)) continue;
+
+        int ac = count_alive(&g);
+        int w = get_winner(&g);
+
+        if (ac == 1) {
+            normal_games++;
+            /* Single winner — standard case */
+            if (!player_is_alive(&g, w)) {
+                fprintf(stderr, "FAIL: winner %d dead (normal end) seed=%llu\n",
+                        w, (unsigned long long)seed);
+                exit(1);
+            }
+            for (int p = 0; p < np; p++) {
+                if (p != w && player_is_alive(&g, p)) {
+                    fprintf(stderr, "FAIL: non-winner %d alive (normal end) seed=%llu\n",
+                            p, (unsigned long long)seed);
+                    exit(1);
+                }
+            }
+        } else {
+            timeout_games++;
+            /* Timeout — winner should be the strongest alive player */
+            if (w < 0 || w >= np) {
+                fprintf(stderr, "FAIL: invalid timeout winner %d seed=%llu\n",
+                        w, (unsigned long long)seed);
+                exit(1);
+            }
+            if (!player_is_alive(&g, w)) {
+                fprintf(stderr, "FAIL: timeout winner %d dead seed=%llu\n",
+                        w, (unsigned long long)seed);
+                exit(1);
+            }
+        }
+    }
+
+    printf("PASS (normal=%d, timeout=%d)\n", normal_games, timeout_games);
+}
+
+/* ------------------------------------------------------------------ */
+/* Fuzz 12: heuristic bot games complete without engine errors         */
+/* ------------------------------------------------------------------ */
+
+static void fuzz_heuristic_bot_games(void) {
+    printf("fuzz_heuristic_bot_games ... ");
+    int games_completed = 0;
+
+    for (uint64_t seed = 1; seed <= 200; seed++) {
+        for (int np = 2; np <= 6; np++) {
+            Game g;
+            game_init(&g, np, seed, seed + 13);
+
+            int steps = 0;
+            while (!is_done(&g) && steps < MAX_STEPS) {
+                if (is_chance_node(&g)) {
+                    ChanceOutcome out[MAX_CHANCE_OUTCOMES];
+                    int n = chance_outcomes(&g, out);
+                    if (n <= 0) break;
+                    /* Pick first chance outcome */
+                    apply_chance(&g, out[0].outcome);
+                } else {
+                    int action = heuristic_choose_action(&g);
+                    uint32_t mask = get_valid_actions(&g);
+                    if (!((mask >> action) & 1)) {
+                        fprintf(stderr, "FAIL: heuristic returned invalid action %d "
+                                "mask=0x%x seed=%llu np=%d step=%d\n",
+                                action, mask, (unsigned long long)seed, np, steps);
+                        exit(1);
+                    }
+
+                    step_with_rng(&g, action);
+                }
+                steps++;
+            }
+
+            if (is_done(&g)) {
+                games_completed++;
+                int w = get_winner(&g);
+                if (w < 0 || w >= np || !player_is_alive(&g, w)) {
+                    fprintf(stderr, "FAIL: bad winner %d seed=%llu np=%d\n",
+                            w, (unsigned long long)seed, np);
+                    exit(1);
+                }
+            }
+        }
+    }
+
+    printf("PASS (%d games completed)\n", games_completed);
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -1572,6 +1740,8 @@ int main(void) {
     fuzz_step_with_rng();
     fuzz_incremental_observe();
     fuzz_no_info_leak();
+    fuzz_game_end_invariants();
+    fuzz_heuristic_bot_games();
 
     printf("\n=== All tests passed ===\n");
     return 0;

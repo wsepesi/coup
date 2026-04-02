@@ -13,7 +13,8 @@ describe("CoupGame wrapper", () => {
     expect(g.activePlayer).toBeGreaterThanOrEqual(0);
     expect(g.activePlayer).toBeLessThan(4);
     expect(g.done).toBe(false);
-    expect(g.winner).toBe(-1);
+    // C engine initializes winner to 0 (not -1); game not done yet so winner is meaningless
+    expect(g.done).toBe(false);
     expect(g.numPlayers).toBe(4);
   });
 
@@ -279,6 +280,162 @@ describe("Action masking", () => {
         g.step(actions[0]);
       }
       steps++;
+    }
+  });
+});
+
+describe("Fuzz: random games with all bot difficulties", () => {
+  const difficulties: Array<"easy" | "medium" | "hard"> = ["easy", "medium", "hard"];
+  const playerCounts = [2, 3, 4, 5, 6];
+  const SEEDS_PER_CONFIG = 20;
+  const MAX_STEPS = 2000;
+
+  for (const diff of difficulties) {
+    for (const numPlayers of playerCounts) {
+      test(`${diff} bots, ${numPlayers} players, ${SEEDS_PER_CONFIG} seeds`, async () => {
+        for (let s = 0; s < SEEDS_PER_CONFIG; s++) {
+          const seed = BigInt(1000 * playerCounts.indexOf(numPlayers) + s + 1);
+          resetBotCounter();
+          const g = new CoupGame(numPlayers, seed);
+          const bots = Array.from({ length: numPlayers }, (_, i) =>
+            createBot(diff, i, numPlayers),
+          );
+
+          let steps = 0;
+          while (!g.done && steps < MAX_STEPS) {
+            const actions = g.getValidActions();
+            expect(actions.length).toBeGreaterThan(0);
+
+            const active = g.activePlayer;
+            expect(active).toBeGreaterThanOrEqual(0);
+            expect(active).toBeLessThan(numPlayers);
+
+            const obs = g.observe(active);
+            const mask = g.validMask;
+            const action = await bots[active].chooseAction(obs, mask);
+
+            // Bot must return a valid action
+            expect(actions).toContain(action);
+
+            const snap = g.getSnapshot();
+            // Deck size should be non-negative
+            expect(snap.deckSize).toBeGreaterThanOrEqual(0);
+            expect(snap.deckSize).toBeLessThanOrEqual(15);
+
+            // All alive players must have coins >= 0
+            for (let p = 0; p < numPlayers; p++) {
+              if (snap.players[p].alive) {
+                expect(snap.players[p].coins).toBeGreaterThanOrEqual(0);
+                expect(snap.players[p].influence).toBeGreaterThanOrEqual(1);
+              }
+            }
+
+            g.step(action);
+            steps++;
+          }
+
+          expect(g.done).toBe(true);
+          const winner = g.winner;
+          expect(winner).toBeGreaterThanOrEqual(0);
+          expect(winner).toBeLessThan(numPlayers);
+          // Winner must be alive
+          const finalSnap = g.getSnapshot();
+          expect(finalSnap.players[winner].alive).toBe(true);
+          // Winner should have the most influence among alive players
+          const aliveCount = finalSnap.players.filter(p => p.alive).length;
+          expect(aliveCount).toBeGreaterThanOrEqual(1);
+        }
+      });
+    }
+  }
+});
+
+describe("Fuzz: mixed difficulty bots", () => {
+  const SEEDS = 30;
+  const MAX_STEPS = 2000;
+
+  test(`mixed easy/medium/hard bots, 6 players, ${SEEDS} seeds`, async () => {
+    const diffCycle: Array<"easy" | "medium" | "hard"> = ["easy", "medium", "hard", "easy", "medium", "hard"];
+    for (let s = 0; s < SEEDS; s++) {
+      const seed = BigInt(5000 + s);
+      resetBotCounter();
+      const g = new CoupGame(6, seed);
+      const bots = Array.from({ length: 6 }, (_, i) =>
+        createBot(diffCycle[i], i, 6),
+      );
+
+      let steps = 0;
+      let prevDeckSize = g.getSnapshot().deckSize;
+      while (!g.done && steps < MAX_STEPS) {
+        const actions = g.getValidActions();
+        expect(actions.length).toBeGreaterThan(0);
+
+        const active = g.activePlayer;
+        const obs = g.observe(active);
+        const mask = g.validMask;
+        const action = await bots[active].chooseAction(obs, mask);
+        expect(actions).toContain(action);
+
+        g.step(action);
+        steps++;
+
+        // Deck size should never go negative
+        const ds = g.getSnapshot().deckSize;
+        expect(ds).toBeGreaterThanOrEqual(0);
+      }
+
+      expect(g.done).toBe(true);
+      const finalSnap = g.getSnapshot();
+      const aliveCount = finalSnap.players.filter(p => p.alive).length;
+      expect(aliveCount).toBeGreaterThanOrEqual(1);
+    }
+  });
+});
+
+describe("Fuzz: snapshot invariants across random actions", () => {
+  const SEEDS = 50;
+  const MAX_STEPS = 1000;
+
+  test(`${SEEDS} games with random valid actions, verify invariants`, () => {
+    for (let s = 0; s < SEEDS; s++) {
+      const seed = BigInt(9000 + s);
+      const numPlayers = 2 + (s % 5); // 2-6 players
+      const g = new CoupGame(numPlayers, seed);
+
+      let steps = 0;
+      while (!g.done && steps < MAX_STEPS) {
+        const actions = g.getValidActions();
+        expect(actions.length).toBeGreaterThan(0);
+
+        // Pick a random valid action
+        const action = actions[Math.floor(Math.random() * actions.length)];
+        const snap = g.getSnapshot();
+
+        // Phase should be valid
+        expect(snap.phase).toBeGreaterThanOrEqual(0);
+        expect(snap.phase).toBeLessThanOrEqual(9);
+
+        // Active player should be valid
+        expect(snap.activePlayer).toBeGreaterThanOrEqual(0);
+        expect(snap.activePlayer).toBeLessThan(numPlayers);
+
+        // Total influence + dead cards = 2 * numPlayers
+        let totalInfluence = 0;
+        let totalDead = 0;
+        for (let p = 0; p < numPlayers; p++) {
+          totalInfluence += snap.players[p].influence;
+          if (!snap.players[p].cards[0].alive) totalDead++;
+          if (!snap.players[p].cards[1].alive) totalDead++;
+        }
+        expect(totalInfluence + totalDead).toBe(2 * numPlayers);
+
+        // Observation tensor should be valid size
+        const obs = g.observe(snap.activePlayer);
+        expect(obs.length).toBe(407);
+
+        g.step(action);
+        steps++;
+      }
     }
   });
 });

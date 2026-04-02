@@ -934,6 +934,10 @@ int get_num_players_ext(const Game *g) {
     return get_num_players(g);
 }
 
+int get_deck_total(const Game *g) {
+    return deck_total(g);
+}
+
 /* ---- Observation ---- */
 
 int get_observation_size(void) {

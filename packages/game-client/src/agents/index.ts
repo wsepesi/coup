@@ -8,17 +8,33 @@ import { EasyBot } from "./heuristic-easy.js";
 import { MediumBot } from "./heuristic-medium.js";
 import { HardBot } from "./heuristic-hard.js";
 
-let botCounter = 1;
+const MII_NAMES = [
+  "Matt", "Lucia", "Elisa", "Tyrone", "Abby", "Ren", "Sakura", "Pierre",
+  "Haru", "Marco", "Emily", "Takumi", "Miyu", "Oscar", "Silke", "Theo",
+  "Naomi", "Kenji", "Gabi", "Luca", "Yuki", "Steph", "Akira", "Dina",
+  "Tommy", "Mia", "Fritz", "Elena", "Ravi", "Anna",
+];
+
+let namePool: string[] = [];
+
+function shuffleNames() {
+  namePool = [...MII_NAMES];
+  for (let i = namePool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [namePool[i], namePool[j]] = [namePool[j], namePool[i]];
+  }
+}
 
 export function createBot(difficulty: "easy" | "medium" | "hard", seat: number, numPlayers: number) {
-  const id = botCounter++;
+  if (namePool.length === 0) shuffleNames();
+  const name = namePool.pop()!;
   switch (difficulty) {
-    case "easy": return new EasyBot(id);
-    case "medium": return new MediumBot(id, seat);
-    case "hard": return new HardBot(id, seat, numPlayers);
+    case "easy": return new EasyBot(name);
+    case "medium": return new MediumBot(name, seat);
+    case "hard": return new HardBot(name, seat, numPlayers);
   }
 }
 
 export function resetBotCounter() {
-  botCounter = 1;
+  shuffleNames();
 }

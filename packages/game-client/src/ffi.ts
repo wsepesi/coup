@@ -61,6 +61,10 @@ function openLib() {
       args: [FFIType.ptr, FFIType.i32],
       returns: FFIType.void,
     },
+    get_deck_total: {
+      args: [FFIType.ptr],
+      returns: FFIType.i32,
+    },
   });
 }
 

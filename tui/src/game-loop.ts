@@ -22,7 +22,7 @@ import {
 import { createBot, resetBotCounter } from "@coup/game-client";
 
 import { computePlayerPositions, getTableCenter, type PlayerPosition } from "./layout.js";
-import { COLORS, getCardColors } from "./constants.js";
+import { COLORS, getCardColors, CARD_ABBREV } from "./constants.js";
 import { renderTable } from "./renderer/table.js";
 import { renderCenter } from "./renderer/center.js";
 import { renderHand } from "./renderer/hand.js";
@@ -35,6 +35,7 @@ import {
 } from "./renderer/actions.js";
 import { HistoryTicker } from "./renderer/history-ticker.js";
 import { renderGameOver, type GameResult } from "./renderer/game-over.js";
+import { renderDeckTracker, type DeckEvent } from "./renderer/deck-tracker.js";
 import { sleep, createSpinner } from "./animation/index.js";
 import type { GameConfig } from "./setup.js";
 
@@ -53,20 +54,34 @@ export async function runGame(
   const seed = config.seed ? BigInt(config.seed) : BigInt(Math.floor(Math.random() * 2 ** 32));
   const seedStr = seed.toString();
   const numPlayers = config.players;
-  const humanSeat = config.seat;
+  const humanSeat = config.seat === -2
+    ? Math.floor(Math.random() * numPlayers)
+    : config.seat;
 
   const game = new CoupGame(numPlayers, seed);
 
   const agents: (Agent | null)[] = [];
   for (let i = 0; i < numPlayers; i++) {
-    if (i === humanSeat) {
+    if (i === humanSeat && humanSeat >= 0 && humanSeat < numPlayers) {
       agents.push(null);
     } else {
       agents.push(createBot(config.difficulty, i, numPlayers));
     }
   }
 
-  const historyLines = Math.max(3, Math.min(8, Math.floor(h * 0.12)));
+  // Layout: bottom-up allocation so action panel + hand are always visible
+  const actionH = 6;  // separator + header + blank + 2 rows of options + padding
+  const handH = 8;    // "You" label + 5-line card + coins + claimed cards
+  // History: scale with screen, but guarantee at least 2 lines
+  const historyLines = h < 30 ? 2 : Math.max(4, Math.min(12, Math.floor(h * 0.20)));
+  const historyH = historyLines + 1; // +1 for separator
+  // Table zone: everything above the fixed bottom sections
+  const tableH = Math.max(6, h - actionH - historyH - handH);
+
+  const actionY = h - actionH;
+  const historyY = actionY - historyH;
+  const handY = historyY - handH;
+
   const history = new HistoryTicker(historyLines);
   let turnCount = 0;
   const eliminationOrder: { seat: number; turn: number }[] = [];
@@ -75,21 +90,79 @@ export async function runGame(
   // Claims tracking: seat → set of claimed card types
   const claimsMap = new Map<number, Set<CardType>>();
 
-  // Fast-forward: when human is eliminated, optionally skip animations
-  let fastForward = fast;
-  let humanElimPromptShown = false;
+  // Last main action per player (persists between turns)
+  const lastActionMap = new Map<number, number>();
 
-  // Layout: constrain zones to avoid overlap
-  const tableH = Math.floor(h * 0.55);
-  const handH = 7; // "You" label + 5-line card + coins
-  const handY = tableH - handH;
-  const centerMaxY = handY - 2; // center box must end above the hand
-  const historyY = tableH;
-  const historyH = historyLines + 1;
-  const actionY = historyY + historyH;
-  const actionH = h - actionY;
-  const positions = computePlayerPositions(numPlayers, w, h, tableH - handH);
-  const center = getTableCenter(w, Math.floor((tableH - handH) * 0.9));
+  // Pass collapsing: buffer consecutive pass names, flush as one line
+  const pendingPasses: { name: string; isYou: boolean }[] = [];
+  function flushPasses() {
+    if (pendingPasses.length === 0) return;
+    const entries = pendingPasses.splice(0);
+    if (entries.length === 1) {
+      const verb = entries[0].isYou ? "pass" : "passes";
+      history.push(`${entries[0].name} ${verb}.`);
+    } else {
+      history.push(`${entries.map(e => e.name).join(", ")} pass.`);
+    }
+  }
+
+  // Deck movement tracker
+  const deckEvents: DeckEvent[] = [];
+
+  // Speed control for spectating/watching
+  const SPEED_LEVELS = [
+    { name: "Slow",  mult: 1.5 },
+    { name: "Med",   mult: 1.0 },
+    { name: "Fast",  mult: 0.3 },
+    { name: "Ultra", mult: 0.08 },
+    { name: "FF",    mult: 0 },
+  ] as const;
+  let speedIdx = 1; // default: Med
+  let fastForward = fast;
+  if (fast) speedIdx = SPEED_LEVELS.length - 1;
+  let humanElimPromptShown = false;
+  const spectating = humanSeat < 0 || humanSeat >= numPlayers;
+
+  function currentSpeedName(): string {
+    return SPEED_LEVELS[speedIdx].name;
+  }
+
+  // Sleep that can be interrupted by speed change keys (when spectating/eliminated)
+  async function interruptibleSleep(ms: number) {
+    if (fastForward || SPEED_LEVELS[speedIdx].mult === 0) return;
+    const scaled = Math.round(ms * SPEED_LEVELS[speedIdx].mult);
+    if (scaled <= 0) return;
+    const timeout = new Promise<void>(r => setTimeout(r, scaled));
+    const keyPress = waitForKey().then(k => {
+      if (k.name === "f") { speedIdx = SPEED_LEVELS.length - 1; fastForward = true; }
+      else if (k.name === "," || k.name === "<") { speedIdx = Math.max(0, speedIdx - 1); }
+      else if (k.name === "." || k.name === ">") { speedIdx = Math.min(SPEED_LEVELS.length - 1, speedIdx + 1); }
+    });
+    await Promise.race([timeout, keyPress]);
+  }
+
+  // Table zone: row 1 to handY-1 (row 0 for seed label)
+  const tableTop = 1;
+  const tableZoneH = Math.max(4, handY - tableTop);
+  // Cap effective zone so opponents don't spread too thin on large screens
+  const effectiveZoneH = Math.min(tableZoneH, 22);
+  // Opponent positions in upper portion of table zone (humanSeat excluded)
+  const positions = computePlayerPositions(numPlayers, w, effectiveZoneH, humanSeat);
+  // Offset positions down by tableTop so they start below the seed line
+  for (const p of positions) {
+    p.y += tableTop;
+  }
+  // Center box positioned just below the opponents
+  const lowestOpponent = positions.length > 0
+    ? Math.max(...positions.map(p => p.y)) + 3 // +3 for player display height + gap
+    : tableTop + 2;
+  const centerBoxH = Math.min(7, Math.max(3, handY - lowestOpponent - 1));
+  const centerBoxW = Math.min(38, w < 100 ? 28 : w - 4);
+  const centerY = Math.min(
+    lowestOpponent + Math.ceil(centerBoxH / 2) + 1,
+    handY - Math.ceil(centerBoxH / 2) - 1,
+  );
+  const center = { x: Math.floor(w / 2), y: centerY };
 
   const buf = fb.frameBuffer;
 
@@ -126,11 +199,20 @@ export async function runGame(
     buf.drawText(seedLabel, w - seedLabel.length - 1, 0, RGBA.fromHex(COLORS.textDim));
 
     // Table (other players) with turn indicator and claimed cards
-    renderTable(buf, snapshot, positions, humanSeat, targetSeat, playerName, claimsMap);
+    renderTable(buf, snapshot, positions, humanSeat, targetSeat, playerName, claimsMap, lastActionMap);
 
     // Center text
     if (centerText) {
-      renderCenter(buf, centerText, center.x, center.y);
+      renderCenter(buf, centerText, center.x, center.y, centerBoxW, centerBoxH);
+    }
+
+    // Deck tracker (bottom-left of table zone)
+    const trackerW = 22;
+    const trackerH = Math.min(8, Math.max(4, handY - tableTop - 2));
+    const trackerX = 1;
+    const trackerY = Math.max(tableTop, handY - trackerH);
+    if (trackerH >= 3 && trackerY >= tableTop) {
+      renderDeckTracker(buf, snapshot.deckSize, deckEvents, trackerX, trackerY, trackerW, trackerH);
     }
 
     // Your hand
@@ -144,15 +226,36 @@ export async function runGame(
         RGBA.fromHex(COLORS.you),
       );
       renderHand(buf, me.cards, me.coins, w, handY + 1, selectedSlot);
+
+      // Show own claimed cards below coins
+      const myClaims = claimsMap.get(humanSeat);
+      if (myClaims && myClaims.size > 0) {
+        const cardColors = getCardColors();
+        const abbrevs = Array.from(myClaims).map(ct => ({ ct, ab: CARD_ABBREV[ct] }));
+        const totalLen = abbrevs.reduce((s, a) => s + a.ab.length + 1, -1);
+        let cx = Math.floor(w / 2) - Math.floor(totalLen / 2);
+        for (const { ct, ab } of abbrevs) {
+          buf.drawText(ab, cx, handY + 7, RGBA.fromHex(cardColors[ct]));
+          cx += ab.length + 1;
+        }
+      }
     }
 
     // History ticker
     history.render(buf, 0, historyY, w, historyH);
+
+    // Spectator hint with speed indicator
+    if (spectating || (!spectating && !snapshot.players[humanSeat]?.alive)) {
+      const speed = `[${currentSpeedName()}]`;
+      const hint = fastForward ? "" : `< > speed ${speed}   (F) skip to end   (H) history`;
+      buf.drawText(hint, Math.floor(w / 2) - Math.floor(hint.length / 2), actionY + 2, RGBA.fromHex(COLORS.textDim));
+    }
   }
 
   function trackEliminations(snapshot: GameSnapshot) {
     for (let i = 0; i < numPlayers; i++) {
       if (prevAlive[i] && !snapshot.players[i].alive) {
+        flushPasses();
         eliminationOrder.push({ seat: i, turn: turnCount });
         history.push(
           renderEvent({
@@ -167,6 +270,9 @@ export async function runGame(
     prevAlive = snapshot.players.map((p) => p.alive);
   }
 
+  // Track challenge state for detecting reshuffles
+  let pendingChallenge: { challenger: number; claimant: number; claimedCard: CardType } | null = null;
+
   function logAction(action: number, seat: number, phase?: Phase) {
     // Track claims
     const role = claimedRole(action);
@@ -180,15 +286,56 @@ export async function runGame(
       claimsMap.get(seat)!.add(bCard);
     }
 
+    // Track last main action per player
+    if (phase === Phase.MainAction && action >= Action.Income && action <= Action.AssassinateP5) {
+      lastActionMap.set(seat, action);
+    }
+
     // Suppress individual discard logs during exchange — logged as single event after
     if (phase === Phase.ExchangeDiscard && action >= Action.DiscardSlot0 && action <= Action.DiscardSlot3) {
       return;
     }
 
-    const target = actionTarget(action);
+    // Collapse consecutive passes into one line
+    if (action === Action.Pass) {
+      pendingPasses.push({ name: playerName(seat), isYou: isHuman(seat) });
+      return;
+    }
+
+    // Flush any buffered passes before logging a non-pass event
+    flushPasses();
+
+    let target = actionTarget(action);
+    // For challenges, the target is the turn player (the one who made the claim)
+    let challengedCard: CardType | undefined;
+    if (action === Action.Challenge && target == null) {
+      const snap = game.getSnapshot();
+      target = snap.turnPlayer;
+      const claimed = claimedRole(snap.pendingAction);
+      if (claimed != null) {
+        challengedCard = claimed;
+        pendingChallenge = { challenger: seat, claimant: snap.turnPlayer, claimedCard: claimed };
+      }
+    }
+
+    // Detect challenge reshuffle: when lose_card happens to the challenger, challenge failed
+    // → claimant's card gets reshuffled into deck
+    if (action >= Action.DiscardSlot0 && action <= Action.DiscardSlot3 && pendingChallenge) {
+      if (seat === pendingChallenge.challenger) {
+        // Challenge failed — claimant reveals and reshuffles
+        deckEvents.push({
+          card: pendingChallenge.claimedCard,
+          direction: "in",
+          description: "reshuffled",
+        });
+      }
+      pendingChallenge = null;
+    }
+
     const tName = target != null ? playerName(target) : undefined;
     const event = actionToEvent(action, seat, playerName(seat), isHuman(seat), target, tName, target != null ? isHuman(target) : undefined);
     if (event) {
+      if (challengedCard != null) event.card = challengedCard;
       history.push(renderEvent(event));
     }
   }
@@ -201,23 +348,44 @@ export async function runGame(
     const active = snapshot.activePlayer;
 
     // Check if human was just eliminated — offer fast-forward
-    const humanAlive = snapshot.players[humanSeat].alive;
-    if (!humanAlive && !humanElimPromptShown) {
+    const humanAlive = !spectating && snapshot.players[humanSeat]?.alive;
+    if (!spectating && !humanAlive && !humanElimPromptShown) {
       humanElimPromptShown = true;
       redraw(snapshot, ["You have been", "eliminated!"]);
       await sleep(500, false);
-      const promptText = "Press F to fast-forward, or any key to watch";
+      const promptText = "F skip to end | < > adjust speed | any key to watch";
       buf.drawText(promptText, Math.floor(w / 2) - Math.floor(promptText.length / 2), actionY + 2, RGBA.fromHex(COLORS.textBright));
       const key = await waitForKey();
       if (key.name === "f") {
+        speedIdx = SPEED_LEVELS.length - 1;
         fastForward = true;
       }
     }
 
-    if (active === humanSeat && humanAlive) {
+    if (!spectating && active === humanSeat && humanAlive) {
+      // Track exchange draws when entering exchange discard phase
+      if (snapshot.phase === Phase.ExchangeDiscard && snapshot.exchangeCards && !_pendingExchangeSlot) {
+        deckEvents.push({ card: snapshot.exchangeCards[0], direction: "out", description: "drawn" });
+        deckEvents.push({ card: snapshot.exchangeCards[1], direction: "out", description: "drawn" });
+      }
       const hadPending = _pendingExchangeSlot != null;
       const action = await humanTurn(game, snapshot, buf, waitForKey, humanSeat, w, h, actionY, actionH, redraw, actionContextText, playerName, isHuman, history, _pendingExchangeSlot);
       if (hadPending) _pendingExchangeSlot = null;
+      // Track exchange returns: the discarded card goes back to deck
+      if (snapshot.phase === Phase.ExchangeDiscard && action >= Action.DiscardSlot0 && action <= Action.DiscardSlot3) {
+        const slot = action - Action.DiscardSlot0;
+        const player = snapshot.players[humanSeat];
+        let discardedType: CardType | undefined;
+        if (slot < 2 && player?.cards[slot]) {
+          discardedType = player.cards[slot].type;
+        } else if (snapshot.exchangeCards) {
+          const exIdx = slot - 2;
+          if (exIdx >= 0 && exIdx < 2) discardedType = snapshot.exchangeCards[exIdx];
+        }
+        if (discardedType != null) {
+          deckEvents.push({ card: discardedType, direction: "in", description: "returned" });
+        }
+      }
       logAction(action, humanSeat, snapshot.phase);
       game.step(action);
       // Log exchange completion when phase transitions away
@@ -228,11 +396,15 @@ export async function runGame(
         }
       }
       if (snapshot.phase === Phase.MainAction) turnCount++;
-    } else if (active === humanSeat && !humanAlive) {
+    } else if (!spectating && active === humanSeat && !humanAlive) {
       // Dead human should not be active — skip
       break;
     } else {
-      await botTurn(game, snapshot, active, agents[active]!, buf, waitForKey, humanSeat, w, h, actionY, actionH, redraw, actionContextText, history, playerName, isHuman, logAction, fastForward, positions, agents);
+      const humanAliveNow = humanSeat >= 0 && humanSeat < numPlayers && snapshot.players[humanSeat].alive;
+      const doSleep = humanAliveNow
+        ? (ms: number) => sleep(ms, false)
+        : (ms: number) => interruptibleSleep(ms);
+      await botTurn(game, snapshot, active, agents[active]!, buf, waitForKey, humanSeat, w, h, actionY, actionH, redraw, actionContextText, history, playerName, isHuman, logAction, doSleep, positions, agents, deckEvents);
       if (snapshot.phase === Phase.MainAction) turnCount++;
     }
   }
@@ -397,6 +569,8 @@ async function handleExchangeDiscard(
     allCards.push({ type: snapshot.exchangeCards[1], slot: 3, source: "drawn" });
   }
 
+  const yoursCount = allCards.filter(c => c.source === "yours").length;
+  const keepCount = yoursCount; // keep as many as you currently have alive
   const selected = new Set<number>();
   let cursor = 0;
   const cardW = 11;
@@ -405,70 +579,109 @@ async function handleExchangeDiscard(
   const startX = Math.floor(w / 2) - Math.floor(totalW / 2);
 
   function render() {
-    redraw(snapshot, ["Ambassador Exchange", "Select 2 to DISCARD"]);
+    redraw(snapshot, ["Ambassador Exchange", "Select 2 to KEEP"]);
 
     // Draw separator
     buf.drawText("═".repeat(w), 0, actionY, RGBA.fromHex(COLORS.border));
 
-    const header = "Select 2 cards to discard (Space to toggle, Enter to confirm):";
-    buf.drawText(header, Math.floor(w / 2) - Math.floor(header.length / 2), actionY + 1, RGBA.fromHex(COLORS.textDefault));
+    const remaining = keepCount - selected.size;
+    const hint = remaining === 0
+      ? `Select ${keepCount} to KEEP:  ↑↓◀▶ move  Space toggle  Enter confirm`
+      : `Select ${keepCount} to KEEP:  ↑↓◀▶ move  Space toggle (${remaining} more)`;
+    buf.drawText(hint, 2, actionY + 1, RGBA.fromHex(COLORS.textDefault));
+    buf.drawText("(H) history", w - 14, actionY + 1, RGBA.fromHex(COLORS.textDim));
 
-    const cardY = actionY + 3;
+    // Horizontal card layout: "[X] ▸Captain (yours)   [ ] Duke (drawn)  ..."
+    // Build each item, measure total width, center the row
+    const items: { text: string; cardName: string; cardColor: string; isCursor: boolean; isSel: boolean; src: string }[] = [];
+    let totalItemW = 0;
+    const colSpacing = 4;
     for (let i = 0; i < allCards.length; i++) {
       const card = allCards[i];
-      const cx = startX + i * (cardW + gap);
       const isCursor = i === cursor;
       const isSel = selected.has(i);
-
-      const borderColor = isCursor
-        ? RGBA.fromHex(COLORS.textBright)
-        : isSel
-          ? RGBA.fromHex(COLORS.cursor)
-          : RGBA.fromHex(COLORS.border);
-
-      buf.drawBox({
-        x: cx, y: cardY, width: cardW, height: 5,
-        border: true, borderColor,
-        backgroundColor: RGBA.fromHex(COLORS.bg), shouldFill: true,
-      });
-
+      const checkbox = isSel ? "[X] " : "[ ] ";
+      const prefix = isCursor ? "▸ " : "  ";
       const name = CARD_NAMES[card.type];
-      const cc = RGBA.fromHex(cardColors[card.type]);
-      buf.drawText(name, cx + Math.floor((cardW - name.length) / 2), cardY + 1, cc);
       const src = `(${card.source})`;
-      buf.drawText(src, cx + Math.floor((cardW - src.length) / 2), cardY + 2, RGBA.fromHex(COLORS.textDim));
+      const text = `${prefix}${checkbox}${name} ${src}`;
+      items.push({ text, cardName: name, cardColor: cardColors[card.type], isCursor, isSel, src });
+      totalItemW += text.length;
+    }
+    totalItemW += colSpacing * (items.length - 1);
 
-      const checkbox = isSel ? "[X]" : "[ ]";
-      const cbColor = isSel ? RGBA.fromHex(COLORS.cursor) : RGBA.fromHex(COLORS.textDim);
-      buf.drawText(checkbox, cx + Math.floor((cardW - 3) / 2), cardY + 3, cbColor);
+    // Row 1: yours cards. Row 2: drawn cards.
+    const yoursItems = items.filter((_, i) => allCards[i].source === "yours");
+    const drawnItems = items.filter((_, i) => allCards[i].source === "drawn");
+
+    function drawRow(rowItems: typeof items, rowY: number) {
+      let rowW = 0;
+      for (const it of rowItems) rowW += it.text.length;
+      rowW += colSpacing * Math.max(0, rowItems.length - 1);
+      let cx = Math.floor(w / 2) - Math.floor(rowW / 2);
+
+      for (const it of rowItems) {
+        const bg = RGBA.fromHex(COLORS.bg);
+        const rowBg = it.isCursor ? RGBA.fromHex(COLORS.selectionBg) : bg;
+        if (it.isCursor) {
+          buf.fillRect(cx, rowY, it.text.length + 1, 1, rowBg);
+        }
+        // prefix
+        const prefixLen = it.isCursor ? 2 : 2;
+        const prefixText = it.isCursor ? "▸ " : "  ";
+        buf.drawText(prefixText, cx, rowY, RGBA.fromHex(COLORS.textBright), rowBg);
+        // checkbox
+        const cbText = it.isSel ? "[X] " : "[ ] ";
+        const cbColor = it.isSel ? RGBA.fromHex(COLORS.cursor) : RGBA.fromHex(COLORS.textDim);
+        buf.drawText(cbText, cx + prefixLen, rowY, cbColor, rowBg);
+        // card name
+        buf.drawText(it.cardName, cx + prefixLen + cbText.length, rowY, RGBA.fromHex(it.cardColor), rowBg);
+        // source
+        buf.drawText(` ${it.src}`, cx + prefixLen + cbText.length + it.cardName.length, rowY, RGBA.fromHex(COLORS.textDim), rowBg);
+
+        cx += it.text.length + colSpacing;
+      }
     }
 
-    const hint = selected.size === 2
-      ? "Press Enter to confirm"
-      : `Toggle ${2 - selected.size} more card${2 - selected.size !== 1 ? "s" : ""}`;
-    buf.drawText(hint, Math.floor(w / 2) - Math.floor(hint.length / 2), cardY + 6, RGBA.fromHex(COLORS.textDefault));
-
-    // History hint
-    buf.drawText("(H) history", w - 14, actionY + 1, RGBA.fromHex(COLORS.textDim));
+    drawRow(yoursItems, actionY + 3);
+    drawRow(drawnItems, actionY + 4);
   }
 
   render();
 
   while (true) {
     const key = await waitForKey();
-    if (key.name === "left") cursor = Math.max(0, cursor - 1);
-    else if (key.name === "right") cursor = Math.min(allCards.length - 1, cursor + 1);
+    if (key.name === "left" || key.name === "right") {
+      const next = key.name === "left" ? cursor - 1 : cursor + 1;
+      if (next >= 0 && next < allCards.length) cursor = next;
+    } else if (key.name === "up" || key.name === "down") {
+      // Jump between yours row and drawn row
+      if (key.name === "down" && cursor < yoursCount) {
+        // Move from yours row to drawn row (same column position)
+        const col = cursor;
+        const drawnIdx = yoursCount + Math.min(col, allCards.length - yoursCount - 1);
+        cursor = drawnIdx;
+      } else if (key.name === "up" && cursor >= yoursCount) {
+        // Move from drawn row to yours row
+        const col = cursor - yoursCount;
+        cursor = Math.min(col, yoursCount - 1);
+      }
+    }
     else if (key.name === " " || key.name === "space") {
       if (selected.has(cursor)) {
         selected.delete(cursor);
-      } else if (selected.size < 2) {
+      } else if (selected.size < keepCount) {
         selected.add(cursor);
       }
-    } else if (key.name === "return" && selected.size === 2) {
-      const slots = Array.from(selected).map(i => allCards[i].slot).sort((a, b) => a - b);
-      // Return first discard, store second via module-level side channel
-      _pendingExchangeSlot = Action.DiscardSlot0 + slots[1];
-      return Action.DiscardSlot0 + slots[0];
+    } else if (key.name === "return" && selected.size === keepCount) {
+      // Discard the UNselected cards (selected = keep)
+      const discardSlots = allCards
+        .map((c, i) => ({ slot: c.slot, idx: i }))
+        .filter(({ idx }) => !selected.has(idx))
+        .map(({ slot }) => slot)
+        .sort((a, b) => a - b);
+      _pendingExchangeSlot = Action.DiscardSlot0 + discardSlots[1];
+      return Action.DiscardSlot0 + discardSlots[0];
     } else if (key.name === "h") {
       await showFullHistory(buf, waitForKey, history, w, screenH);
     }
@@ -570,18 +783,19 @@ async function botTurn(
   playerName: (s: number) => string,
   isHuman: (s: number) => boolean,
   logAction: (a: number, s: number, p?: Phase) => void,
-  fast: boolean,
+  doSleep: (ms: number) => Promise<void>,
   positions: PlayerPosition[],
   agents: (Agent | null)[],
+  deckEvents: DeckEvent[],
 ) {
   const botName = playerName(botSeat);
 
   // Thinking display
   redraw(snapshot, [`${botName} is`, "thinking..."]);
   const pos = positions.find((p) => p.seat === botSeat);
-  const spinner = pos ? createSpinner(buf, pos.x + 12, pos.y, fast) : null;
+  const spinner = pos ? createSpinner(buf, pos.x + 12, pos.y, false) : null;
 
-  await sleep(300 + Math.random() * 300, fast);
+  await doSleep(300 + Math.random() * 300);
   spinner?.stop();
 
   // Bot decides
@@ -597,7 +811,7 @@ async function botTurn(
   const desc = describeAction(action, botName, false, actionTarget(action) != null ? playerName(actionTarget(action)!) : undefined);
   redraw(newSnap, [desc]);
 
-  await sleep(200, fast);
+  await doSleep(200);
 
   // Handle follow-up phases
   while (!game.done) {
@@ -607,11 +821,31 @@ async function botTurn(
     if (currentSnap.phase === Phase.MainAction) break;
 
     if (currentActive === humanSeat) {
+      // Track exchange draws when human enters exchange discard (from botTurn follow-up)
+      if (currentSnap.phase === Phase.ExchangeDiscard && currentSnap.exchangeCards && !_pendingExchangeSlot) {
+        deckEvents.push({ card: currentSnap.exchangeCards[0], direction: "out", description: "drawn" });
+        deckEvents.push({ card: currentSnap.exchangeCards[1], direction: "out", description: "drawn" });
+      }
       const hadPending = _pendingExchangeSlot != null;
       const humanAction = await humanTurn(
         game, currentSnap, buf, waitForKey, humanSeat, w, h, actionY, actionH, redraw, actionContextText, playerName, isHuman, history, _pendingExchangeSlot,
       );
       if (hadPending) _pendingExchangeSlot = null;
+      // Track exchange returns
+      if (currentSnap.phase === Phase.ExchangeDiscard && humanAction >= Action.DiscardSlot0 && humanAction <= Action.DiscardSlot3) {
+        const slot = humanAction - Action.DiscardSlot0;
+        const player = currentSnap.players[humanSeat];
+        let discardedType: CardType | undefined;
+        if (slot < 2 && player?.cards[slot]?.alive) {
+          discardedType = player.cards[slot].type;
+        } else if (currentSnap.exchangeCards) {
+          const exIdx = slot - 2;
+          if (exIdx >= 0 && exIdx < 2) discardedType = currentSnap.exchangeCards[exIdx];
+        }
+        if (discardedType != null) {
+          deckEvents.push({ card: discardedType, direction: "in", description: "returned" });
+        }
+      }
       logAction(humanAction, humanSeat, currentSnap.phase);
       game.step(humanAction);
       // Log exchange completion
@@ -622,7 +856,7 @@ async function botTurn(
         }
       }
       redraw(game.getSnapshot());
-      await sleep(150, fast);
+      await doSleep(150);
     } else {
       // Another bot responds
       const respAgent = agents[currentActive];
@@ -638,10 +872,11 @@ async function botTurn(
         const np = game.getSnapshot().phase;
         if (np !== Phase.ExchangeDiscard) {
           history.push(`${playerName(currentActive)} completes Exchange.`);
+          deckEvents.push({ direction: "swap", description: `${playerName(currentActive)} exchanged` });
         }
       }
       redraw(game.getSnapshot());
-      await sleep(150, fast);
+      await doSleep(150);
     }
   }
 }
@@ -717,11 +952,11 @@ function actionToEvent(
   if (action >= Action.AssassinateP0 && action <= Action.AssassinateP5)
     return { ...withTarget, type: "assassinate" };
   if (action === Action.Challenge)
-    return { ...base, type: "challenge" };
+    return { ...withTarget, type: "challenge" };
   if (action === Action.Pass)
     return { ...base, type: "pass" };
   if (action >= Action.BlockContessa && action <= Action.BlockDuke)
-    return { ...base, type: "block" };
+    return { ...base, type: "block", blockCard: blockCardType(action) ?? undefined };
   if (action >= Action.DiscardSlot0 && action <= Action.DiscardSlot3)
     return { ...base, type: "lose_card" };
   return null;

@@ -6,8 +6,8 @@ import { Action } from "../types.js";
 export class EasyBot implements Agent {
   readonly name: string;
 
-  constructor(id: number) {
-    this.name = `bot-${id}`;
+  constructor(name: string) {
+    this.name = name;
   }
 
   async chooseAction(_obs: Float32Array, validMask: number): Promise<number> {

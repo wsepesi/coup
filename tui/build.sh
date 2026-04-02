@@ -18,7 +18,10 @@ else
   echo "Built c_engine/libcoup.so"
 fi
 
-# Run TUI
-echo "Starting Coup TUI..."
-cd "$ROOT_DIR"
-bun run tui/src/index.ts "$@"
+# Run TUI only if --play flag is passed
+if [[ "$1" == "--play" ]]; then
+  shift
+  echo "Starting Coup TUI..."
+  cd "$ROOT_DIR"
+  bun run tui/src/index.ts "$@"
+fi

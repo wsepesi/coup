@@ -241,6 +241,7 @@ int get_active_player_ext(const Game *g);
 int is_done(const Game *g);
 int get_winner(const Game *g);
 int get_num_players_ext(const Game *g);
+int get_deck_total(const Game *g);
 
 #ifdef __cplusplus
 }

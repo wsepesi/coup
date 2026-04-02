@@ -170,6 +170,11 @@ export class CoupGame {
     return ((aux >> 9) & 0x7) as CardType;
   }
 
+  get deckSize(): number {
+    const lib = getLib();
+    return lib.symbols.get_deck_total(this.gamePtr) as number;
+  }
+
   getSnapshot(): GameSnapshot {
     const players: PlayerState[] = [];
     for (let i = 0; i < this._numPlayers; i++) {
@@ -192,6 +197,7 @@ export class CoupGame {
       done: this.done,
       winner: this.winner,
       validMask: this.validMask,
+      deckSize: this.deckSize,
       exchangeCards,
     };
   }

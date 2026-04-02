@@ -3,14 +3,15 @@
 import { CliRenderer, resolveRenderLib, RGBA } from "@opentui/core";
 import { FrameBufferRenderable } from "@opentui/core";
 import type { KeyEvent } from "@opentui/core";
-import { SetupScreen, type GameConfig } from "./setup.js";
+import { SetupScreen, showRulesScreen, type GameConfig } from "./setup.js";
 import { runGame } from "./game-loop.js";
 import { setTheme, MIN_TERM_WIDTH, MIN_TERM_HEIGHT } from "./constants.js";
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
-  if (args.light) setTheme("light");
+  if (args.dark) setTheme("dark");
+  else setTheme("light");
 
   const cols = process.stdout.columns || 100;
   const rows = process.stdout.rows || 30;
@@ -84,6 +85,13 @@ async function main() {
       }
       choice = await runGame(fb, waitForKey, config, cols, rows, args.fast ?? false);
     }
+  } catch (err) {
+    // Exit alternate screen so the error message is visible in the normal terminal
+    renderer.stop();
+    console.error("\n\x1b[31m=== Coup TUI Crashed ===\x1b[0m\n");
+    console.error(err);
+    console.error("\nPlease report this bug with the seed and steps to reproduce.");
+    process.exit(1);
   } finally {
     process.exit(0);
   }
@@ -110,6 +118,11 @@ async function showSetup(
     if (result === "start") {
       return setup.getConfig();
     }
+    if (result === "rules") {
+      await showRulesScreen(buf, waitForKey, width, height);
+      render();
+      continue;
+    }
     render();
   }
 }
@@ -120,7 +133,7 @@ interface CliArgs {
   difficulty?: "easy" | "medium" | "hard";
   seed?: string;
   fast?: boolean;
-  light?: boolean;
+  dark?: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -134,7 +147,7 @@ function parseArgs(argv: string[]): CliArgs {
       case "--difficulty": args.difficulty = next as any; i++; break;
       case "--seed": args.seed = next; i++; break;
       case "--fast": args.fast = true; break;
-      case "--light": args.light = true; break;
+      case "--dark": args.dark = true; break;
     }
   }
   return args;

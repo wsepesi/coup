@@ -2,25 +2,30 @@
 
 import { OptimizedBuffer, RGBA } from "@opentui/core";
 import { COLORS } from "../constants.js";
-import { CENTER_BOX_WIDTH, CENTER_BOX_HEIGHT } from "../layout.js";
 
 const col = (hex: string) => RGBA.fromHex(hex);
 
+// Dynamically sized center box that shrinks on small screens
 export function renderCenter(
   buffer: OptimizedBuffer,
   text: string[],
   cx: number,
   cy: number,
+  maxWidth?: number,
+  maxHeight?: number,
 ): void {
-  const bx = cx - Math.floor(CENTER_BOX_WIDTH / 2);
-  const by = cy - Math.floor(CENTER_BOX_HEIGHT / 2);
+  const boxW = Math.min(maxWidth ?? 38, 38);
+  const boxH = Math.min(maxHeight ?? 7, 7);
+
+  const bx = cx - Math.floor(boxW / 2);
+  const by = cy - Math.floor(boxH / 2);
 
   // Draw bordered box
   buffer.drawBox({
     x: bx,
     y: by,
-    width: CENTER_BOX_WIDTH,
-    height: CENTER_BOX_HEIGHT,
+    width: boxW,
+    height: boxH,
     border: true,
     borderColor: col(COLORS.border),
     backgroundColor: col(COLORS.bg),
@@ -28,7 +33,7 @@ export function renderCenter(
   });
 
   // Word-wrap and draw each text line centered within the box
-  const innerWidth = CENTER_BOX_WIDTH - 2;
+  const innerWidth = boxW - 2;
   const wrapped: string[] = [];
   for (const line of text) {
     if (line.length <= innerWidth) {
@@ -48,9 +53,9 @@ export function renderCenter(
     }
   }
 
-  const maxLines = CENTER_BOX_HEIGHT - 2;
+  const maxLines = boxH - 2;
   const lines = wrapped.slice(0, maxLines);
-  const startY = by + 1 + Math.floor((CENTER_BOX_HEIGHT - 2 - lines.length) / 2);
+  const startY = by + 1 + Math.floor((boxH - 2 - lines.length) / 2);
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];

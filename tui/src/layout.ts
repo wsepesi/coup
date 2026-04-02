@@ -6,56 +6,51 @@ export interface PlayerPosition {
   seat: number;
 }
 
-// Compute player positions for N players on an oval layout.
-// Seat 0 (you) is always at bottom center. Others wrap clockwise.
-// Returns positions in character coordinates for a terminal of given size.
+// Compute opponent positions on the upper arc of an oval.
+// humanSeat is excluded — it's rendered separately as the hand at the bottom.
+// Returns positions in character coordinates for the table zone (0-based, caller offsets).
 export function computePlayerPositions(
   playerCount: number,
   termWidth: number,
-  termHeight: number,
-  tableHeight: number, // height of the table zone
+  tableZoneHeight: number,
+  humanSeat: number,
 ): PlayerPosition[] {
   const positions: PlayerPosition[] = [];
   const cx = Math.floor(termWidth / 2);
-  const cy = Math.floor(tableHeight / 2);
-  const rx = Math.floor(termWidth * 0.30); // horizontal radius
-  const ry = Math.floor(tableHeight * 0.30); // vertical radius
+  const cy = Math.floor(tableZoneHeight / 2);
+  // Radii: clamp for large screens, floor for tiny ones
+  const rx = Math.min(Math.max(Math.floor(termWidth * 0.35), 15), 60);
+  const ry = Math.min(Math.max(Math.floor(tableZoneHeight * 0.35), 2), 12);
 
-  // Predefined angle layouts per player count
-  // Seat 0 at bottom (angle = PI/2 from top, or 270° in standard, we use radians from top going clockwise)
-  // We place seat 0 at the bottom, then go clockwise
-  const angles = getSeatAngles(playerCount);
-
+  // Collect opponent seats
+  const opponents: number[] = [];
   for (let i = 0; i < playerCount; i++) {
-    const angle = angles[i];
+    if (i !== humanSeat) opponents.push(i);
+  }
+
+  // Spread opponents across the upper arc only (hand occupies the bottom).
+  // Angle convention: 0 = bottom (y=cy+ry), PI = top (y=cy-ry).
+  // Arc from 2PI/3 (upper-right) through PI (top) to 4PI/3 (upper-left).
+  // This keeps all opponents in the upper half of the table zone.
+  const arcStart = (2 * Math.PI) / 3;
+  const arcEnd = (4 * Math.PI) / 3;
+  const arcSpan = arcEnd - arcStart;
+
+  for (let i = 0; i < opponents.length; i++) {
+    let angle: number;
+    if (opponents.length === 1) {
+      angle = Math.PI; // single opponent at top center
+    } else {
+      angle = arcStart + i * arcSpan / (opponents.length - 1);
+    }
     const x = Math.round(cx + rx * Math.sin(angle));
     const y = Math.round(cy + ry * Math.cos(angle));
-    positions.push({ x, y, seat: i });
+    // Clamp y to stay within table zone with room for 2-line player display
+    const clampedY = Math.max(0, Math.min(tableZoneHeight - 2, y));
+    positions.push({ x, y: clampedY, seat: opponents[i] });
   }
 
   return positions;
-}
-
-function getSeatAngles(n: number): number[] {
-  // Seat 0 at bottom (angle 0 = bottom), going clockwise
-  // bottom = 0, right = PI/2, top = PI, left = 3PI/2
-  switch (n) {
-    case 2:
-      return [0, Math.PI]; // you bottom, opponent top
-    case 3:
-      return [0, (Math.PI * 4) / 3, (Math.PI * 2) / 3]; // bottom, upper-left, upper-right
-    case 4:
-      return [0, (Math.PI * 5) / 4, Math.PI, (Math.PI * 3) / 4]; // bottom, lower-left, top, upper-right...
-      // Actually: bottom, left, top, right
-    case 5:
-      return [0, (Math.PI * 6) / 5, (Math.PI * 4) / 5, (Math.PI * 2) / 5, (Math.PI * 8) / 5].map(a => a); // nope
-    case 6:
-      // Seat layout from plan: [0]=bottom, [1]=lower-left, [2]=top, [3]=upper-right, [4]=lower-right, [5]=lower-left
-      // Actually plan says: [2] top, [1] upper-left, [3] upper-right, [5] lower-left, [4] lower-right, [0] bottom
-      return [0, 1, 2, 3, 4, 5].map(i => (Math.PI * 2 * i) / 6);
-    default:
-      return Array.from({ length: n }, (_, i) => (Math.PI * 2 * i) / n);
-  }
 }
 
 // Spatial navigation: given current seat, direction, alive mask, return next seat
@@ -68,7 +63,6 @@ export function spatialNavigate(
   positions: PlayerPosition[],
   humanSeat: number,
 ): number | null {
-  // Filter to valid targets (alive, not self/human)
   const candidates = positions.filter(
     (p) => p.seat !== humanSeat && aliveMask[p.seat] && p.seat !== currentSeat
   );
@@ -77,13 +71,12 @@ export function spatialNavigate(
   const current = positions.find((p) => p.seat === currentSeat);
   if (!current) return candidates[0].seat;
 
-  // Find closest candidate in the given direction
   let best: PlayerPosition | null = null;
   let bestDist = Infinity;
 
   for (const c of candidates) {
     const dx = c.x - current.x;
-    const dy = c.y - current.y; // positive = down in terminal coords
+    const dy = c.y - current.y;
 
     let inDirection = false;
     switch (direction) {
@@ -102,9 +95,7 @@ export function spatialNavigate(
     }
   }
 
-  // If no candidate in that direction, wrap around
   if (!best) {
-    // Find the farthest candidate in the opposite direction (wrap)
     let farthest: PlayerPosition | null = null;
     let farthestDist = -1;
     for (const c of candidates) {

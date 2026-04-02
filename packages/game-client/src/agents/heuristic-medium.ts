@@ -7,8 +7,8 @@ export class MediumBot implements Agent {
   readonly name: string;
   private seat: number;
 
-  constructor(id: number, seat: number) {
-    this.name = `bot-${id}`;
+  constructor(name: string, seat: number) {
+    this.name = name;
     this.seat = seat;
   }
 
@@ -16,7 +16,7 @@ export class MediumBot implements Agent {
     const actions = getValidActions(validMask);
     if (actions.length === 1) return actions[0];
 
-    const myCards = getOwnCards(obs);
+    const myCards = getOwnCards(obs, this.seat);
 
     // LOSE_CARD: lose the less valuable card
     if (actions.some(a => a >= Action.DiscardSlot0 && a <= Action.DiscardSlot3)) {
@@ -77,8 +77,11 @@ export class MediumBot implements Agent {
       }
     }
 
-    // Foreign Aid as fallback
-    if (actions.includes(Action.ForeignAid)) return Action.ForeignAid;
+    // Foreign Aid as fallback — but only if all 3 Dukes are known dead (face-up),
+    // otherwise someone could block with a Duke
+    if (actions.includes(Action.ForeignAid) && countRevealedDukes(obs) >= 3) {
+      return Action.ForeignAid;
+    }
 
     // Income as last resort
     if (actions.includes(Action.Income)) return Action.Income;
@@ -172,27 +175,39 @@ function getValidActions(mask: number): number[] {
   return actions;
 }
 
-// Extract own cards from observation tensor
-// Observation layout (from plan.md §6):
-// [0-4]: card0 type one-hot (5 floats)
-// [5]: card0 alive
-// [6-10]: card1 type one-hot (5 floats)
-// [11]: card1 alive
-function getOwnCards(obs: Float32Array): CardType[] {
+// Extract own cards from observation tensor using the bot's seat index.
+// Obs layout: 6 players × 12 floats. Per card: type one-hot(5) + alive(1).
+function getOwnCards(obs: Float32Array, seat: number): CardType[] {
+  const base = seat * 12;
   const cards: CardType[] = [];
   // Card 0
-  if (obs[5] > 0.5) { // alive
+  if (obs[base + 5] > 0.5) { // alive
     for (let i = 0; i < 5; i++) {
-      if (obs[i] > 0.5) { cards.push(i as CardType); break; }
+      if (obs[base + i] > 0.5) { cards.push(i as CardType); break; }
     }
   }
   // Card 1
-  if (obs[11] > 0.5) { // alive
+  if (obs[base + 11] > 0.5) { // alive
     for (let i = 0; i < 5; i++) {
-      if (obs[6 + i] > 0.5) { cards.push(i as CardType); break; }
+      if (obs[base + 6 + i] > 0.5) { cards.push(i as CardType); break; }
     }
   }
   return cards;
+}
+
+// Count face-up (dead) Dukes visible in the observation tensor.
+// Obs layout: 6 players × 12 floats. Per card: type one-hot(5) + alive(1).
+// A dead card with Duke type has obs[p*12 + 0]=1 (Duke=0) and alive=0.
+function countRevealedDukes(obs: Float32Array): number {
+  let count = 0;
+  for (let p = 0; p < 6; p++) {
+    const base = p * 12;
+    // Card 0: Duke type at base+0, alive at base+5
+    if (obs[base] > 0.5 && obs[base + 5] < 0.5) count++;
+    // Card 1: Duke type at base+6, alive at base+11
+    if (obs[base + 6] > 0.5 && obs[base + 11] < 0.5) count++;
+  }
+  return count;
 }
 
 // Get coins for a player from observation

@@ -166,6 +166,8 @@ export function renderActionPanel(
   const startY = y + 3;
   const colWidth = Math.floor((width - 4) / GRID_COLS);
 
+  const selBg = RGBA.fromHex(COLORS.selectionBg);
+
   for (let i = 0; i < options.length; i++) {
     const row = Math.floor(i / GRID_COLS);
     const col = i % GRID_COLS;
@@ -177,8 +179,13 @@ export function renderActionPanel(
     const isSelected = i === selectedIndex;
     const prefix = isSelected ? "▸ " : "  ";
     const fg = isSelected ? brightColor : dimColor;
+    const rowBg = isSelected ? selBg : bg;
 
-    buffer.drawText(prefix + options[i].label, ox, oy, fg, bg);
+    const text = prefix + options[i].label;
+    if (isSelected) {
+      buffer.fillRect(ox, oy, text.length + 1, 1, selBg);
+    }
+    buffer.drawText(text, ox, oy, fg, rowBg);
   }
 }
 
@@ -203,27 +210,26 @@ export function navigateGrid(
   const col = currentIndex % cols;
   const totalRows = Math.ceil(totalItems / cols);
 
-  let newRow = row;
-  let newCol = col;
-
   switch (direction) {
-    case "up":
-      newRow = row > 0 ? row - 1 : totalRows - 1;
-      break;
-    case "down":
-      newRow = row < totalRows - 1 ? row + 1 : 0;
-      break;
-    case "left":
-      newCol = col > 0 ? col - 1 : cols - 1;
-      break;
-    case "right":
-      newCol = col < cols - 1 ? col + 1 : 0;
-      break;
+    case "left": {
+      const next = currentIndex - 1;
+      return next < 0 ? totalItems - 1 : next;
+    }
+    case "right": {
+      const next = currentIndex + 1;
+      return next >= totalItems ? 0 : next;
+    }
+    case "up": {
+      const newRow = row > 0 ? row - 1 : totalRows - 1;
+      let newIndex = newRow * cols + col;
+      if (newIndex >= totalItems) newIndex = totalItems - 1;
+      return Math.max(0, newIndex);
+    }
+    case "down": {
+      const newRow = row < totalRows - 1 ? row + 1 : 0;
+      let newIndex = newRow * cols + col;
+      if (newIndex >= totalItems) newIndex = totalItems - 1;
+      return Math.max(0, newIndex);
+    }
   }
-
-  let newIndex = newRow * cols + newCol;
-  if (newIndex >= totalItems) {
-    newIndex = totalItems - 1;
-  }
-  return Math.max(0, newIndex);
 }

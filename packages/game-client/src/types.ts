@@ -71,6 +71,7 @@ export interface GameSnapshot {
   done: boolean;
   winner: number;
   validMask: number;
+  deckSize: number;
   exchangeCards?: [CardType, CardType];
 }
 

@@ -17,6 +17,7 @@ export function renderTable(
   targetSeat?: number,
   playerNames?: (seat: number) => string,
   claimsMap?: Map<number, Set<CardType>>,
+  lastActionMap?: Map<number, number>,
 ): void {
   for (const pos of positions) {
     if (pos.seat === humanSeat) continue;
@@ -98,16 +99,21 @@ export function renderTable(
       }
     }
 
-    // --- Line 4: turn action indicator ---
-    if (isTurnPlayer && !isDead && snapshot.pendingAction >= 0) {
-      const target = actionTarget(snapshot.pendingAction);
+    // --- Line 4: action indicator (current pending or last action) ---
+    const showAction = isTurnPlayer && !isDead && snapshot.pendingAction >= 0
+      ? snapshot.pendingAction
+      : lastActionMap?.get(pos.seat) ?? -1;
+    if (showAction >= 0 && !isDead) {
+      const target = actionTarget(showAction);
       const targetName = target != null && playerNames ? playerNames(target) : undefined;
-      const actionDesc = describeShortAction(snapshot.pendingAction, targetName);
+      const actionDesc = describeShortAction(showAction, targetName);
       if (actionDesc) {
-        const role = claimedRole(snapshot.pendingAction);
-        const arrowColor = role != null ? col(getCardColors()[role]) : col(COLORS.textBright);
+        const role = claimedRole(showAction);
+        const isCurrent = isTurnPlayer && snapshot.pendingAction >= 0;
+        const arrowColor = role != null ? col(getCardColors()[role]) : col(isCurrent ? COLORS.textBright : COLORS.textDim);
+        const textColor = col(isCurrent ? COLORS.textBright : COLORS.textDim);
         buffer.drawText("→", px, py + 3, arrowColor);
-        buffer.drawText(` ${actionDesc}`, px + 1, py + 3, col(COLORS.textBright));
+        buffer.drawText(` ${actionDesc}`, px + 1, py + 3, textColor);
       }
     }
   }
