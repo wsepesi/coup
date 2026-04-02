@@ -32,6 +32,7 @@ static int next_alive_player(const Game *g, int after) {
 }
 
 static void advance_turn(Game *g) {
+    g->turn_count++;
     int tp = get_turn_player(g);
     int next = next_alive_player(g, tp);
     set_turn_player(g, next);
@@ -893,20 +894,40 @@ int get_active_player_ext(const Game *g) {
 }
 
 int is_done(const Game *g) {
-    return alive_count(g) <= 1;
+    if (alive_count(g) <= 1) return 1;
+    if (g->turn_count >= MAX_TURNS) return 1;
+    return 0;
 }
 
 int get_winner(const Game *g) {
     int np = get_num_players(g);
-    int winner = -1;
-    int count = 0;
+
+    /* Collect alive players */
+    int alive[6];
+    int n_alive = 0;
     for (int i = 0; i < np; i++) {
-        if (player_is_alive(g, i)) {
-            winner = i;
-            count++;
+        if (player_is_alive(g, i))
+            alive[n_alive++] = i;
+    }
+
+    if (n_alive == 0) return -1;
+    if (n_alive == 1) return alive[0];
+
+    /* Tiebreaker: most alive cards, then most coins */
+    int best = alive[0];
+    int best_cards = player_card0_alive(g, best) + player_card1_alive(g, best);
+    int best_coins = player_coins(g, best);
+    for (int j = 1; j < n_alive; j++) {
+        int p = alive[j];
+        int cards = player_card0_alive(g, p) + player_card1_alive(g, p);
+        int coins = player_coins(g, p);
+        if (cards > best_cards || (cards == best_cards && coins > best_coins)) {
+            best = p;
+            best_cards = cards;
+            best_coins = coins;
         }
     }
-    return (count == 1) ? winner : -1;
+    return best;
 }
 
 int get_num_players_ext(const Game *g) {
@@ -919,50 +940,31 @@ int get_observation_size(void) {
     return OBS_SIZE;
 }
 
-void observe(const Game *g, int player_id, const HistoryEntry *history,
-             int history_len, float *out)
+void observe(const Game *g, int player_id, const HistoryBuffer *history,
+             float *out)
 {
     memset(out, 0, OBS_SIZE * sizeof(float));
     int off = 0;
 
-    /* Own card0: one-hot type (5) + alive (1) */
-    out[off + player_card0_type(g, player_id)] = 1.0f;
-    off += 5;
-    out[off] = (float)player_card0_alive(g, player_id);
-    off += 1;
-
-    /* Own card1: one-hot type (5) + alive (1) */
-    out[off + player_card1_type(g, player_id)] = 1.0f;
-    off += 5;
-    out[off] = (float)player_card1_alive(g, player_id);
-    off += 1;
-    /* off == 12 */
-
-    /* Other players (5 slots x 12 floats = 60) */
+    /* All players' cards — absolute encoding (6 players x 12 floats = 72)
+     * Per card: type one-hot (5) + alive flag (1)
+     * Type is visible if: (a) this is the observer's card, or (b) card is dead.
+     * Alive flag is always public. */
     int np = get_num_players(g);
-    for (int i = 0; i < 5; i++) {
-        int p = (player_id + 1 + i) % MAX_PLAYERS;
+    for (int p = 0; p < MAX_PLAYERS; p++) {
         if (p < np) {
-            /* card0: revealed = one-hot of type; hidden = zeros */
+            int is_self = (p == player_id);
             int c0_alive = player_card0_alive(g, p);
-            if (!c0_alive) {
+            if (is_self || !c0_alive)
                 out[off + player_card0_type(g, p)] = 1.0f;
-            }
-            off += 5;
-            out[off] = c0_alive ? 0.0f : 1.0f;  /* revealed flag */
-            off += 1;
+            out[off + 5] = (float)c0_alive;
 
-            /* card1 */
             int c1_alive = player_card1_alive(g, p);
-            if (!c1_alive) {
-                out[off + player_card1_type(g, p)] = 1.0f;
-            }
-            off += 5;
-            out[off] = c1_alive ? 0.0f : 1.0f;
-            off += 1;
-        } else {
-            off += 12;
+            if (is_self || !c1_alive)
+                out[off + 6 + player_card1_type(g, p)] = 1.0f;
+            out[off + 11] = (float)c1_alive;
         }
+        off += 12;
     }
     /* off == 72 */
 
@@ -1048,15 +1050,243 @@ void observe(const Game *g, int player_id, const HistoryEntry *history,
     off += 10;
     /* off == 151 */
 
-    /* History (64 entries x 4 floats = 256) */
-    int n = history_len;
-    if (n > 64) n = 64;
-    for (int i = 0; i < n; i++) {
-        int base = off + i * 4;
-        out[base + 0] = (float)history[i].acting_player / 6.0f;
-        out[base + 1] = (float)history[i].action / 32.0f;
-        out[base + 2] = (float)history[i].phase / 10.0f;
-        out[base + 3] = (float)history[i].result / 255.0f;
+    /* History (64 entries x 4 floats = 256)
+     * Stored newest-first: slot 0 = most recent action.
+     * Read directly from ring buffer — no reversal needed. */
+    if (history) {
+        int n = history->len;
+        if (n > 64) n = 64;
+        for (int i = 0; i < n; i++) {
+            HistoryEntry e = history_get(history, i);
+            int base = off + i * 4;
+            out[base + 0] = (float)e.acting_player / 6.0f;
+            out[base + 1] = (float)e.action / 32.0f;
+            out[base + 2] = (float)e.phase / 10.0f;
+            out[base + 3] = (float)e.result / 255.0f;
+        }
     }
     /* off += 256; total = 407 */
+}
+
+/* ---- Incremental observation ---- */
+
+/* Extract fields from raw bit-packed uint16_t (mirrors inline helpers) */
+static inline int snap_card0_type(uint16_t pw) { return pw & 0x7; }
+static inline int snap_card0_alive(uint16_t pw) { return (pw >> 3) & 1; }
+static inline int snap_card1_type(uint16_t pw) { return (pw >> 4) & 0x7; }
+static inline int snap_card1_alive(uint16_t pw) { return (pw >> 7) & 1; }
+static inline int snap_coins(uint16_t pw) { return (pw >> 8) & 0xF; }
+static inline int snap_is_alive(uint16_t pw) { return snap_card0_alive(pw) || snap_card1_alive(pw); }
+
+static inline int snap_phase(uint16_t ps) { return ps & 0xF; }
+static inline int snap_turn_player(uint16_t ps) { return (ps >> 4) & 0x7; }
+static inline int snap_active_player(uint16_t ps) { return (ps >> 7) & 0x7; }
+static inline int snap_pending_action(uint16_t ps) { return (ps >> 10) & 0x3F; }
+static inline int snap_responded_mask(uint16_t ax) { return ax & 0x3F; }
+static inline int snap_exchange_card0(uint16_t ax) { return (ax >> 6) & 0x7; }
+static inline int snap_exchange_card1(uint16_t ax) { return (ax >> 9) & 0x7; }
+
+static int phase_to_obs_idx(int phase) {
+    switch (phase) {
+        case PHASE_MAIN_ACTION:      return 0;
+        case PHASE_CHALLENGE_ACTION: return 1;
+        case PHASE_BLOCK:            return 2;
+        case PHASE_CHALLENGE_BLOCK:  return 3;
+        case PHASE_LOSE_CARD:        return 4;
+        case PHASE_EXCHANGE_DISCARD: return 5;
+        default:                     return 6;
+    }
+}
+
+void observe_incremental(const Game *g, int player_id,
+                         const HistoryBuffer *history,
+                         float *out, ObsSnapshot *snap)
+{
+    /* First call: full recompute */
+    if (snap->player_id < 0) {
+        observe(g, player_id, history, out);
+        for (int i = 0; i < 6; i++) snap->players[i] = g->players[i];
+        snap->phase_state = g->phase_state;
+        snap->aux = g->aux;
+        snap->history_len = history ? history->len : 0;
+        snap->player_id = (int8_t)player_id;
+        return;
+    }
+
+    int np = get_num_players(g);
+    int old_pid = snap->player_id;
+
+    /* --- Cards [0-71] — absolute encoding --- */
+    /* With absolute encoding, card state + visibility can change from two sources:
+     * 1. player_id changed (is_self toggled for two players)
+     * 2. Card state changed (reveal, loss, exchange)
+     * Both can happen simultaneously. Simplest correct approach: rewrite any
+     * player whose card state OR is_self status changed. */
+    for (int p = 0; p < np; p++) {
+        int was_self = (p == old_pid);
+        int is_self = (p == player_id);
+        int state_changed = (g->players[p] != snap->players[p]);
+        int self_changed = (was_self != is_self);
+
+        if (!state_changed && !self_changed) continue;
+
+        int off = p * 12;
+        uint16_t old_pw = snap->players[p];
+
+        /* Zero old card0 type (was visible if was_self or was dead) */
+        int old_c0_alive = snap_card0_alive(old_pw);
+        int old_c0_type = snap_card0_type(old_pw);
+        if (was_self || !old_c0_alive)
+            out[off + old_c0_type] = 0.0f;
+
+        /* Write new card0 type (visible if is_self or dead) */
+        int new_c0_alive = player_card0_alive(g, p);
+        int new_c0_type = player_card0_type(g, p);
+        if (is_self || !new_c0_alive)
+            out[off + new_c0_type] = 1.0f;
+        if (state_changed)
+            out[off + 5] = (float)new_c0_alive;
+
+        /* Zero old card1 type */
+        int old_c1_alive = snap_card1_alive(old_pw);
+        int old_c1_type = snap_card1_type(old_pw);
+        if (was_self || !old_c1_alive)
+            out[off + 6 + old_c1_type] = 0.0f;
+
+        /* Write new card1 type */
+        int new_c1_alive = player_card1_alive(g, p);
+        int new_c1_type = player_card1_type(g, p);
+        if (is_self || !new_c1_alive)
+            out[off + 6 + new_c1_type] = 1.0f;
+        if (state_changed)
+            out[off + 11] = (float)new_c1_alive;
+    }
+
+    /* --- Coins [72-77] --- */
+    for (int i = 0; i < np; i++) {
+        if (snap_coins(snap->players[i]) != player_coins(g, i)) {
+            out[72 + i] = (float)player_coins(g, i) / 12.0f;
+        }
+    }
+
+    /* --- Alive mask [78-83] --- */
+    for (int i = 0; i < np; i++) {
+        int old_alive = snap_is_alive(snap->players[i]);
+        int new_alive = player_is_alive(g, i) ? 1 : 0;
+        if (old_alive != new_alive) {
+            out[78 + i] = (float)new_alive;
+        }
+    }
+
+    /* --- Phase one-hot [84-90] --- */
+    {
+        int old_phase = snap_phase(snap->phase_state);
+        int new_phase = get_phase(g);
+        if (old_phase != new_phase) {
+            out[84 + phase_to_obs_idx(old_phase)] = 0.0f;
+            out[84 + phase_to_obs_idx(new_phase)] = 1.0f;
+        }
+    }
+
+    /* --- Active player one-hot [91-96] --- */
+    {
+        int old_ap = snap_active_player(snap->phase_state);
+        int new_ap = get_active_player(g);
+        if (old_ap != new_ap) {
+            out[91 + old_ap] = 0.0f;
+            out[91 + new_ap] = 1.0f;
+        }
+    }
+
+    /* --- Turn player one-hot [97-102] --- */
+    {
+        int old_tp = snap_turn_player(snap->phase_state);
+        int new_tp = get_turn_player(g);
+        if (old_tp != new_tp) {
+            out[97 + old_tp] = 0.0f;
+            out[97 + new_tp] = 1.0f;
+        }
+    }
+
+    /* --- Pending action one-hot [103-134] --- */
+    {
+        int old_pa = snap_pending_action(snap->phase_state);
+        int new_pa = get_pending_action(g);
+        if (old_pa != new_pa) {
+            if (old_pa < 32) out[103 + old_pa] = 0.0f;
+            if (new_pa < 32) out[103 + new_pa] = 1.0f;
+        }
+    }
+
+    /* --- Responded mask [135-140] --- */
+    {
+        int old_rm = snap_responded_mask(snap->aux);
+        int new_rm = get_responded_mask(g);
+        if (old_rm != new_rm) {
+            for (int i = 0; i < MAX_PLAYERS; i++) {
+                int old_bit = (old_rm >> i) & 1;
+                int new_bit = (new_rm >> i) & 1;
+                if (old_bit != new_bit) {
+                    out[135 + i] = new_bit ? 1.0f : 0.0f;
+                }
+            }
+        }
+    }
+
+    /* --- Exchange cards [141-150] --- */
+    {
+        int old_phase = snap_phase(snap->phase_state);
+        int new_phase = get_phase(g);
+        int old_in_exchange = (old_phase == PHASE_EXCHANGE_DISCARD &&
+                               snap_active_player(snap->phase_state) == old_pid);
+        int new_in_exchange = (new_phase == PHASE_EXCHANGE_DISCARD &&
+                               get_active_player(g) == player_id);
+
+        if (old_in_exchange && !new_in_exchange) {
+            /* Leaving exchange: zero out */
+            int oec0 = snap_exchange_card0(snap->aux);
+            int oec1 = snap_exchange_card1(snap->aux);
+            if (oec0 < 5) out[141 + oec0] = 0.0f;
+            if (oec1 < 5) out[146 + oec1] = 0.0f;
+        } else if (new_in_exchange) {
+            /* In exchange (entering or cards changed): update */
+            if (old_in_exchange) {
+                /* Zero old */
+                int oec0 = snap_exchange_card0(snap->aux);
+                int oec1 = snap_exchange_card1(snap->aux);
+                if (oec0 < 5) out[141 + oec0] = 0.0f;
+                if (oec1 < 5) out[146 + oec1] = 0.0f;
+            }
+            int ec0 = get_exchange_card0(g);
+            int ec1 = get_exchange_card1(g);
+            if (ec0 < 5) out[141 + ec0] = 1.0f;
+            if (ec1 < 5) out[146 + ec1] = 1.0f;
+        }
+    }
+
+    /* --- History [151-406] --- */
+    /* History is newest-first (slot 0 = most recent). Every new entry shifts
+     * all existing slots down by one. So we always rewrite the full history
+     * section — but without the memset, just overwriting in place. This is
+     * still faster than full observe() since we skip the memset + card
+     * sections when unchanged. */
+    if (history && history->len > 0) {
+        int n = history->len;
+        if (n > 64) n = 64;
+        for (int i = 0; i < n; i++) {
+            HistoryEntry e = history_get(history, i);
+            int base = 151 + i * 4;
+            out[base + 0] = (float)e.acting_player / 6.0f;
+            out[base + 1] = (float)e.action / 32.0f;
+            out[base + 2] = (float)e.phase / 10.0f;
+            out[base + 3] = (float)e.result / 255.0f;
+        }
+    }
+
+    /* --- Save snapshot --- */
+    for (int i = 0; i < 6; i++) snap->players[i] = g->players[i];
+    snap->phase_state = g->phase_state;
+    snap->aux = g->aux;
+    snap->history_len = history ? (history->len > 64 ? 64 : history->len) : 0;
+    snap->player_id = (int8_t)player_id;
 }

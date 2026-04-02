@@ -26,7 +26,7 @@ function openLib() {
       returns: FFIType.u32,
     },
     observe: {
-      args: [FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.ptr],
+      args: [FFIType.ptr, FFIType.i32, FFIType.ptr, FFIType.ptr],
       returns: FFIType.void,
     },
     get_observation_size: {

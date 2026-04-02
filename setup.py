@@ -20,7 +20,7 @@ coup_ext = Extension(
         "c_engine/",
         np.get_include(),
     ],
-    extra_compile_args=["-std=c11", "-O2", "-Wall"],
+    extra_compile_args=["-std=c11", "-O3", "-march=native", "-flto", "-Wall"],
 )
 
 setup(

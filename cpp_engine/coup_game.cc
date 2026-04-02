@@ -138,17 +138,17 @@ std::unique_ptr<State> CoupState::Clone() const {
 // ===========================================================================
 
 std::vector<std::pair<Action, double>> CoupState::ChanceOutcomes() const {
-  std::vector<std::pair<Action, double>> outcomes;
+  chance_outcomes_cache_.clear();
   assert(phase_ == kDeal || phase_ == kChanceRedraw ||
          phase_ == kChanceExchange);
   int total = DeckTotal();
   assert(total > 0);
   for (int i = 0; i < kNumCardTypes; i++) {
     if (deck_[i] > 0) {
-      outcomes.push_back({i, static_cast<double>(deck_[i]) / total});
+      chance_outcomes_cache_.push_back({i, static_cast<double>(deck_[i]) / total});
     }
   }
-  return outcomes;
+  return chance_outcomes_cache_;
 }
 
 // ===========================================================================
@@ -156,32 +156,31 @@ std::vector<std::pair<Action, double>> CoupState::ChanceOutcomes() const {
 // ===========================================================================
 
 std::vector<Action> CoupState::LegalActions() const {
-  if (IsTerminal()) return {};
+  legal_actions_cache_.clear();
+  if (IsTerminal()) return legal_actions_cache_;
   if (phase_ == kDeal || phase_ == kChanceRedraw ||
       phase_ == kChanceExchange) {
-    // Chance node: return all card types with nonzero deck count.
-    std::vector<Action> actions;
     for (int i = 0; i < kNumCardTypes; i++) {
-      if (deck_[i] > 0) actions.push_back(i);
+      if (deck_[i] > 0) legal_actions_cache_.push_back(i);
     }
-    return actions;
+    return legal_actions_cache_;
   }
   switch (phase_) {
-    case kMainAction: return LegalActionsMainAction();
-    case kChallengeAction: return LegalActionsChallengeAction();
-    case kBlock: return LegalActionsBlock();
-    case kChallengeBlock: return LegalActionsChallengeBlock();
-    case kLoseCard: return LegalActionsLoseCard();
-    case kExchangeDiscard: return LegalActionsExchangeDiscard();
+    case kMainAction: LegalActionsMainAction(); break;
+    case kChallengeAction: LegalActionsChallengeAction(); break;
+    case kBlock: LegalActionsBlock(); break;
+    case kChallengeBlock: LegalActionsChallengeBlock(); break;
+    case kLoseCard: LegalActionsLoseCard(); break;
+    case kExchangeDiscard: LegalActionsExchangeDiscard(); break;
     default:
-      // kResolve is auto-advance; should not be queried for legal actions.
       assert(false);
-      return {};
+      break;
   }
+  return legal_actions_cache_;
 }
 
-std::vector<Action> CoupState::LegalActionsMainAction() const {
-  std::vector<Action> actions;
+void CoupState::LegalActionsMainAction() const {
+  auto& actions = legal_actions_cache_;
   int np = NumPlayers();
   int coins = players_[active_player_].coins;
 
@@ -192,7 +191,7 @@ std::vector<Action> CoupState::LegalActionsMainAction() const {
         actions.push_back(kCoupPlayer0 + t);
       }
     }
-    return actions;
+    return;
   }
 
   // Income always available.
@@ -218,51 +217,43 @@ std::vector<Action> CoupState::LegalActionsMainAction() const {
       actions.push_back(kAssassinatePlayer0 + t);
     }
   }
-
-  return actions;
 }
 
-std::vector<Action> CoupState::LegalActionsChallengeAction() const {
-  // Active player can challenge or pass.
-  return {kChallenge, kPass};
+void CoupState::LegalActionsChallengeAction() const {
+  legal_actions_cache_.push_back(kChallenge);
+  legal_actions_cache_.push_back(kPass);
 }
 
-std::vector<Action> CoupState::LegalActionsBlock() const {
-  std::vector<Action> actions;
+void CoupState::LegalActionsBlock() const {
+  auto& actions = legal_actions_cache_;
   int pa = pending_action_;
 
   // Pass is always available.
   actions.push_back(kPass);
 
   if (pa == kForeignAid) {
-    // Anyone (active_player_ is the responder) can block with Duke.
     actions.push_back(kBlockDuke);
   } else if (pa >= kStealPlayer0 && pa <= kStealPlayer0 + 5) {
-    // Target can block with Captain or Ambassador.
     actions.push_back(kBlockCaptain);
     actions.push_back(kBlockAmbassador);
   } else if (pa >= kAssassinatePlayer0 && pa <= kAssassinatePlayer0 + 5) {
-    // Target can block with Contessa.
     actions.push_back(kBlockContessa);
   }
-
-  return actions;
 }
 
-std::vector<Action> CoupState::LegalActionsChallengeBlock() const {
-  return {kChallenge, kPass};
+void CoupState::LegalActionsChallengeBlock() const {
+  legal_actions_cache_.push_back(kChallenge);
+  legal_actions_cache_.push_back(kPass);
 }
 
-std::vector<Action> CoupState::LegalActionsLoseCard() const {
-  std::vector<Action> actions;
+void CoupState::LegalActionsLoseCard() const {
   const auto& p = players_[lose_card_player_];
-  if (p.cards[0].alive) actions.push_back(kDiscardSlot0);
-  if (p.cards[1].alive) actions.push_back(kDiscardSlot1);
-  return actions;
+  if (p.cards[0].alive) legal_actions_cache_.push_back(kDiscardSlot0);
+  if (p.cards[1].alive) legal_actions_cache_.push_back(kDiscardSlot1);
 }
 
-std::vector<Action> CoupState::LegalActionsExchangeDiscard() const {
-  std::vector<Action> actions;
+void CoupState::LegalActionsExchangeDiscard() const {
+  auto& actions = legal_actions_cache_;
   // The player has their own cards (slots 0,1) and exchange cards (slots 2,3).
   // Available slots: own alive cards + exchange cards that exist.
   // Collect which slots are available.
@@ -295,8 +286,6 @@ std::vector<Action> CoupState::LegalActionsExchangeDiscard() const {
       }
     }
   }
-
-  return actions;
 }
 
 // ===========================================================================
@@ -925,6 +914,23 @@ void CoupState::CheckGameOver() {
   }
   if (alive_count == 1) {
     winner_ = last_alive;
+    return;
+  }
+  // Max turns tiebreaker: most alive cards, then most coins
+  if (turn_count_ >= kMaxTurns && alive_count > 1) {
+    int best = -1;
+    int best_cards = -1, best_coins = -1;
+    for (int i = 0; i < NumPlayers(); i++) {
+      if (!PlayerIsAlive(i)) continue;
+      int cards = players_[i].NumAliveCards();
+      int coins = players_[i].coins;
+      if (cards > best_cards || (cards == best_cards && coins > best_coins)) {
+        best = i;
+        best_cards = cards;
+        best_coins = coins;
+      }
+    }
+    winner_ = best;
   }
 }
 
@@ -953,6 +959,7 @@ int CoupState::NextResponder(int from) const {
 }
 
 void CoupState::AdvanceTurn() {
+  turn_count_++;
   CheckGameOver();
   if (IsTerminal()) return;
   turn_player_ = NextAlivePlayer(turn_player_);
@@ -1134,55 +1141,26 @@ void CoupState::FillObservationTensor(Player player,
   std::fill(values.begin(), values.begin() + kObservationTensorSize, 0.0f);
   int offset = 0;
 
-  // 0-4: own_card0 one-hot type (5)
-  if (players_[player].cards[0].type >= 0 &&
-      players_[player].cards[0].type < kNumCardTypes) {
-    values[offset + players_[player].cards[0].type] = 1.0f;
-  }
-  offset += 5;
-
-  // 5: own_card0_alive (1)
-  values[offset] = players_[player].cards[0].alive ? 1.0f : 0.0f;
-  offset += 1;
-
-  // 6-10: own_card1 one-hot type (5)
-  if (players_[player].cards[1].type >= 0 &&
-      players_[player].cards[1].type < kNumCardTypes) {
-    values[offset + players_[player].cards[1].type] = 1.0f;
-  }
-  offset += 5;
-
-  // 11: own_card1_alive (1)
-  values[offset] = players_[player].cards[1].alive ? 1.0f : 0.0f;
-  offset += 1;
-
-  // 12-71: other_players x {revealed cards, alive} (60 = 5 players x 12 each)
-  // Per other player (12 floats):
-  //   card0_type_onehot(5) if revealed else zeros,
-  //   card0_revealed(1),
-  //   card1_type_onehot(5) if revealed else zeros,
-  //   card1_revealed(1)
-  // Iterate through all players except self, using relative ordering.
-  for (int off_p = 1; off_p <= kMaxPlayers - 1; off_p++) {
-    int other = (player + off_p) % kMaxPlayers;
-    int base = 12 + (off_p - 1) * 12;
-
-    if (other < NumPlayers()) {
+  // 0-71: all players' cards — absolute encoding (6 players x 12 floats)
+  // Per card: type one-hot (5) + alive flag (1)
+  // Type visible if: (a) observer's own card, or (b) card is dead/revealed.
+  for (int p = 0; p < kMaxPlayers; p++) {
+    int base = p * 12;
+    if (p < NumPlayers()) {
+      bool is_self = (p == player);
       // Card 0.
-      bool card0_revealed = !players_[other].cards[0].alive;
-      if (card0_revealed) {
-        values[base + players_[other].cards[0].type] = 1.0f;
+      bool c0_alive = players_[p].cards[0].alive;
+      if (is_self || !c0_alive) {
+        values[base + players_[p].cards[0].type] = 1.0f;
       }
-      values[base + 5] = card0_revealed ? 1.0f : 0.0f;
-
+      values[base + 5] = c0_alive ? 1.0f : 0.0f;
       // Card 1.
-      bool card1_revealed = !players_[other].cards[1].alive;
-      if (card1_revealed) {
-        values[base + 6 + players_[other].cards[1].type] = 1.0f;
+      bool c1_alive = players_[p].cards[1].alive;
+      if (is_self || !c1_alive) {
+        values[base + 6 + players_[p].cards[1].type] = 1.0f;
       }
-      values[base + 11] = card1_revealed ? 1.0f : 0.0f;
+      values[base + 11] = c1_alive ? 1.0f : 0.0f;
     }
-    // Unused player slots remain zeros.
   }
   offset = 72;
 

@@ -31,6 +31,9 @@ inline constexpr int kAssassinateCost = 3;
 inline constexpr int kStartingCoins = 2;
 inline constexpr int kCardsPerPlayer = 2;
 
+// Maximum turns (main actions) before tiebreak. Matches C engine MAX_TURNS.
+inline constexpr int kMaxTurns = 200;
+
 // History ring buffer for observation tensor.
 inline constexpr int kHistoryLength = 64;
 inline constexpr int kHistoryEntrySize = 4;  // floats per entry
@@ -203,6 +206,13 @@ class CoupState : public State {
   // the block phase if blockable. This flag tracks that.
   bool needs_block_ = false;
 
+  // Turn counter (incremented each main action; game ends at kMaxTurns)
+  int turn_count_ = 0;
+
+  // Cached vectors to avoid per-call heap allocation
+  mutable std::vector<Action> legal_actions_cache_;
+  mutable std::vector<std::pair<Action, double>> chance_outcomes_cache_;
+
   // History buffer for observation
   std::vector<HistoryEntry> history_buffer_;
 
@@ -240,13 +250,13 @@ class CoupState : public State {
   bool IsBlockable(int action) const;
   void AddHistoryEntry(int acting_player, int action, int phase, int result);
 
-  // Legal action helpers
-  std::vector<Action> LegalActionsMainAction() const;
-  std::vector<Action> LegalActionsChallengeAction() const;
-  std::vector<Action> LegalActionsBlock() const;
-  std::vector<Action> LegalActionsChallengeBlock() const;
-  std::vector<Action> LegalActionsLoseCard() const;
-  std::vector<Action> LegalActionsExchangeDiscard() const;
+  // Legal action helpers (fill legal_actions_cache_)
+  void LegalActionsMainAction() const;
+  void LegalActionsChallengeAction() const;
+  void LegalActionsBlock() const;
+  void LegalActionsChallengeBlock() const;
+  void LegalActionsLoseCard() const;
+  void LegalActionsExchangeDiscard() const;
 
   // Observation helpers
   void FillObservationTensor(Player player,
@@ -266,7 +276,7 @@ class CoupGame : public Game {
   int NumPlayers() const override { return num_players_; }
   double MinUtility() const override { return -1.0; }
   double MaxUtility() const override { return 1.0; }
-  double UtilitySum() const override { return 0.0; }
+  absl::optional<double> UtilitySum() const override { return 0.0; }
   int MaxGameLength() const override { return 1000; }
   int MaxChanceOutcomes() const override { return kNumCardTypes; }
 

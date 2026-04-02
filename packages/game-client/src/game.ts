@@ -74,8 +74,8 @@ export class CoupGame {
   }
 
   observe(playerId: number): Float32Array {
-    // Pass null history (ptr 0) and length 0 for now
-    getLib().symbols.observe(this.gamePtr, playerId, 0 as any, 0, this.obsPtr);
+    // Pass null history buffer pointer (no history tracking in TUI)
+    getLib().symbols.observe(this.gamePtr, playerId, 0 as any, this.obsPtr);
     return new Float32Array(this.obsBuffer);
   }
 

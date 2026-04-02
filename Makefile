@@ -1,4 +1,4 @@
-.PHONY: test test-c test-text test-cpp build-puffer test-puffer test-cross clean
+.PHONY: test test-c test-text test-cpp build-puffer test-puffer test-cross clean bench bench-c bench-puffer
 
 # C engine tests
 test-c:
@@ -20,7 +20,7 @@ test-cpp:
 
 # Build PufferLib C extension
 build-puffer:
-	uv run python setup.py build_ext --inplace
+	uv run --with setuptools --with numpy python setup.py build_ext --inplace
 
 # PufferLib performance test
 test-puffer: build-puffer
@@ -36,6 +36,19 @@ test-cross:
 
 # Run all tests
 test: test-c test-text test-cross
+
+# Profiling / benchmarks
+bench-c:
+	cc -O3 -march=native -flto -std=c11 -o profiling/bench_c profiling/bench_c.c c_engine/coup_core.c -I c_engine/ -lm -lpthread
+	./profiling/bench_c --players 2 --policy random --threads 1 --duration 10
+	./profiling/bench_c --players 6 --policy heuristic --threads 1 --duration 10
+
+bench-puffer: build-puffer
+	uv run --with setuptools --with numpy python profiling/bench_pufferlib.py --players 2 --policy random --duration 10
+	uv run --with setuptools --with numpy python profiling/bench_pufferlib.py --players 6 --policy heuristic --duration 10
+
+bench:
+	./profiling/run_benchmarks.sh --duration 10
 
 # Clean build artifacts
 clean:

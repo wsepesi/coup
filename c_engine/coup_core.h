@@ -52,6 +52,10 @@ extern "C" {
 
 #define FIRST_DISCARD_NONE 7
 
+/* Maximum turns (main actions) before the game ends in a tiebreak.
+ * Tiebreaker: most alive cards, then most coins. */
+#define MAX_TURNS 200
+
 typedef struct {
     int outcome;
     double prob;
@@ -64,6 +68,7 @@ typedef struct {
     uint16_t aux;
     uint16_t aux2;
     uint16_t _pad;
+    uint16_t turn_count;  /* incremented each main action; game ends at MAX_TURNS */
     Xoshiro256 rng;
 } Game;
 
@@ -204,7 +209,24 @@ static inline void set_num_players(Game *g, int n) {
 #define OBS_SIZE 407
 
 int get_observation_size(void);
-void observe(const Game *g, int player_id, const HistoryEntry *history, int history_len, float *out);
+void observe(const Game *g, int player_id, const HistoryBuffer *history, float *out);
+
+/* Snapshot for incremental observation updates.
+ * Stores previous game state so observe_incremental() can diff. */
+typedef struct {
+    uint16_t players[6];   /* previous player bit-packed state */
+    uint16_t phase_state;  /* previous phase + turn + active + pending */
+    uint16_t aux;          /* previous responded_mask + exchange cards */
+    uint8_t  history_len;  /* previous history length */
+    int8_t   player_id;    /* previous observer player (-1 = uninitialized) */
+} ObsSnapshot;
+
+/* Incremental observation: only rewrites floats that changed since last call.
+ * On first call or after reset, snap->player_id should be -1 to trigger
+ * a full recompute. The snapshot is updated at the end of each call. */
+void observe_incremental(const Game *g, int player_id,
+                         const HistoryBuffer *history,
+                         float *out, ObsSnapshot *snap);
 
 /* --- Core API --- */
 

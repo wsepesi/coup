@@ -8,6 +8,7 @@
  */
 
 #include "coup_core.h"
+#include "heuristic.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -1396,6 +1397,146 @@ static void fuzz_step_with_rng(void) {
     printf("PASS (%d/%d games completed)\n", games_completed, 1000);
 }
 
+static void fuzz_incremental_observe(void) {
+    printf("fuzz_incremental_observe ... ");
+    int total_steps = 0;
+    int total_games = 0;
+
+    for (uint64_t seed = 1; seed <= 500; seed++) {
+        /* Alternate between random and heuristic, 2p and 6p */
+        int use_heuristic = (seed % 2 == 0);
+        int np = (seed % 3 == 0) ? 6 : 2;
+        Game g;
+        game_init(&g, np, seed, seed + 999);
+        HistoryBuffer hist;
+        history_init(&hist);
+
+        float inc_buf[OBS_SIZE];
+        float full_buf[OBS_SIZE];
+        ObsSnapshot snap;
+        snap.player_id = -1;  /* force first call to be full */
+
+        /* Initial observation */
+        int active = get_active_player_ext(&g);
+        memset(inc_buf, 0, sizeof(inc_buf));
+        observe_incremental(&g, active, &hist, inc_buf, &snap);
+
+        int steps = 0;
+        while (!is_done(&g) && steps < MAX_STEPS) {
+            /* Pick action */
+            int action;
+            if (use_heuristic) {
+                action = heuristic_choose_action(&g);
+            } else {
+                action = random_legal_action(&g);
+            }
+
+            /* Push history */
+            HistoryEntry entry;
+            entry.acting_player = (uint8_t)get_active_player_ext(&g);
+            entry.action = (uint8_t)action;
+            entry.phase = (uint8_t)get_phase(&g);
+            entry.result = 0;
+            history_push(&hist, entry);
+
+            /* Step */
+            step_with_rng(&g, action);
+            steps++;
+
+            if (is_done(&g)) break;
+
+            /* Compute both observations */
+            active = get_active_player_ext(&g);
+            observe_incremental(&g, active, &hist, inc_buf, &snap);
+            observe(&g, active, &hist, full_buf);
+
+            /* Compare */
+            for (int j = 0; j < OBS_SIZE; j++) {
+                if (inc_buf[j] != full_buf[j]) {
+                    fprintf(stderr, "\nFAIL: incremental mismatch at seed=%llu step=%d "
+                            "obs[%d]: inc=%.6f full=%.6f phase=%d active=%d\n",
+                            (unsigned long long)seed, steps, j,
+                            inc_buf[j], full_buf[j],
+                            get_phase(&g), active);
+                    exit(1);
+                }
+            }
+            total_steps++;
+        }
+        total_games++;
+    }
+
+    printf("PASS (%d games, %d steps checked)\n", total_games, total_steps);
+}
+
+static void fuzz_no_info_leak(void) {
+    printf("fuzz_no_info_leak ... ");
+    int total_checks = 0;
+
+    for (uint64_t seed = 1; seed <= 500; seed++) {
+        int np = (seed % 3 == 0) ? 6 : 2;
+        Game g;
+        game_init(&g, np, seed, seed + 999);
+        HistoryBuffer hist;
+        history_init(&hist);
+
+        int steps = 0;
+        while (!is_done(&g) && steps < MAX_STEPS) {
+            int action = random_legal_action(&g);
+            HistoryEntry entry;
+            entry.acting_player = (uint8_t)get_active_player_ext(&g);
+            entry.action = (uint8_t)action;
+            entry.phase = (uint8_t)get_phase(&g);
+            entry.result = 0;
+            history_push(&hist, entry);
+            step_with_rng(&g, action);
+            steps++;
+
+            if (is_done(&g)) break;
+
+            /* For each observer, check that other players' alive cards
+             * have zero type one-hots (no info leak). */
+            for (int obs_player = 0; obs_player < np; obs_player++) {
+                float obs[OBS_SIZE];
+                observe(&g, obs_player, &hist, obs);
+
+                for (int target = 0; target < np; target++) {
+                    if (target == obs_player) continue;
+                    int off = target * 12;
+
+                    /* Card 0: if alive, type must be all zeros */
+                    if (player_card0_alive(&g, target)) {
+                        for (int t = 0; t < 5; t++) {
+                            if (obs[off + t] != 0.0f) {
+                                fprintf(stderr, "\nFAIL: info leak at seed=%llu step=%d "
+                                        "observer=%d target=%d card0 type[%d]=%.1f (should be 0)\n",
+                                        (unsigned long long)seed, steps, obs_player, target, t, obs[off + t]);
+                                exit(1);
+                            }
+                        }
+                        total_checks++;
+                    }
+
+                    /* Card 1: if alive, type must be all zeros */
+                    if (player_card1_alive(&g, target)) {
+                        for (int t = 0; t < 5; t++) {
+                            if (obs[off + 6 + t] != 0.0f) {
+                                fprintf(stderr, "\nFAIL: info leak at seed=%llu step=%d "
+                                        "observer=%d target=%d card1 type[%d]=%.1f (should be 0)\n",
+                                        (unsigned long long)seed, steps, obs_player, target, t, obs[off + 6 + t]);
+                                exit(1);
+                            }
+                        }
+                        total_checks++;
+                    }
+                }
+            }
+        }
+    }
+
+    printf("PASS (%d card visibility checks)\n", total_checks);
+}
+
 /* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
@@ -1429,6 +1570,8 @@ int main(void) {
     fuzz_exactly_one_winner();
     fuzz_forced_coup();
     fuzz_step_with_rng();
+    fuzz_incremental_observe();
+    fuzz_no_info_leak();
 
     printf("\n=== All tests passed ===\n");
     return 0;
