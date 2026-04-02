@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+bun.lock
+
+# Build artifacts
+*.dylib
+*.so
+*.o
+*.dSYM/
+*.egg-info/
+build/
+__pycache__/
+
+# C/C++ test binaries
+c_engine/test_core
+c_engine/test_prng
+c_engine/test_text_render
+cpp_engine/build/
+
+# Top-level test binary
+test_core
+
+# Python
+*.pyc

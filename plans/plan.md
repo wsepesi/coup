@@ -395,31 +395,36 @@ Coup's 32-byte game state with a branchy state machine (switch on phase, conditi
 
 ---
 
-## 8. Dual-Framework Architecture
+## 8. Dual-Engine Architecture
+
+**Decision: Two fully separate engines.** A pure C engine for PufferLib and a pure C++ engine for OpenSpiel. No shared engine code — each is an independent implementation of the same game spec (this document). Correctness parity is enforced by cross-framework fuzz tests, not shared source.
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   coup_core.h / .c                   │
-│                                                       │
-│  Game struct, step(), get_valid_actions(), observe()  │
-│  Pure C. No framework dependencies. No malloc.        │
-│                                                       │
-│  step_with_rng(game, action, rng)   ← PufferLib path │
-│  step_deterministic(game, action)   ← OpenSpiel path │
-│  chance_outcomes(game) → [(outcome, prob), ...]       │
-│  apply_chance(game, outcome)                          │
-└──────────────┬──────────────────────┬────────────────┘
-               │                      │
-       ┌───────▼───────┐      ┌───────▼────────┐
-       │  PufferLib     │      │  OpenSpiel      │
-       │  Cython/.pyx   │      │  C++ wrapper    │
-       │                │      │                  │
-       │  Internal RNG  │      │  Explicit chance │
-       │  Batched step  │      │  nodes via       │
-       │  Shared memory │      │  ChanceOutcomes  │
-       │  obs → numpy   │      │  InformationState│
-       └────────────────┘      └──────────────────┘
+┌──────────────────────────────┐    ┌──────────────────────────────┐
+│  c_engine/                    │    │  cpp_engine/                  │
+│  coup_core.h / coup_core.c    │    │  coup_game.h / coup_game.cc   │
+│                                │    │                                │
+│  Pure C. No framework deps.    │    │  Pure C++. OpenSpiel classes.  │
+│  Game struct, step, observe,   │    │  CoupState, CoupGame.          │
+│  mask, chance, PRNG.           │    │  No RNG — all via chance nodes.│
+│                                │    │                                │
+│  step_with_rng() ← PufferLib   │    │  ChanceOutcomes() + Apply     │
+│  step_deterministic() ← tests  │    │  InformationStateTensor()     │
+│  chance_outcomes() ← replay    │    │  InformationStateString()     │
+└──────────────┬────────────────┘    └──────────────┬───────────────┘
+               │                                     │
+       ┌───────▼───────┐                     ┌───────▼────────┐
+       │  PufferLib     │                     │  OpenSpiel      │
+       │  Pure C binding│                     │  Dynamic reg.   │
+       │  (CPython ext) │                     │  via RegisterGame│
+       │                │                     │                  │
+       │  Internal RNG  │                     │  Explicit chance │
+       │  Ring buffer   │                     │  nodes via       │
+       │  obs → numpy   │                     │  State::history_ │
+       └────────────────┘                     └──────────────────┘
 ```
+
+**Rationale:** Pure C++ is the overwhelmingly dominant pattern in OpenSpiel (90+ games). The one C-wrapping precedent (`universal_poker`) adds complexity with no clear benefit when implementing from scratch. Separate engines are easy to cross-validate and let each use idiomatic patterns for its framework.
 
 ### The Critical Insight: Stochasticity
 
@@ -427,9 +432,9 @@ PufferLib and OpenSpiel handle randomness fundamentally differently:
 
 **PufferLib (PPO/self-play):** The environment owns an RNG. Stochastic events are consumed internally. The agent never sees the randomness mechanism — fast, simple, standard for RL.
 
-**OpenSpiel (CFR):** Stochastic events must be modeled as explicit chance nodes. CFR requires enumerating all outcomes and their probabilities to compute counterfactual values. Hiding randomness inside `step()` breaks CFR.
+**OpenSpiel (CFR):** Stochastic events must be modeled as explicit chance nodes. CFR requires enumerating all outcomes and their probabilities to compute counterfactual values. Hiding randomness inside `step()` breaks CFR. The C++ engine has no RNG state at all.
 
-**Solution:** Every stochastic event exposes two entry points: `chance_outcomes()` returns (outcome_id, probability) pairs for enumeration, and `apply_chance()` applies a specific outcome deterministically. PufferLib's `step_with_rng()` samples and calls `apply_chance()`. OpenSpiel calls `chance_outcomes()` to get the distribution and `apply_chance()` with each outcome during tree traversal.
+**Cross-engine determinism:** Matching rollouts work by recording the chance outcomes the C engine's PRNG samples, then replaying those exact outcomes through the C++ engine's `DoApplyAction()` at chance nodes. A cross-framework fuzz test validates this for many seeds and player counts.
 
 ---
 
@@ -562,38 +567,62 @@ From the PufferLib agent's perspective, one call resolves all intermediate chanc
 
 ## 11. PufferLib Integration
 
+### Installation
+
+PufferLib is included as a **git submodule** at `lib/PufferLib/` (cloned from https://github.com/PufferAI/PufferLib) and installed **from source** in editable mode via `uv pip install -e lib/PufferLib`. All Python commands use `uv run` to ensure the correct virtual environment.
+
+### Out-of-Tree Integration
+
+The Coup environment lives **outside** PufferLib's tree, in the project's own `pufferlib/` directory. This avoids dirtying the submodule. The integration pattern (matching current PufferLib conventions) is:
+
+1. Copy `env_binding.h` from PufferLib's `ocean/` directory into `pufferlib/`
+2. Write `binding.c` (CPython C extension) that includes the C engine headers and `env_binding.h`
+3. Write `coup_env.py` subclassing `pufferlib.PufferEnv`
+4. Build via `setuptools.Extension` in the project's own `setup.py`
+
+**No Cython.** PufferLib has moved to pure C bindings using CPython's C extension API with `env_binding.h` as shared glue. Numpy array data pointers are passed directly to C structs — zero-copy.
+
 ### Multi-Agent Approach
 
-**Recommended: single-agent framing with player rotation.** Each PufferLib environment instance is one game of Coup. Each `step()` provides one action for one player (the active player). PufferLib sees `num_agents=1` per env, and many env instances run in parallel. This is simpler and likely faster for self-play than a multi-agent framing where 5 of 6 agents' actions are ignored each step.
+**Single-agent framing with player rotation.** Each PufferLib environment instance is one game of Coup. Each `step()` provides one action for one player (the active player). PufferLib sees `num_agents=1` per env, and many env instances run in parallel. This is simpler and likely faster for self-play than a multi-agent framing where 5 of 6 agents' actions are ignored each step. All seats share one policy; the observation encodes seat identity via relative positioning.
 
 ### File Layout
 
 ```
-pufferlib/ocean/coup/
-├── coup_core.h        # Symlink to shared/
-├── prng.h             # Symlink to shared/
-├── coup.h             # PufferLib-specific: env struct, step wrapping, obs writing
-├── coup.c             # Test main
-├── cy_coup.pyx        # Cython bindings
-├── coup.py            # Python PufferEnv class
-└── config.ini         # Training hyperparameters
+pufferlib/                       # In project root, NOT inside lib/PufferLib/
+├── env_binding.h                # Copied from PufferLib ocean/ (CPython glue framework)
+├── binding.c                    # CPython extension: init, step, log
+├── coup_env.py                  # Python PufferEnv class
+└── test_perf.py                 # SPS benchmark
 ```
 
 ### Environment Struct
 
 ```c
+// In binding.c
 typedef struct {
+    // Required by env_binding.h
+    float *observations;
+    int *actions;
+    float *rewards;
+    uint8_t *terminals;
+    Log log;
+
+    // Game state
     Game game;
-    Xoshiro256 rng;
-    HistoryEntry history[64];
-    uint8_t history_head;
-    uint8_t history_len;
+    HistoryBuffer history;   // Ring buffer (PufferLib owns this, not the core engine)
+    int num_players;
+    uint64_t seed;
 } CoupEnv;
 ```
 
+### History Ring Buffer
+
+The ring buffer is owned by the PufferLib wrapper, NOT the core Game struct. The core engine is fully Markov. The ring buffer exists only to provide bounded history in the observation tensor for PPO training. OpenSpiel uses its own `State::history_` for full action history.
+
 ### Action Masking
 
-PufferLib doesn't natively support action masking. Thread the mask through the observation (e.g., structured obs where the last 32 floats are the mask) and apply in the PyTorch policy:
+PufferLib doesn't natively support action masking. The last 32 floats of the observation tensor are the action validity mask. The PyTorch policy applies the mask before sampling:
 
 ```python
 def decode_actions(self, hidden, lookup):
@@ -608,20 +637,28 @@ def decode_actions(self, hidden, lookup):
 
 ```python
 class Coup(pufferlib.PufferEnv):
-    def __init__(self, num_envs=1, buf=None, seed=0):
+    def __init__(self, num_envs=1, buf=None, seed=0, num_players=6):
         self.single_observation_space = gymnasium.spaces.Box(
             low=0, high=1, shape=(OBS_DIM,), dtype=np.float32)
         self.single_action_space = gymnasium.spaces.Discrete(32)
         self.num_agents = num_envs
         super().__init__(buf)
-        self.c_envs = cy_coup.VecCoupEnv(
-            num_envs, self.observations, self.actions,
-            self.rewards, self.terminals, self.truncations, seed)
+        # binding is the compiled CPython extension from binding.c
+        binding.vec_init(
+            self.observations, self.actions, self.rewards,
+            self.terminals, self.truncations,
+            num_envs, seed, num_players=num_players)
 ```
 
 ---
 
 ## 12. OpenSpiel Integration
+
+### Architecture
+
+OpenSpiel is included as a **git submodule** at `lib/OpenSpiel/`. The Coup game is a **pure C++ implementation** (no C dependency) that builds standalone against the OpenSpiel library via its own `CMakeLists.txt`. Registration is dynamic via `REGISTER_SPIEL_GAME()` — no modification of OpenSpiel's source tree is needed.
+
+This follows the dominant pattern in OpenSpiel where all 90+ games are pure C++. The one C-wrapping precedent (`universal_poker`) is unnecessarily complex when implementing from scratch.
 
 ### Game Type
 
@@ -631,14 +668,19 @@ const GameType kGameType{
     GameType::Dynamics::kSequential,
     GameType::ChanceMode::kExplicitStochastic,
     GameType::Information::kImperfectInformation,
-    GameType::Utility::kGeneralSum,
+    GameType::Utility::kGeneralSum,  // Compatible with +1/-1; kZeroSum would also work for 2p
     GameType::RewardModel::kTerminal,
     /*max_num_players=*/6, /*min_num_players=*/2,
     /*provides_information_state_string=*/true,
     /*provides_information_state_tensor=*/true,
     /*provides_observation_string=*/true,
     /*provides_observation_tensor=*/true,
+    /*parameter_specification=*/
+    {{"players", GameParameter(2)}},  // Default 2, range 2-6
 };
+
+// Dynamic registration — no central file editing
+REGISTER_SPIEL_GAME(kGameType, Factory);
 ```
 
 ### State Class Key Methods
@@ -647,9 +689,9 @@ const GameType kGameType{
 class CoupState : public State {
 public:
     Player CurrentPlayer() const override;
-    // Returns CHANCE_PLAYER (-1) during deal/redraw/exchange draw
+    // Returns kChancePlayerId (-1) during deal/redraw/exchange draw
     // Returns 0-5 for player decisions
-    // Returns TERMINAL (-4) when done
+    // Returns kTerminalPlayerId (-4) when done
 
     std::vector<Action> LegalActions() const override;
     void DoApplyAction(Action action) override;
@@ -664,15 +706,30 @@ public:
     std::unique_ptr<State> Clone() const override;
 
 private:
-    Game game_;  // The C struct
+    // Pure C++ internal state — no C Game struct dependency.
+    // Can use clearer representations (arrays, structs) since
+    // OpenSpiel doesn't need the C engine's bit-packing.
+    // ...
 };
 ```
 
-`Clone()` is trivial since `Game` is a value type. `InformationStateTensor` should produce the same encoding as the PufferLib `observe()` function for network compatibility.
+`Clone()` via copy constructor — all state is value-typed, no heap allocations. The C++ engine has **no RNG state** — all stochasticity is expressed through chance nodes.
+
+`InformationStateTensor()` must produce the same ~410-float encoding as the C engine's `observe()` function for identical game states. This is validated by the observation parity cross-framework test.
+
+### File Layout
+
+```
+cpp_engine/
+├── coup_game.h              # CoupGame + CoupState class declarations
+├── coup_game.cc             # Implementation + REGISTER_SPIEL_GAME
+├── coup_game_test.cc        # OpenSpiel-style tests
+└── CMakeLists.txt           # Builds against lib/OpenSpiel/ submodule
+```
 
 ### Information State for CFR
 
-CFR requires that two game states informationally equivalent to player `p` produce the same `InformationStateString`. For player `p`, this includes their own cards, all public information (revealed cards, coin counts), and the full action history. It does NOT include other players' hidden cards or deck contents.
+CFR requires that two game states informationally equivalent to player `p` produce the same `InformationStateString`. For player `p`, this includes their own cards, all public information (revealed cards, coin counts), and the full action history (via OpenSpiel's `State::history_`). It does NOT include other players' hidden cards or deck contents.
 
 ---
 
@@ -877,88 +934,130 @@ Small shaping rewards can accelerate PPO training: negative per-step reward (enc
 ## 17. Repository Structure & Build
 
 ```
-coup-env/
-├── shared/
-│   ├── coup_core.h          # Game struct, enums, core logic
-│   ├── coup_core.c          # Implementation
-│   ├── prng.h               # xoshiro256** (header-only, extern "C")
-│   ├── text_render.h        # LLM text interface
-│   ├── text_render.c        # Text rendering implementation
-│   └── test_core.c          # Standalone C tests
+coup/
+├── Makefile                     # Top-level: delegates to sub-builds
+├── pyproject.toml               # uv-managed project config
+├── setup.py                     # Build C extension for PufferLib binding
+├── dev-plan.md                  # Task tracking for concurrent subagents
 │
-├── pufferlib/
-│   ├── coup.h               # PufferLib env wrapper
-│   ├── coup.c               # Test main
-│   ├── cy_coup.pyx          # Cython bindings
-│   ├── coup.py              # Python PufferEnv class
-│   ├── torch_policy.py      # PyTorch policy with action masking
-│   └── config.ini           # Training config
+├── c_engine/                    # Pure C engine (PufferLib target)
+│   ├── coup_core.h              # Game struct, enums, function declarations
+│   ├── coup_core.c              # Implementation
+│   ├── prng.h                   # xoshiro256** (header-only)
+│   ├── history.h                # Ring buffer struct + helpers (header-only)
+│   └── test_core.c              # Standalone C tests
 │
-├── openspiel/
-│   ├── coup.h               # CoupGame + CoupState C++ classes
-│   ├── coup.cc              # Implementation
-│   ├── coup_test.cc         # OpenSpiel-style tests
-│   └── CMakeLists.txt       # Build integration
+├── pufferlib/                   # PufferLib integration (out-of-tree)
+│   ├── env_binding.h            # Copied from PufferLib (CPython glue framework)
+│   ├── binding.c                # CPython extension: init, step, log
+│   ├── coup_env.py              # PufferEnv subclass
+│   └── test_perf.py             # SPS benchmark
+│
+├── cpp_engine/                  # Pure C++ engine (OpenSpiel target)
+│   ├── coup_game.h              # CoupGame + CoupState class declarations
+│   ├── coup_game.cc             # Implementation + REGISTER_SPIEL_GAME
+│   ├── coup_game_test.cc        # OpenSpiel-style tests
+│   └── CMakeLists.txt           # Builds against lib/OpenSpiel/ submodule
+│
+├── lib/
+│   ├── PufferLib/               # Git submodule (https://github.com/PufferAI/PufferLib)
+│   └── OpenSpiel/               # Git submodule (https://github.com/google-deepmind/open_spiel)
 │
 ├── tests/
-│   ├── test_prng_cross.py   # PRNG bit-identity C vs C++
-│   ├── test_determinism.py  # Cross-framework rollout comparison
-│   └── test_exploitability.py
+│   ├── test_cross_determinism.py  # Same action sequence, both engines, compare outcomes
+│   ├── test_observation_parity.py # Same game state, compare observation tensors
+│   ├── test_constants_sync.py     # Enum/action index parity between C and C++
+│   └── test_prng_identity.py      # xoshiro256** bit-identity C vs C++
 │
-└── README.md
+├── training/
+│   ├── puffer_hello.py           # Minimal PPO self-play (hello world)
+│   └── openspiel_hello.py        # Minimal MCCFR / exploitability (hello world)
+│
+└── plans/                        # Design documents
+    ├── plan.md                   # Core design spec (this file)
+    ├── model-architecture-plan.md
+    ├── web.md
+    └── tui-plan.md
 ```
 
 ### Build
 
+All Python work uses **`uv`** as the package manager and virtual environment tool. No `pip`, `conda`, or bare `python` invocations. A top-level **Makefile** orchestrates all build targets.
+
 ```bash
-# Standalone core test
-cc -O3 -std=c99 -o test_core shared/test_core.c shared/coup_core.c
-./test_core
+# One-time setup: submodules + venv
+git submodule add https://github.com/PufferAI/PufferLib lib/PufferLib
+git submodule add https://github.com/google-deepmind/open_spiel lib/OpenSpiel
+git submodule update --init --recursive
+uv venv
+uv pip install -e lib/PufferLib
+uv pip install torch gymnasium
 
-# PufferLib (from PufferLib repo, after symlinking into ocean/)
-python setup.py build_ext --inplace --force
-python demo.py --env coup --train.device cuda
+# Build and test everything
+make test          # runs all targets below
 
-# OpenSpiel (from OpenSpiel repo, after copying into games/)
-mkdir -p build && cd build
-cmake -DPython3_EXECUTABLE=$(which python3) ../open_spiel
-make -j$(nproc) coup_test
+# Individual targets
+make test-c        # cc + run c_engine/test_core.c
+make test-cpp      # cmake + run cpp_engine/coup_game_test
+make build-puffer  # python setup.py build_ext --inplace
+make test-puffer   # run pufferlib/test_perf.py
+make test-cross    # run all cross-framework tests
+make clean         # remove build artifacts
 ```
 
 ---
 
 ## 18. Implementation Priority
 
-1. **prng.h** — xoshiro256**, verify C/C++ bit-identical output.
-2. **coup_core.h/c** — Full game logic with `step_deterministic()`, `chance_outcomes()`, `apply_chance()`, `get_valid_actions()`, `observe()`. Extensive standalone tests.
-3. **PufferLib wrapper** — Get random-action games running at 1M+ steps/sec.
-4. **OpenSpiel wrapper** — Register game, pass `LoadGameTest`, `RandomSimTest`, `SerializationTest`.
-5. **Cross-framework determinism test** — Identical rollouts given same seed + policy.
-6. **text_render** — LLM text interface.
-7. **PPO training** in PufferLib with action masking (6-player).
-8. **MCCFR / Deep CFR** in OpenSpiel (2-player first).
-9. **Exploitability analysis** — 2-player exact, 6-player local best response.
+See `dev-plan.md` in the project root for the full task breakdown with dependency graph, parallelism map, and agent coordination protocol.
+
+**Critical path (sequential):**
+1. **prng.h** — xoshiro256**, header-only.
+2. **c_engine/coup_core.h/c** — Full C game logic.
+3. **c_engine observe()** — Observation tensor function.
+4. **pufferlib/ binding + env** — CPython extension, PufferEnv subclass.
+5. **pufferlib/ perf test** — Validate >1M SPS.
+6. **training/puffer_hello.py** — Hello-world PPO self-play.
+
+**Parallel with steps 2-4 above:**
+- **cpp_engine/** — Pure C++ OpenSpiel engine (independent of C engine).
+- **cpp_engine/ CMake + registration** — Build against OpenSpiel submodule.
+- **All tests** — C standalone, C++ OpenSpiel-style, cross-framework.
+
+**Deferred to later phases (not in current dev-plan.md):**
+- text_render (LLM text interface)
+- Real PPO training + tuning
+- MCCFR / Deep CFR
+- Exploitability analysis
+- Web, TUI, and other downstream clients
 
 ---
 
 ## 19. Open Questions & Gotchas
 
-### Open Questions
+### Resolved Questions
 
-- **History encoding:** Should the PufferLib ring buffer match OpenSpiel's full history exactly, or is a compressed version acceptable for PPO? Full history is cleaner for cross-compatibility but larger.
+- **History encoding:** PufferLib owns a ring buffer (64 entries, training-only). OpenSpiel uses its own `State::history_` (full action sequence). They don't need to match — the observation parity test validates the tensor encoding is identical, not the history representation.
+- **Self-play schedule:** V1 uses single shared policy with player rotation. Population/league is a later concern.
+- **C vs C++ engines:** Fully separate implementations. No shared engine code. Parity enforced by cross-framework fuzz tests.
+- **PufferLib integration:** Out-of-tree, pure C (no Cython), CPython extension via `env_binding.h`.
+- **OpenSpiel integration:** Git submodule, dynamic `RegisterGame()`, standalone CMake build.
+
+### Remaining Open Questions
+
 - **6-player Deep CFR:** The game tree may be too large even for Deep CFR. Consider starting with 2-player for CFR validation and 6-player for PPO only.
-- **Self-play schedule:** All players share one policy? Population-based training? League play? This is a training decision, not an env design decision.
 - **Assassination coin timing:** Standard rules say coins deducted on declaration (even if blocked). Verify and ensure identical in both implementations.
+- **Reward shaping for 6-player:** Terminal is +1/-1 for now. Placement-based rewards (e.g., last eliminated gets -0.2, first gets -1.0) and intermediate shaping are deferred but the reward path must be easy to modify.
 
 ### Things To Not Forget
 
 - **Reveal-shuffle-redraw on successful challenge defense** is a state update inside `resolve_challenge()`, not a player decision. It consumes RNG (PufferLib) or is a chance node (OpenSpiel) and changes the defender's hidden card.
-- **Dead players are skipped everywhere.** Pre-set their bits in `responded_mask`. Skip in turn advancement. Never present as targets.
+- **Dead players are skipped everywhere.** Pre-set their bits in `responded_mask`. Skip in turn advancement. Never present as targets. For games with <6 players, unused slots are pre-killed at init.
 - **10+ coin forced coup** is purely a mask constraint.
 - **Foreign Aid blocks can come from any player** claiming Duke, not just a target.
 - **Ambassador exchange returns cards face-down.** The observation function must not expose which cards were returned.
-- **The history ring buffer is not part of the sim state.** It lives in a wrapper struct. The sim is Markov; the buffer is for the network.
+- **The history ring buffer is not part of the sim state.** It lives in the PufferLib wrapper. The sim is Markov; the buffer is for the network.
 - **Coins and revealed cards are public information.** Always include in all players' observations.
 - **Discard slots 28–31 are reused across LOSE_CARD and EXCHANGE_DISCARD phases.** Mutually exclusive by phase, but replay/logging code must be phase-aware when interpreting action indices.
 - **Block phase cycling for Foreign Aid** iterates all living non-acting players, not just a single target.
-- **The observation tensor encoding must be identical between PufferLib's `observe()` and OpenSpiel's `InformationStateTensor()`** so that neural networks are portable between frameworks.
+- **The observation tensor encoding must be identical between PufferLib's `observe()` and OpenSpiel's `InformationStateTensor()`** so that neural networks are portable between frameworks. This is validated by the observation parity cross-framework test, not by shared code.

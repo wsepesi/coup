@@ -1,0 +1,3 @@
+[submodule "lib/OpenSpiel"]
+	path = lib/OpenSpiel
+	url = https://github.com/google-deepmind/open_spiel

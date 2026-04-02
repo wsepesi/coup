@@ -1,0 +1,13 @@
+{
+  "name": "coup",
+  "private": true,
+  "workspaces": [
+    "packages/game-client",
+    "tui"
+  ],
+  "scripts": {
+    "play": "bun run tui/src/index.ts",
+    "build": "./tui/build.sh",
+    "test:tui": "bun test tui/tests/"
+  }
+}
