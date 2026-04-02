@@ -7,7 +7,7 @@ import { COLORS } from "./constants.js";
 export interface GameConfig {
   players: number;
   seat: number;
-  difficulty: "easy" | "medium" | "hard";
+  difficulty: "easy" | "medium" | "hard" | "hard+";
   seed: string;
 }
 
@@ -26,11 +26,11 @@ export class SetupScreen {
   private config: GameConfig;
 
   constructor() {
-    this.config = { players: 6, seat: 0, difficulty: "medium", seed: "" };
+    this.config = { players: 6, seat: 0, difficulty: "hard", seed: "" };
     this.fields = [
       { label: "Players", value: "6", min: 2, max: 6 },
       { label: "Your seat", value: "Random", options: this.buildSeatOptions(6) },
-      { label: "Bot level", value: "Medium", options: ["Easy", "Medium", "Hard"] },
+      { label: "Bot level", value: "Hard", options: ["Easy", "Medium", "Hard", "Hard+"] },
       { label: "Seed", value: "", isInput: true },
     ];
   }
@@ -58,10 +58,7 @@ export class SetupScreen {
         this.adjustField(1);
         break;
       case "return":
-        if (this.selectedField === this.fields.length) {
-          return "start";
-        }
-        break;
+        return "start";
       case "backspace":
         if (this.fields[this.selectedField]?.isInput) {
           this.fields[this.selectedField].value = this.fields[this.selectedField].value.slice(0, -1);
@@ -114,7 +111,7 @@ export class SetupScreen {
     } else {
       this.config.seat = parseInt(seatVal) || 0;
     }
-    this.config.difficulty = (this.fields[2].value.toLowerCase() as "easy" | "medium" | "hard");
+    this.config.difficulty = (this.fields[2].value.toLowerCase() as GameConfig["difficulty"]);
     this.config.seed = this.fields[3].value;
   }
 

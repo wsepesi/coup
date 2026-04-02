@@ -19,7 +19,7 @@ import {
   type GameEvent,
   describeAction,
 } from "@coup/game-client";
-import { createBot, resetBotCounter } from "@coup/game-client";
+import { createBot, initBots } from "@coup/game-client";
 
 import { computePlayerPositions, getTableCenter, type PlayerPosition } from "./layout.js";
 import { COLORS, getCardColors, CARD_ABBREV } from "./constants.js";
@@ -49,9 +49,8 @@ export async function runGame(
   h: number,
   fast: boolean,
 ): Promise<GameOverChoice> {
-  resetBotCounter();
-
   const seed = config.seed ? BigInt(config.seed) : BigInt(Math.floor(Math.random() * 2 ** 32));
+  initBots(seed);
   const seedStr = seed.toString();
   const numPlayers = config.players;
   const humanSeat = config.seat === -2
