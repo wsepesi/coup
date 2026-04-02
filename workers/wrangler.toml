@@ -1,0 +1,23 @@
+name = "coup-server"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Allow wrangler to bundle the Emscripten JS glue + WASM
+[build]
+command = ""
+
+[durable_objects]
+bindings = [
+  { name = "MATCHMAKER", class_name = "Matchmaker" },
+  { name = "GAME", class_name = "GameRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Matchmaker", "GameRoom"]
+
+# Rules for importing .wasm files as WebAssembly modules
+[[rules]]
+type = "CompiledWasm"
+globs = ["**/*.wasm"]

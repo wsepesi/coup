@@ -1,0 +1,112 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #F5F5F0;
+  --border: #999999;
+  --text-default: #222222;
+  --text-dim: #777777;
+  --text-bright: #000000;
+  --selection-bg: #A8A898;
+  --you: #007755;
+  --dead: #CC0000;
+  --coin-gain: #007700;
+  --coin-loss: #CC0000;
+  --challenge-win: #007700;
+  --challenge-fail: #CC0000;
+  --cursor: #B05000;
+
+  --role-duke: #997700;
+  --role-assassin: #CC0000;
+  --role-captain: #0055CC;
+  --role-ambassador: #007733;
+  --role-contessa: #CC3377;
+}
+
+@theme {
+  --color-bg: #F5F5F0;
+  --color-border-term: #999999;
+  --color-text-default: #222222;
+  --color-text-dim: #777777;
+  --color-text-bright: #000000;
+  --color-selection-bg: #A8A898;
+  --color-you: #007755;
+  --color-dead: #CC0000;
+  --color-coin-gain: #007700;
+  --color-coin-loss: #CC0000;
+  --color-challenge-win: #007700;
+  --color-challenge-fail: #CC0000;
+  --color-cursor: #B05000;
+  --color-role-duke: #997700;
+  --color-role-assassin: #CC0000;
+  --color-role-captain: #0055CC;
+  --color-role-ambassador: #007733;
+  --color-role-contessa: #CC3377;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--text-default);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  min-height: 100vh;
+}
+
+::selection {
+  background: var(--selection-bg);
+  color: var(--text-bright);
+}
+
+/* Blinking cursor for inputs */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.cursor-blink::after {
+  content: "_";
+  animation: blink 1s step-end infinite;
+  color: var(--cursor);
+}
+
+/* Card reveal animation */
+@keyframes card-reveal {
+  from {
+    transform: rotateY(90deg);
+    opacity: 0;
+  }
+  to {
+    transform: rotateY(0deg);
+    opacity: 1;
+  }
+}
+
+.card-reveal {
+  animation: card-reveal 0.3s ease-out;
+}
+
+/* Glow effect for action buttons */
+@keyframes glow-pulse {
+  0%, 100% { box-shadow: 0 0 4px rgba(176, 80, 0, 0.2); }
+  50% { box-shadow: 0 0 12px rgba(176, 80, 0, 0.5); }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
+}
