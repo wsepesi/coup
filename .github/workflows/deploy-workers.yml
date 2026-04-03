@@ -16,6 +16,11 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
+      - uses: mymindstorm/setup-emsdk@v14
+
+      - name: Build WASM
+        run: bash wasm/build.sh
+
       - name: Install dependencies
         run: bun install
         working-directory: workers
