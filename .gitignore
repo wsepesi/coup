@@ -1,6 +1,7 @@
 # Dependencies
 node_modules/
 bun.lock
+package-lock.json
 
 # Build artifacts
 *.dylib
@@ -20,11 +21,22 @@ cpp_engine/build/
 # Top-level test binary
 test_core
 
+# Profiling binaries
+profiling/bench_c
+
+# WASM build output
+wasm/coup.wasm
+wasm/coup.js
+
 # Python
 *.pyc
 
 # Screenshots
 *.png
+
+# Plans & internal docs
+plans/
+dev-plan.md
 
 # Local env
 site/.env.local
