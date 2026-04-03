@@ -23,8 +23,8 @@ export default function LandingPage() {
   const [menuIndex, setMenuIndex] = useState(0);
 
   // Bot game config
-  const [botPlayers, setBotPlayers] = useState(4);
-  const [botDifficulty, setBotDifficulty] = useState<string>("medium");
+  const [botPlayers, setBotPlayers] = useState(6);
+  const [botDifficulty, setBotDifficulty] = useState<string>("hard");
 
   // Join
   const [joinCode, setJoinCode] = useState("");

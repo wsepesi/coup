@@ -3,6 +3,9 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { ServerMessage, ClientMessage } from "./types";
 
+// Must match PROTOCOL_VERSION in workers/src/index.ts
+const PROTOCOL_VERSION = "2025-04-02.1";
+
 const BASE_URL =
   process.env.NEXT_PUBLIC_WS_URL ?? "wss://coup-server.sepesi-coup.workers.dev";
 
@@ -43,11 +46,21 @@ export function useWebSocket({ path, enabled = true, onMessage, onConnect }: Use
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
+    let pingInterval: ReturnType<typeof setInterval> | null = null;
+
     ws.onopen = () => {
       // Ignore if this WS is already stale
       if (wsRef.current !== ws) return;
       setStatus("connected");
       reconnectAttempts.current = 0;
+
+      // Heartbeat: ping every 30s while tab is focused
+      pingInterval = setInterval(() => {
+        if (document.hasFocus() && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "ping" }));
+        }
+      }, 30_000);
+
       onConnectRef.current?.((msg: ClientMessage) => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify(msg));
@@ -60,6 +73,15 @@ export function useWebSocket({ path, enabled = true, onMessage, onConnect }: Use
       if (wsRef.current !== ws) return;
       try {
         const msg = JSON.parse(event.data) as ServerMessage;
+        if (msg.type === "version") {
+          if (msg.version !== PROTOCOL_VERSION) {
+            console.error(
+              `[coup] Protocol version mismatch! Client: ${PROTOCOL_VERSION}, Server: ${msg.version}. ` +
+              `The Cloudflare Worker may need redeployment.`
+            );
+          }
+          return; // don't forward version messages to consumers
+        }
         onMessageRef.current?.(msg);
       } catch {
         // ignore malformed messages
@@ -67,6 +89,7 @@ export function useWebSocket({ path, enabled = true, onMessage, onConnect }: Use
     };
 
     ws.onclose = () => {
+      if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
       // Ignore if this is a stale WS (a newer one has replaced it)
       if (wsRef.current !== ws) return;
       wsRef.current = null;

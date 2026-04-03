@@ -146,7 +146,8 @@ export type ClientMessage =
   | { type: "start" }
   | { type: "house_rules"; houseRules: HouseRules }
   | { type: "bot_config"; numBots: number; botDifficulty: BotDifficulty }
-  | { type: "forfeit" };
+  | { type: "forfeit" }
+  | { type: "ping" };
 
 // Server -> Client messages
 export type ServerMessage =
@@ -183,7 +184,9 @@ export type ServerMessage =
       history: { text: string; turn: number }[];
     }
   | { type: "error"; message: string }
-  | { type: "forfeited"; by: string };
+  | { type: "forfeited"; by: string }
+  | { type: "pong" }
+  | { type: "version"; version: string };
 
 // ---- Env type ----
 export interface Env {

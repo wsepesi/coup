@@ -4,6 +4,7 @@
 
 import { CoupWasm } from "./wasm-bridge.js";
 import { chooseBotAction, pickBotName } from "./bot.js";
+import { PROTOCOL_VERSION } from "./index.js";
 import {
   type Env,
   type BotDifficulty,
@@ -43,6 +44,7 @@ interface PlayerConn {
   ws: WebSocket;
   username: string;
   seat: number;
+  lastPing: number;
 }
 
 interface HistoryEntry {
@@ -76,6 +78,7 @@ export class GameRoom {
   private pendingPasses: string[] = [];
   private claimedRoles = new Map<number, Set<string>>(); // seat → claimed role names
   private eliminationOrder: { seat: number; turn: number }[] = [];
+  private staleCheckInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -93,6 +96,7 @@ export class GameRoom {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       server.accept();
+      this.send(server, { type: "version", version: PROTOCOL_VERSION });
       server.addEventListener("message", (event) => {
         this.handleWsMessage(server, event.data);
       });
@@ -155,6 +159,12 @@ export class GameRoom {
       case "forfeit":
         this.handleForfeit(ws);
         break;
+      case "ping": {
+        const conn = this.connections.get(ws);
+        if (conn) conn.lastPing = Date.now();
+        this.send(ws, { type: "pong" });
+        break;
+      }
       default:
         this.send(ws, { type: "error", message: `Unknown message type: ${msg.type}` });
     }
@@ -235,6 +245,7 @@ export class GameRoom {
     }
 
     // Fully reset room state — everyone will re-join from lobby
+    this.stopStaleCheck();
     this.gameStarted = false;
     this.history = [];
     this.turnCounter = 0;
@@ -264,8 +275,9 @@ export class GameRoom {
       // Allow reconnection if the username matches an existing player
       const existing = this.players.find(p => p.username === username && !p.isBot);
       if (existing) {
-        const conn: PlayerConn = { ws, username, seat: existing.seat };
+        const conn: PlayerConn = { ws, username, seat: existing.seat, lastPing: Date.now() };
         this.connections.set(ws, conn);
+        this.startStaleCheck();
         this.broadcastState();
         return;
       }
@@ -298,8 +310,9 @@ export class GameRoom {
     };
     this.players.push(slot);
 
-    const conn: PlayerConn = { ws, username, seat };
+    const conn: PlayerConn = { ws, username, seat, lastPing: Date.now() };
     this.connections.set(ws, conn);
+    this.startStaleCheck();
 
     // Restore host by username, or assign first human as host
     if (this.hostUsername === username) {
@@ -801,6 +814,7 @@ export class GameRoom {
     }
 
     // Clean up WASM memory and reset room state so players return to a clean lobby
+    this.stopStaleCheck();
     this.wasm.dispose();
     this.wasm = null;
     this.gameStarted = false;
@@ -828,6 +842,31 @@ export class GameRoom {
   private getPlayerName(seat: number): string {
     const p = this.players.find(pl => pl.seat === seat);
     return p?.username || `Player ${seat}`;
+  }
+
+  private startStaleCheck(): void {
+    if (this.staleCheckInterval) return; // already running
+    this.staleCheckInterval = setInterval(() => {
+      const now = Date.now();
+      for (const [ws, conn] of this.connections) {
+        if (now - conn.lastPing > 60_000) {
+          this.connections.delete(ws);
+          if (ws === this.hostWs) this.hostWs = null;
+          try { ws.close(); } catch { /* already closed */ }
+        }
+      }
+      // Stop checking if no connections remain
+      if (this.connections.size === 0) {
+        this.stopStaleCheck();
+      }
+    }, 30_000);
+  }
+
+  private stopStaleCheck(): void {
+    if (this.staleCheckInterval) {
+      clearInterval(this.staleCheckInterval);
+      this.staleCheckInterval = null;
+    }
   }
 
   private send(ws: WebSocket, msg: object): void {

@@ -2,6 +2,9 @@
 
 import type { Env } from "./types.js";
 
+// Bump this whenever the client↔server protocol changes (new message types, etc.)
+export const PROTOCOL_VERSION = "2025-04-02.1";
+
 export { Matchmaker } from "./matchmaker.js";
 export { GameRoom } from "./game-room.js";
 
@@ -29,7 +32,7 @@ export default {
 
     // Health check
     if (url.pathname === "/api/health") {
-      return corsResponse(JSON.stringify({ status: "ok", timestamp: Date.now() }), 200, {
+      return corsResponse(JSON.stringify({ status: "ok", version: PROTOCOL_VERSION, timestamp: Date.now() }), 200, {
         "Content-Type": "application/json",
       });
     }

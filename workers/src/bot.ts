@@ -1,6 +1,11 @@
 // Heuristic bots for the Coup Workers backend.
 // Easy = random legal action (always passes on challenges/blocks).
 // Medium = rule-based honest play, never bluffs, blocks when holding the card.
+//
+// SECURITY NOTE: Bots receive an unrestricted CoupWasm instance and can read ANY
+// player's cards via playerCard0Type/playerCard1Type. All card reads MUST be guarded:
+// only read own seat, or check !playerCardXAlive(p) before reading dead cards.
+// If bot logic grows more complex, add a FilteredWasm wrapper to enforce this.
 
 import {
   ACTION_INCOME,
@@ -150,8 +155,12 @@ function chooseMainAction(
   }
 
   // Income as last resort
-  if (actions.includes(ACTION_INCOME)) return ACTION_INCOME;
+  if (actions.includes(ACTION_INCOME)) {
+    console.warn(`[Bot] seat=${seat} medium fell through to Income (cards: [${myCards}], coins: ${myCoins}, actions: [${actions}])`);
+    return ACTION_INCOME;
+  }
 
+  console.warn(`[Bot] seat=${seat} medium fallthrough to actions[0]=${actions[0]} (cards: [${myCards}], coins: ${myCoins}, actions: [${actions}])`);
   return actions[0];
 }
 
@@ -373,7 +382,12 @@ function hardMainAction(
     return ACTION_FOREIGN_AID;
   }
 
-  return actions.includes(ACTION_INCOME) ? ACTION_INCOME : actions[0];
+  if (actions.includes(ACTION_INCOME)) {
+    console.warn(`[Bot] seat=${seat} hard fell through to Income (cards: [${myCards}], revealed: ${JSON.stringify(revealed)}, actions: [${actions}])`);
+    return ACTION_INCOME;
+  }
+  console.warn(`[Bot] seat=${seat} hard fallthrough to actions[0]=${actions[0]} (cards: [${myCards}], actions: [${actions}])`);
+  return actions[0];
 }
 
 function hardChallengeBlock(

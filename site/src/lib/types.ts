@@ -69,7 +69,9 @@ export type ServerMessage =
       history: HistoryEntry[];
     }
   | { type: "error"; message: string }
-  | { type: "forfeited"; by: string };
+  | { type: "forfeited"; by: string }
+  | { type: "pong" }
+  | { type: "version"; version: string };
 
 // ── Client → Server messages ──────────────────────────────────────
 
@@ -86,7 +88,8 @@ export type ClientMessage =
   | { type: "start" }
   | { type: "house_rules"; houseRules: HouseRules }
   | { type: "bot_config"; numBots: number; botDifficulty: string }
-  | { type: "forfeit" };
+  | { type: "forfeit" }
+  | { type: "ping" };
 
 // ── Game state for React ──────────────────────────────────────────
 
