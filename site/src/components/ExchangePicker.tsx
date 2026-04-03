@@ -98,7 +98,7 @@ export default function ExchangePicker({ yourCards, onConfirm }: ExchangePickerP
               key={idx}
               card={c.card}
               isSelected={selected.has(idx)}
-              isCursor={showCursor && cursor === idx}
+              isCursor={cursor === idx}
               onClick={() => toggle(idx)}
             />
           );
@@ -114,7 +114,7 @@ export default function ExchangePicker({ yourCards, onConfirm }: ExchangePickerP
               key={idx}
               card={c.card}
               isSelected={selected.has(idx)}
-              isCursor={showCursor && cursor === idx}
+              isCursor={cursor === idx}
               onClick={() => toggle(idx)}
             />
           );

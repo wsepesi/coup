@@ -149,6 +149,9 @@ export class GameRoom {
       case "house_rules":
         this.handleHouseRules(ws, msg);
         break;
+      case "bot_config":
+        this.handleBotConfig(ws, msg);
+        break;
       case "forfeit":
         this.handleForfeit(ws);
         break;
@@ -185,6 +188,27 @@ export class GameRoom {
       };
       this.broadcastLobby();
     }
+  }
+
+  private handleBotConfig(ws: WebSocket, msg: any): void {
+    if (ws !== this.hostWs) {
+      this.send(ws, { type: "error", message: "Only host can change bot config" });
+      return;
+    }
+    if (this.gameStarted) {
+      this.send(ws, { type: "error", message: "Cannot change bot config after game start" });
+      return;
+    }
+    const humanCount = this.players.filter(p => !p.isBot).length;
+    const maxBots = this.numPlayers - humanCount;
+
+    if (typeof msg.numBots === "number") {
+      this.numBots = Math.max(0, Math.min(maxBots, msg.numBots));
+    }
+    if (msg.botDifficulty === "easy" || msg.botDifficulty === "medium" || msg.botDifficulty === "hard") {
+      this.botDifficulty = msg.botDifficulty;
+    }
+    this.broadcastLobby();
   }
 
   private handleForfeit(ws: WebSocket): void {
@@ -250,11 +274,15 @@ export class GameRoom {
     }
 
     const humanCount = this.players.filter(p => !p.isBot).length;
-    const maxHumans = this.numPlayers - this.numBots;
-
-    if (humanCount >= maxHumans) {
+    if (humanCount >= this.numPlayers) {
       this.send(ws, { type: "error", message: "Room is full" });
       return;
+    }
+
+    // Auto-reduce bot count if needed to make room for humans
+    const maxBots = this.numPlayers - (humanCount + 1);
+    if (this.numBots > maxBots) {
+      this.numBots = Math.max(0, maxBots);
     }
 
     // Assign next available seat
@@ -299,6 +327,9 @@ export class GameRoom {
         players: playerList,
         houseRules: this.houseRules,
         isHost: ws === this.hostWs,
+        numBots: this.numBots,
+        botDifficulty: this.botDifficulty,
+        numPlayers: this.numPlayers,
       });
     }
   }
@@ -339,26 +370,24 @@ export class GameRoom {
         });
       }
 
-      // If we still don't have enough players, add more bots
-      while (this.players.length < this.numPlayers) {
-        let seat = 0;
-        while (takenSeats.has(seat)) seat++;
-        takenSeats.add(seat);
-
-        this.players.push({
-          username: pickBotName(),
-          seat,
-          isBot: true,
-          botDifficulty: this.botDifficulty,
-          ready: true,
-        });
+      // Sort players by seat and re-assign sequential seats
+      this.players.sort((a, b) => a.seat - b.seat);
+      for (let i = 0; i < this.players.length; i++) {
+        // Update connection seats to match
+        for (const [, conn] of this.connections) {
+          if (conn.username === this.players[i].username && conn.seat === this.players[i].seat) {
+            conn.seat = i;
+          }
+        }
+        this.players[i].seat = i;
       }
 
-      // Sort players by seat
-      this.players.sort((a, b) => a.seat - b.seat);
-
-      // Initialize WASM
-      await this.initWasm();
+      // Initialize WASM with actual player count
+      const actualPlayers = this.players.length;
+      this.wasm = await CoupWasm.create(actualPlayers);
+      if (this.houseRules.refundOnChallenge === false) {
+        this.wasm.setRefundOnChallenge(false);
+      }
 
       this.gameStarted = true;
 
@@ -771,8 +800,18 @@ export class GameRoom {
       this.send(ws, gameOverMsg);
     }
 
-    // Clean up WASM memory
+    // Clean up WASM memory and reset room state so players return to a clean lobby
     this.wasm.dispose();
+    this.wasm = null;
+    this.gameStarted = false;
+    this.history = [];
+    this.turnCounter = 0;
+    this.pendingPasses = [];
+    this.claimedRoles.clear();
+    this.eliminationOrder = [];
+    this.players = [];
+    this.connections.clear();
+    this.hostWs = null;
   }
 
   // ---- Helpers ----

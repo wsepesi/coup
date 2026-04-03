@@ -123,7 +123,7 @@ export function actionLabel(action: number, playerNames: string[]): string {
 
 // ---- Protocol types ----
 
-export type BotDifficulty = "easy" | "medium";
+export type BotDifficulty = "easy" | "medium" | "hard";
 
 export interface HouseRules {
   refundOnChallenge?: boolean;
@@ -145,12 +145,13 @@ export type ClientMessage =
   | { type: "action"; action: number }
   | { type: "start" }
   | { type: "house_rules"; houseRules: HouseRules }
+  | { type: "bot_config"; numBots: number; botDifficulty: BotDifficulty }
   | { type: "forfeit" };
 
 // Server -> Client messages
 export type ServerMessage =
   | { type: "room_created"; code: string }
-  | { type: "lobby"; code: string; players: PlayerSlot[]; houseRules?: HouseRules; isHost?: boolean }
+  | { type: "lobby"; code: string; players: PlayerSlot[]; houseRules?: HouseRules; isHost?: boolean; numBots: number; botDifficulty: BotDifficulty; numPlayers: number }
   | {
       type: "state";
       yourSeat: number;

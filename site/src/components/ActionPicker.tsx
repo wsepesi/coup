@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useLayoutEffect, useCallback } from "react";
 import type { ActionInfo, PlayerInfo, CardInfo } from "@/lib/types";
 import { useKeyboard } from "@/hooks/useKeyboard";
 import { ROLE_NAMES } from "@/lib/constants";
@@ -135,7 +135,6 @@ export default function ActionPicker({ actions, onAction, players, phase, yourCa
   const isMainAction = phase === "action";
   const hasTargeted = actions.some((a) => isTargetedAction(a.id));
   const useTwoStep = isMainAction && hasTargeted;
-
   // Build current menu options
   const options: MenuOption[] = useTwoStep
     ? activeCategory
@@ -146,7 +145,8 @@ export default function ActionPicker({ actions, onAction, players, phase, yourCa
       : actions.map((a) => ({ label: a.label, action: a.id }));
 
   // Reset cursor when actions/phase change — default to Pass in reactive phases
-  useEffect(() => {
+  // useLayoutEffect prevents a flash of the wrong selection before paint
+  useLayoutEffect(() => {
     setActiveCategory(null);
     setShowCursor(false);
     if (!isMainAction) {
@@ -157,11 +157,6 @@ export default function ActionPicker({ actions, onAction, players, phase, yourCa
       setSelected(0);
     }
   }, [actions, isMainAction, phase]);
-
-  useEffect(() => {
-    setSelected(0);
-    setShowCursor(false);
-  }, [activeCategory]);
 
   // Notify parent of hovered target seat
   useEffect(() => {
@@ -181,6 +176,8 @@ export default function ActionPicker({ actions, onAction, players, phase, yourCa
         // Category sentinel → enter target sub-menu
         const cat = opt.action === -1 ? "coup" : opt.action === -2 ? "steal" : "assassinate";
         setActiveCategory(cat);
+        setSelected(0);
+        setShowCursor(false);
       } else {
         onAction(opt.action);
       }
@@ -199,7 +196,7 @@ export default function ActionPicker({ actions, onAction, players, phase, yourCa
       ArrowUp: () => { setShowCursor(true); setSelected((s) => navigateGrid(s, "ArrowUp", options.length)); },
       ArrowDown: () => { setShowCursor(true); setSelected((s) => navigateGrid(s, "ArrowDown", options.length)); },
       Enter: confirm,
-      Escape: () => { if (activeCategory) setActiveCategory(null); },
+      Escape: () => { if (activeCategory) { setActiveCategory(null); setSelected(0); setShowCursor(false); } },
       "1": () => { if (options[0]) handleSelect(options[0]); },
       "2": () => { if (options[1]) handleSelect(options[1]); },
       "3": () => { if (options[2]) handleSelect(options[2]); },
@@ -237,12 +234,12 @@ export default function ActionPicker({ actions, onAction, players, phase, yourCa
               key={opt.action}
               onClick={() => handleSelect(opt)}
               className={`text-left text-sm px-2 py-1 transition-colors ${
-                showCursor && isSelected
+                isSelected
                   ? "bg-selection-bg text-text-bright"
                   : "text-text-dim hover:bg-selection-bg hover:text-text-bright"
               }`}
             >
-              <span className={showCursor && isSelected ? "text-cursor mr-1" : "mr-1 opacity-0"}>▸</span>
+              <span className={isSelected ? "text-cursor mr-1" : "mr-1 opacity-0"}>▸</span>
               <span className="text-text-dim mr-1 text-xs">{i + 1}.</span>
               {opt.label}
             </button>

@@ -44,7 +44,7 @@ export interface Standing {
 
 export type ServerMessage =
   | { type: "room_created"; code: string }
-  | { type: "lobby"; code: string; players: LobbyPlayer[]; houseRules?: HouseRules; isHost?: boolean }
+  | { type: "lobby"; code: string; players: LobbyPlayer[]; houseRules?: HouseRules; isHost?: boolean; numBots?: number; botDifficulty?: string; numPlayers?: number }
   | {
       type: "state";
       yourSeat: number;
@@ -85,6 +85,7 @@ export type ClientMessage =
   | { type: "action"; action: number }
   | { type: "start" }
   | { type: "house_rules"; houseRules: HouseRules }
+  | { type: "bot_config"; numBots: number; botDifficulty: string }
   | { type: "forfeit" };
 
 // ── Game state for React ──────────────────────────────────────────

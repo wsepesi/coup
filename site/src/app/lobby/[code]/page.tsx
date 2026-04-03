@@ -17,6 +17,9 @@ export default function LobbyPage() {
   );
   const [players, setPlayers] = useState<LobbyPlayer[]>([]);
   const [houseRules, setHouseRules] = useState<HouseRules>({ refundOnChallenge: true });
+  const [numBots, setNumBots] = useState(0);
+  const [botDifficulty, setBotDifficulty] = useState("hard");
+  const [numPlayers, setNumPlayers] = useState(6);
   const [error, setError] = useState<string | null>(null);
   const [isHost, setIsHost] = useState(false);
   const [phase, setPhase] = useState<"matchmaker" | "game">(
@@ -80,6 +83,9 @@ export default function LobbyPage() {
         setPlayers(msg.players);
         if (msg.houseRules) setHouseRules(msg.houseRules);
         if (msg.isHost != null) setIsHost(msg.isHost);
+        if (msg.numBots != null) setNumBots(msg.numBots);
+        if (msg.botDifficulty) setBotDifficulty(msg.botDifficulty);
+        if (msg.numPlayers) setNumPlayers(msg.numPlayers);
         break;
       case "state":
         router.push(`/game/${roomCode || rawCode}`);
@@ -221,6 +227,79 @@ export default function LobbyPage() {
           </label>
           <p className="text-text-dim text-xs mt-1">
             Refund coins when action claim is successfully challenged (official rule)
+          </p>
+        </div>
+      </div>
+
+      {/* Bot configuration */}
+      <div className="w-full max-w-md border border-border-term mb-4">
+        <div className="border-b border-border-term px-3 py-1 text-text-dim text-xs">
+          {"// "}bot fill
+        </div>
+        <div className="px-3 py-2 space-y-3">
+          <div className="flex items-center justify-between text-sm">
+            <span className="text-text-default">Fill with bots</span>
+            {isHost ? (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    const next = Math.max(0, numBots - 1);
+                    setNumBots(next);
+                    game.send({ type: "bot_config", numBots: next, botDifficulty });
+                  }}
+                  className="text-text-dim hover:text-text-bright px-2"
+                >
+                  ◀
+                </button>
+                <span className="text-you w-4 text-center">{numBots}</span>
+                <button
+                  onClick={() => {
+                    const humanCount = players.filter(p => !p.isBot).length;
+                    const maxBots = numPlayers - humanCount;
+                    const next = Math.min(maxBots, numBots + 1);
+                    setNumBots(next);
+                    game.send({ type: "bot_config", numBots: next, botDifficulty });
+                  }}
+                  className="text-text-dim hover:text-text-bright px-2"
+                >
+                  ▶
+                </button>
+              </div>
+            ) : (
+              <span className="text-you text-xs">{numBots}</span>
+            )}
+          </div>
+          {numBots > 0 && (
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-text-default">Difficulty</span>
+              {isHost ? (
+                <div className="flex gap-2">
+                  {(["easy", "medium", "hard"] as const).map((d) => (
+                    <button
+                      key={d}
+                      onClick={() => {
+                        setBotDifficulty(d);
+                        game.send({ type: "bot_config", numBots, botDifficulty: d });
+                      }}
+                      className={`px-2 py-0.5 text-xs border transition-colors ${
+                        botDifficulty === d
+                          ? "border-you text-you"
+                          : "border-border-term text-text-dim hover:text-text-default"
+                      }`}
+                    >
+                      {d}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <span className="text-you text-xs">{botDifficulty}</span>
+              )}
+            </div>
+          )}
+          <p className="text-text-dim text-xs">
+            {numBots > 0
+              ? `${numBots} bot${numBots !== 1 ? "s" : ""} will join when game starts`
+              : `${numPlayers - players.filter(p => !p.isBot).length} seat${numPlayers - players.filter(p => !p.isBot).length !== 1 ? "s" : ""} open`}
           </p>
         </div>
       </div>

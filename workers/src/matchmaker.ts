@@ -111,7 +111,7 @@ export class Matchmaker {
 
     const np = Math.max(2, Math.min(6, Number(numPlayers) || 4));
     const nb = Math.max(0, Math.min(np - 1, Number(numBots) || 0));
-    const diff: BotDifficulty = botDifficulty === "easy" ? "easy" : "medium";
+    const diff: BotDifficulty = botDifficulty === "easy" ? "easy" : botDifficulty === "hard" ? "hard" : "medium";
 
     // Generate unique code
     let code: string;
