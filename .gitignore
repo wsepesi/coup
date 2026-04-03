@@ -22,3 +22,13 @@ test_core
 
 # Python
 *.pyc
+
+# Screenshots
+*.png
+
+# Local env
+site/.env.local
+
+# IDE / tooling
+site/tsconfig.tsbuildinfo
+.playwright-mcp/
