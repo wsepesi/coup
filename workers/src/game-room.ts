@@ -4,7 +4,6 @@
 
 import { CoupWasm } from "./wasm-bridge.js";
 import { chooseBotAction, pickBotName } from "./bot.js";
-import { PROTOCOL_VERSION } from "./index.js";
 import {
   type Env,
   type BotDifficulty,
@@ -77,6 +76,8 @@ export class GameRoom {
   private history: HistoryEntry[] = [];
   private pendingPasses: string[] = [];
   private claimedRoles = new Map<number, Set<string>>(); // seat → claimed role names
+  private pendingChallenge: { challenger: number; claimant: number; claimedCard: string } | null = null;
+  private lastBlocker: { seat: number; cardName: string } | null = null;
   private eliminationOrder: { seat: number; turn: number }[] = [];
   private staleCheckInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -96,7 +97,6 @@ export class GameRoom {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       server.accept();
-      this.send(server, { type: "version", version: PROTOCOL_VERSION });
       server.addEventListener("message", (event) => {
         this.handleWsMessage(server, event.data);
       });
@@ -556,14 +556,33 @@ export class GameRoom {
       text = `${name} claims Assassin to Assassinate ${playerNames[t]}. -3 coins.`;
     } else if (action === ACTION_CHALLENGE) {
       text = `${name} challenges!`;
+      // Track who challenged whom for result logging
+      if (this.wasm) {
+        const phase = this.wasm.getPhase();
+        if (phase === PHASE_CHALLENGE_ACTION) {
+          const turnPlayer = this.wasm.getTurnPlayer();
+          const pendingAction = this.wasm.getPendingAction();
+          const role = claimedRole(pendingAction);
+          const cardName = role != null ? (CARD_NAMES[role] ?? null) : null;
+          if (cardName) {
+            this.pendingChallenge = { challenger: seat, claimant: turnPlayer, claimedCard: cardName };
+          }
+        } else if (phase === PHASE_CHALLENGE_BLOCK && this.lastBlocker) {
+          this.pendingChallenge = { challenger: seat, claimant: this.lastBlocker.seat, claimedCard: this.lastBlocker.cardName };
+        }
+      }
     } else if (action === ACTION_BLOCK_CONTESSA) {
       text = `${name} blocks with Contessa.`;
+      this.lastBlocker = { seat, cardName: "Contessa" };
     } else if (action === ACTION_BLOCK_CAPTAIN) {
       text = `${name} blocks with Captain.`;
+      this.lastBlocker = { seat, cardName: "Captain" };
     } else if (action === ACTION_BLOCK_AMBASSADOR) {
       text = `${name} blocks with Ambassador.`;
+      this.lastBlocker = { seat, cardName: "Ambassador" };
     } else if (action === ACTION_BLOCK_DUKE) {
       text = `${name} blocks with Duke.`;
+      this.lastBlocker = { seat, cardName: "Duke" };
     } else if (action >= ACTION_DISCARD_SLOT0 && action <= ACTION_DISCARD_SLOT0 + 3) {
       text = `${name} loses a card.`;
     } else {
@@ -585,6 +604,24 @@ export class GameRoom {
     }
 
     this.history.push({ text, turn: this.turnCounter });
+
+    // Emit challenge result after a discard resolves a challenge
+    if (action >= ACTION_DISCARD_SLOT0 && action <= ACTION_DISCARD_SLOT0 + 3 && this.pendingChallenge) {
+      const pc = this.pendingChallenge;
+      const claimantName = playerNames[pc.claimant];
+      if (seat === pc.challenger) {
+        this.history.push({
+          text: `Challenge failed! ${claimantName} reveals ${pc.claimedCard}. (shuffled back, drew replacement)`,
+          turn: this.turnCounter,
+        });
+      } else if (seat === pc.claimant) {
+        this.history.push({
+          text: `Challenge succeeded! ${claimantName} was bluffing.`,
+          turn: this.turnCounter,
+        });
+      }
+      this.pendingChallenge = null;
+    }
   }
 
   private resolveChanceNodes(): void {

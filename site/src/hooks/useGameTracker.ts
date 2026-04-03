@@ -30,6 +30,7 @@ const ACTION_PATTERNS: [RegExp, (m: RegExpMatchArray) => string][] = [
 const DECK_PATTERNS: [RegExp, (m: RegExpMatchArray) => DeckEvent | null][] = [
   [/^(.+?) claims Ambassador for Exchange\./, (m) => ({ arrow: "⇄", text: `${m[1]} exchanges` })],
   [/^(.+?) loses (\w+)\./, (m) => ({ arrow: "↩", text: `${m[2]} revealed`, card: m[2] })],
+  [/^Challenge failed! .+ reveals (\w+)\./, (m) => ({ arrow: "↩", text: `${m[1]} reshuffled`, card: m[1] })],
 ];
 
 export function useGameTracker(

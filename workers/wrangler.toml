@@ -5,7 +5,7 @@ compatibility_flags = ["nodejs_compat"]
 
 # Allow wrangler to bundle the Emscripten JS glue + WASM
 [build]
-command = ""
+command = "echo \"export const PROTOCOL_VERSION = \\\"$(git rev-parse --short HEAD)\\\"\" > src/version.ts"
 
 [durable_objects]
 bindings = [

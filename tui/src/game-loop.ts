@@ -359,6 +359,14 @@ export async function runGame(
           direction: "in",
           description: "reshuffled",
         });
+        deckEvents.push({
+          direction: "out",
+          description: "drew replacement",
+        });
+        const cardName = CARD_NAMES[pendingChallenge.claimedCard];
+        history.push(`Challenge failed! ${playerName(pendingChallenge.claimant)} reveals ${cardName}. (shuffled back, drew replacement)`);
+      } else if (seat === pendingChallenge.claimant) {
+        history.push(`Challenge succeeded! ${playerName(pendingChallenge.claimant)} was bluffing.`);
       }
       pendingChallenge = null;
     }

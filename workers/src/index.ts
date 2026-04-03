@@ -3,7 +3,7 @@
 import type { Env } from "./types.js";
 
 // Bump this whenever the client↔server protocol changes (new message types, etc.)
-export const PROTOCOL_VERSION = "2025-04-02.1";
+import { PROTOCOL_VERSION } from "./version.js";
 
 export { Matchmaker } from "./matchmaker.js";
 export { GameRoom } from "./game-room.js";

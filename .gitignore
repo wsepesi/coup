@@ -24,6 +24,9 @@ test_core
 # Profiling binaries
 profiling/bench_c
 
+# Generated version file
+workers/src/version.ts
+
 # WASM build output
 wasm/coup.wasm
 wasm/coup.js

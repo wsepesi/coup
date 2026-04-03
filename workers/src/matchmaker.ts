@@ -2,7 +2,6 @@
 // Singleton that manages room creation, join codes, and quick-match queue.
 
 import type { Env, BotDifficulty } from "./types.js";
-import { PROTOCOL_VERSION } from "./index.js";
 
 interface RoomInfo {
   code: string;
@@ -48,7 +47,6 @@ export class Matchmaker {
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       server.accept();
-      this.send(server, { type: "version", version: PROTOCOL_VERSION });
       server.addEventListener("message", (event) => {
         this.handleWsMessage(server, event.data);
       });
