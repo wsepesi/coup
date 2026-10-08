@@ -122,12 +122,14 @@ export interface HouseRules {
 export const DEFAULT_RULES: HouseRules = { refundOnChallenge: true, responseTimer: true };
 
 export type HistoryKind =
-  | "turn" | "action" | "claim" | "challenge" | "block" | "reveal" | "lose" | "elim" | "info" | "win";
+  | "turn" | "action" | "claim" | "challenge" | "block" | "pass" | "reveal" | "lose" | "elim" | "info" | "win";
 
 export interface HistoryEntry {
   turn: number;
   text: string;
   kind: HistoryKind;
+  /** Seat the entry is about (actor, claimant, or the player losing a card). Absent for table-wide notes. */
+  seat?: number;
 }
 
 export interface LobbySeat {
