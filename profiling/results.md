@@ -33,29 +33,23 @@
 
 Thread scaling: ~2x per doubling up to 4 cores, ~6.7x at 10 cores (some E-core penalty).
 
-## PufferLib (realistic training loop)
+## PufferLib 5.0 env (`puffer/coup.h`)
 
-Full observation generation (407 floats + 32-float action mask) every step.
-C-side action selection (simulates neural net policy output).
+`make bench-puffer`, Apple M4, single thread, 256 envs. Each step writes the
+587-byte uint8 observation and 32-byte action mask for every seat; the active
+seat picks a random legal action (included in the timing).
 
-| Players | Policy | Num Envs | Games/sec | Avg Game Length |
-|---------|--------|----------|-----------|-----------------|
-| 2 | random | 100 | 739,396 | 15.4 |
-| 2 | random | 1,000 | 1,036,536 | 15.4 |
-| 2 | random | 10,000 | 783,439 | 15.4 |
-| 2 | heuristic | 100 | 104,110 | 106.3 |
-| 2 | heuristic | 1,000 | 152,168 | 106.4 |
-| 2 | heuristic | 10,000 | 114,055 | 105.5 |
-| 6 | random | 100 | 168,218 | 51.1 |
-| 6 | random | 1,000 | 222,642 | 51.1 |
-| 6 | random | 10,000 | 173,749 | 51.2 |
-| 6 | heuristic | 100 | 13,788 | 602.2 |
-| 6 | heuristic | 1,000 | 17,771 | 605.1 |
-| 6 | heuristic | 10,000 | 13,727 | 623.1 |
+| Players | Agents | Env-steps/sec | Agent-steps/sec | Games/sec |
+|---------|--------|---------------|-----------------|-----------|
+| 2 | all | 4.54M | 9.07M | 295K |
+| 4 | all | 2.40M | 9.61M | 71K |
+| 6 | all | 1.46M | 8.75M | 29K |
+| mixed 2-6 | all | 2.17M | 8.70M | 77K |
+| 4 | 1 + 3 heuristic bots | 1.99M | 1.99M | 231K |
 
-PufferLib overhead vs raw C: ~2.9x slower (history rewriting dominates remaining gap).
-Optimizations applied: history reversal eliminated, `-O3 -march=native -flto`, incremental obs updates, absolute card encoding.
-See [performance-puffer.md](performance-puffer.md) for remaining opportunities (#5 oldest-first history).
+The numbers in older revisions of this file were for the removed 3.0-era
+CPython binding (`pufferlib/binding.c`), which used a different observation and
+had correctness bugs. They are not comparable.
 
 ## C++ (OpenSpiel)
 
@@ -74,16 +68,11 @@ Optimizations applied: `LegalActions()`/`ChanceOutcomes()` vector caching (avoid
 C++ vs raw C: ~3.5x slower single-threaded (2p random). Virtual dispatch + explicit chance nodes.
 6p heuristic avg 1800 steps — C++ heuristic (action-priority, no card awareness) hits 200-turn cap more often than C heuristic.
 
-## pyspiel (Python) — pending
-
-Requires pyspiel import. Will be added when available.
-
 ## Methodology
 
 - **C (raw)**: Direct `step_with_rng()` loop, no observation generation. Compiled with `-O3 -march=native -flto`.
-- **PufferLib**: CPython extension. Each step generates full 439-float observation (407 engine + 32 action mask). C-side random/heuristic action selection simulates policy output.
+- **PufferLib**: 5.0 env header driven by a fake Agent buffer harness (`puffer/test_coup_env.c`). Every seat's uint8 observation + action mask written every step.
 - **C++ (OpenSpiel)**: OpenSpiel `State` API with explicit chance node handling. More steps per game than C (chance nodes are separate actions).
-- **pyspiel**: Python game loop via `pyspiel.load_game()`. Python/SWIG overhead. Multi-process for threading.
 
 ### Player Policies
 - **random**: Uniform random selection from valid actions.

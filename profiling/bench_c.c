@@ -5,7 +5,15 @@
  * and duration. Supports OpenMP or pthreads for multi-threaded benchmarks.
  *
  * Usage:
- *   ./bench_c --players 2|6 --policy random|heuristic --threads N --duration S
+ *   ./bench_c --players 2|6 --policy random|heuristic|counting --threads N
+ *             --duration S [--mode game|env]
+ *
+ * Modes:
+ *   game  raw engine throughput: policy + step_with_rng only.
+ *   env   RL-env-shaped loop: every step additionally computes, for EVERY
+ *         seat, coup_valid_actions_rel() + coup_obs_write() and records the
+ *         event in a CoupObsTracker (what puffer/ does). This is the number
+ *         that matters for training throughput.
  *
  * Output (one line, machine-parseable):
  *   engine=c players=2 policy=random threads=4 games=123456 duration=10.00 gps=12345.6 avg_len=42.3
@@ -20,6 +28,7 @@
 
 #include "../c_engine/coup_core.h"
 #include "../c_engine/heuristic.h"
+#include "../c_engine/coup_obs.h"
 
 /* ---------- Portable wall-clock time ---------- */
 
@@ -40,11 +49,13 @@ static double wall_time(void) {
 #include <pthread.h>
 #endif
 
-typedef enum { POLICY_RANDOM, POLICY_HEURISTIC } Policy;
+typedef enum { POLICY_RANDOM, POLICY_HEURISTIC, POLICY_COUNTING } Policy;
+typedef enum { MODE_GAME, MODE_ENV } Mode;
 
 typedef struct {
     int num_players;
     Policy policy;
+    Mode mode;
     double duration;
     uint64_t seed;
     /* outputs */
@@ -52,23 +63,50 @@ typedef struct {
     uint64_t total_steps;
 } WorkerArgs;
 
-/* Max steps before declaring a draw and re-dealing.
- * Prevents infinite loops from heuristic deadlocks (e.g., all-Captain games). */
+/* Safety net only: MAX_TURNS already bounds every game. */
 #define MAX_STEPS_PER_GAME 10000
+
+static inline int choose(Game *g, Policy policy) {
+    switch (policy) {
+    case POLICY_HEURISTIC: return heuristic_choose_action_level(g, HEURISTIC_HONEST);
+    case POLICY_COUNTING:  return heuristic_choose_action_level(g, HEURISTIC_COUNTING);
+    default:               return heuristic_choose_action_level(g, HEURISTIC_RANDOM);
+    }
+}
 
 /* Play one complete game, return number of steps */
 static inline int play_game(Game *g, Policy policy) {
     int steps = 0;
     while (!is_done(g) && steps < MAX_STEPS_PER_GAME) {
-        int action;
-        if (policy == POLICY_HEURISTIC) {
-            action = heuristic_choose_action(g);
-        } else {
-            action = random_valid_action(g);
-        }
-        step_with_rng(g, action);
+        step_with_rng(g, choose(g, policy));
         steps++;
     }
+    return steps;
+}
+
+/* Sink so the compiler cannot drop the observation work. */
+static volatile uint32_t bench_sink;
+
+/* Same, but doing the per-step work of a multi-agent RL env. */
+static inline int play_game_env(Game *g, Policy policy, CoupObsTracker *t,
+                                uint8_t *obs) {
+    int steps = 0;
+    int np = get_num_players(g);
+    uint32_t acc = 0;
+    coup_obs_tracker_reset(t);
+    while (!is_done(g) && steps < MAX_STEPS_PER_GAME) {
+        for (int s = 0; s < np; s++) {
+            acc += coup_valid_actions_rel(g, s);
+            coup_obs_write(g, t, s, obs + s * COUP_OBS_SIZE);
+        }
+        acc += obs[(steps * 7) % (np * COUP_OBS_SIZE)];
+        int actor = get_active_player(g);
+        int a = choose(g, policy);
+        coup_obs_tracker_record(t, g, actor, a);
+        step_with_rng(g, a);
+        steps++;
+    }
+    bench_sink += acc;
     return steps;
 }
 
@@ -84,9 +122,13 @@ static void worker_run(WorkerArgs *args) {
     uint64_t games = 0;
     uint64_t total_steps = 0;
     double start = wall_time();
+    CoupObsTracker tracker;
+    static _Thread_local uint8_t obs[MAX_PLAYERS * COUP_OBS_SIZE];
 
     while (wall_time() - start < args->duration) {
-        int steps = play_game(&g, args->policy);
+        int steps = args->mode == MODE_ENV
+            ? play_game_env(&g, args->policy, &tracker, obs)
+            : play_game(&g, args->policy);
         total_steps += (uint64_t)steps;
         games++;
 
@@ -110,14 +152,15 @@ static void *pthread_worker(void *arg) {
 /* ---------- Main ---------- */
 
 static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s [--players 2|6] [--policy random|heuristic] "
-                    "[--threads N] [--duration S]\n", prog);
+    fprintf(stderr, "Usage: %s [--players 2..6] [--policy random|heuristic|counting] "
+                    "[--threads N] [--duration S] [--mode game|env]\n", prog);
     exit(1);
 }
 
 int main(int argc, char **argv) {
     int num_players = 2;
     Policy policy = POLICY_RANDOM;
+    Mode mode = MODE_GAME;
     int num_threads = 1;
     double duration = 10.0;
 
@@ -127,7 +170,13 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--policy") == 0 && i + 1 < argc) {
             i++;
             if (strcmp(argv[i], "heuristic") == 0) policy = POLICY_HEURISTIC;
+            else if (strcmp(argv[i], "counting") == 0) policy = POLICY_COUNTING;
             else if (strcmp(argv[i], "random") == 0) policy = POLICY_RANDOM;
+            else usage(argv[0]);
+        } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+            i++;
+            if (strcmp(argv[i], "env") == 0) mode = MODE_ENV;
+            else if (strcmp(argv[i], "game") == 0) mode = MODE_GAME;
             else usage(argv[0]);
         } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             num_threads = atoi(argv[++i]);
@@ -161,6 +210,7 @@ int main(int argc, char **argv) {
     for (int t = 0; t < num_threads; t++) {
         workers[t].num_players = num_players;
         workers[t].policy = policy;
+        workers[t].mode = mode;
         workers[t].duration = duration;
         workers[t].seed = (uint64_t)(t + 1) * 6364136223846793005ULL + 1442695040888963407ULL;
     }
@@ -199,15 +249,20 @@ int main(int argc, char **argv) {
     }
 
     double gps = (double)total_games / elapsed;
+    double sps = (double)total_steps / elapsed;
     double avg_len = total_games > 0 ? (double)total_steps / (double)total_games : 0.0;
+    static const char *policy_names[] = {"random", "heuristic", "counting"};
 
-    printf("engine=c players=%d policy=%s threads=%d games=%llu duration=%.2f gps=%.1f avg_len=%.1f\n",
+    printf("engine=c mode=%s players=%d policy=%s threads=%d games=%llu duration=%.2f "
+           "gps=%.1f sps=%.0f avg_len=%.1f\n",
+           mode == MODE_ENV ? "env" : "game",
            num_players,
-           policy == POLICY_HEURISTIC ? "heuristic" : "random",
+           policy_names[policy],
            num_threads,
            (unsigned long long)total_games,
            elapsed,
            gps,
+           sps,
            avg_len);
 
     free(workers);

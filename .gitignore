@@ -24,6 +24,11 @@ test_core
 # Profiling binaries
 profiling/bench_c
 
+# PufferLib env test binaries
+puffer/test_coup_env
+puffer/test_coup_env_bench
+puffer/*.dSYM/
+
 # Generated version file
 workers/src/version.ts
 
@@ -47,3 +52,11 @@ site/.env.local
 # IDE / tooling
 site/tsconfig.tsbuildinfo
 .playwright-mcp/
+
+# Python (uv venv, pyspiel build)
+.venv/
+cpp_engine/build-py/
+.pytest_cache/
+
+# Vercel local project link
+.vercel/

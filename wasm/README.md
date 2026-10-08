@@ -1,6 +1,6 @@
 # WASM
 
-Compiles the C game engine to WebAssembly for use in Cloudflare Workers and browser environments.
+Compiles the C game engine to a standalone WebAssembly module for the Workers game server.
 
 ## Build
 
@@ -10,9 +10,10 @@ Requires [Emscripten](https://emscripten.org/):
 ./build.sh
 ```
 
-Outputs `coup.wasm` and `coup.js`.
+Outputs `coup.wasm` (no imports, unminified export names, no malloc).
 
 ## Files
 
-- `wasm_exports.c` -- Wrapper that exposes C engine inline helpers as WASM-exportable functions (game state accessors, struct sizes, config setters)
-- `build.sh` -- Emscripten build script (`-O3`, targets `coup_core.c` + `text_render.c` + `wasm_exports.c`)
+- `wasm_exports.c` -- Exposes the engine's inline accessors plus a static scratch `Game`
+  struct; the server copies each room's state bytes in/out of it (see `workers/src/engine.ts`).
+- `build.sh` -- Emscripten build script (`-O3`, `STANDALONE_WASM`, `coup_core.c` + `wasm_exports.c`).

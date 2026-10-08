@@ -1,14 +1,47 @@
-// ── Server → Client messages ──────────────────────────────────────
+// Client mirror of the server protocol (workers/src/types.ts). Keep in sync.
+
+/** Must equal PROTOCOL in workers/src/types.ts. */
+export const PROTOCOL = 2;
+
+export type BotDifficulty = "easy" | "medium" | "hard";
 
 export interface HouseRules {
-  refundOnChallenge?: boolean;
+  refundOnChallenge: boolean;
+  responseTimer: boolean;
 }
 
-export interface LobbyPlayer {
+export type HistoryKind =
+  | "turn" | "action" | "claim" | "challenge" | "block" | "reveal" | "lose" | "elim" | "info" | "win";
+
+export interface HistoryEntry {
+  turn: number;
+  text: string;
+  kind: HistoryKind;
+}
+
+export interface LobbySeat {
+  name: string;
+  bot: BotDifficulty | null;
+  online: boolean;
+  host: boolean;
+  you: boolean;
+}
+
+export interface Standing {
   seat: number;
-  username: string;
-  isBot: boolean;
-  botDifficulty?: string;
+  name: string;
+  bot: boolean;
+  alive: boolean;
+  eliminatedTurn?: number;
+}
+
+export interface GameResult {
+  winner: number;
+  winnerName: string;
+  standings: Standing[];
+  turns: number;
+  history: HistoryEntry[];
+  finalCards: number[][];
 }
 
 export interface CardInfo {
@@ -19,10 +52,13 @@ export interface CardInfo {
 export interface PlayerInfo {
   name: string;
   coins: number;
-  influence: number; // 0, 1, or 2
-  revealed: { type: number }[];
-  isBot: boolean;
+  influence: number;
+  revealed: number[];
+  bot: boolean;
+  online: boolean;
+  away: boolean;
   alive: boolean;
+  claims: string[];
 }
 
 export interface ActionInfo {
@@ -30,80 +66,60 @@ export interface ActionInfo {
   label: string;
 }
 
-export interface HistoryEntry {
-  text: string;
+export interface GameView {
+  type: "state";
+  code: string;
+  you: number;
+  cards: CardInfo[];
+  drawn?: number[];
+  players: PlayerInfo[];
+  phase: string;
+  active: number;
+  turnPlayer: number;
+  pending?: number;
+  block?: { seat: number; card: number };
+  actions: ActionInfo[];
+  prompt: string;
+  deadlineMs?: number;
+  history: HistoryEntry[];
+  historyBase: number;
+  deck: number;
   turn: number;
+  step: number;
+  isHost: boolean;
+  rules: HouseRules;
 }
 
-export interface Standing {
-  seat: number;
-  name: string;
-  alive: boolean;
-  eliminatedTurn?: number;
+export interface LobbyView {
+  type: "lobby";
+  code: string;
+  seats: LobbySeat[];
+  rules: HouseRules;
+  isHost: boolean;
+  maxSeats: number;
 }
 
 export type ServerMessage =
-  | { type: "room_created"; code: string }
-  | { type: "lobby"; code: string; players: LobbyPlayer[]; houseRules?: HouseRules; isHost?: boolean; numBots?: number; botDifficulty?: string; numPlayers?: number }
-  | {
-      type: "state";
-      yourSeat: number;
-      yourCards: CardInfo[];
-      players: PlayerInfo[];
-      phase: string;
-      activePlayer: number;
-      isYourTurn: boolean;
-      availableActions: ActionInfo[];
-      history: HistoryEntry[];
-      claims: Record<number, string[]>;
-      context?: string;
-      pendingAction?: number;
-      deckSize: number;
-    }
-  | {
-      type: "game_over";
-      winner: number;
-      winnerName: string;
-      finalStandings: Standing[];
-      totalTurns: number;
-      history: HistoryEntry[];
-    }
-  | { type: "error"; message: string }
-  | { type: "forfeited"; by: string }
-  | { type: "pong" }
-  | { type: "version"; version: string };
-
-// ── Client → Server messages ──────────────────────────────────────
+  | { type: "welcome"; protocol: number; code: string }
+  | LobbyView
+  | GameView
+  | ({ type: "game_over" } & GameResult)
+  | { type: "error"; message: string; fatal?: boolean }
+  | { type: "pong" };
 
 export type ClientMessage =
-  | {
-      type: "create";
-      username: string;
-      numPlayers: number;
-      numBots: number;
-      botDifficulty: string;
-    }
-  | { type: "join"; username: string; code: string }
-  | { type: "action"; action: number }
+  | { type: "join"; name: string; cid: string }
+  | { type: "leave" }
   | { type: "start" }
-  | { type: "house_rules"; houseRules: HouseRules }
-  | { type: "bot_config"; numBots: number; botDifficulty: string }
-  | { type: "forfeit" }
+  | { type: "add_bot"; difficulty: BotDifficulty }
+  | { type: "remove_seat"; index: number }
+  | { type: "set_bot"; index: number; difficulty: BotDifficulty }
+  | { type: "rules"; rules: Partial<HouseRules> }
+  | { type: "action"; action: number; then?: number; step?: number }
   | { type: "ping" };
 
-// ── Game state for React ──────────────────────────────────────────
-
-export interface GameState {
-  yourSeat: number;
-  yourCards: CardInfo[];
-  players: PlayerInfo[];
-  phase: string;
-  activePlayer: number;
-  isYourTurn: boolean;
-  availableActions: ActionInfo[];
+/** Game view as held by the client: history merged across messages, deadline made absolute. */
+export interface GameState extends Omit<GameView, "history" | "historyBase" | "deadlineMs"> {
   history: HistoryEntry[];
-  claims: Record<number, string[]>;
-  context?: string;
-  pendingAction?: number;
-  deckSize: number;
+  deadline: number | null;
 }

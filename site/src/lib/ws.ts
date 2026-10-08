@@ -1,145 +1,209 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
-import type { ServerMessage, ClientMessage } from "./types";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { WS_BASE, getClientId } from "./identity";
+import {
+  PROTOCOL,
+  type ClientMessage,
+  type GameResult,
+  type GameState,
+  type HistoryEntry,
+  type LobbyView,
+  type ServerMessage,
+} from "./types";
 
-// Must match PROTOCOL_VERSION in workers/src/index.ts
-const PROTOCOL_VERSION = "2025-04-02.1";
+export type ConnectionStatus = "connecting" | "connected" | "reconnecting" | "closed";
 
-const BASE_URL =
-  process.env.NEXT_PUBLIC_WS_URL ?? "wss://coup-server.sepesi-coup.workers.dev";
+/** Close codes the server uses for "don't reconnect" situations. */
+const TERMINAL_CLOSE: Record<number, string> = {
+  4000: "You left the room.",
+  4001: "This game is open in another tab.",
+  4003: "The host removed you from the room.",
+  4004: "Room not found. It may have expired.",
+};
 
-export type ConnectionStatus = "connecting" | "connected" | "disconnected" | "reconnecting";
+const PING_MS = 25_000;
+const DEAD_AFTER_MS = 60_000;
 
-interface UseWebSocketOptions {
-  /** WS path relative to base, e.g. "/ws/matchmaker" or "/ws/game/ABCD12" */
-  path: string;
-  /** If false/undefined, don't connect yet */
-  enabled?: boolean;
-  onMessage?: (msg: ServerMessage) => void;
-  onConnect?: (send: (msg: ClientMessage) => void) => void;
+export interface RoomConnection {
+  status: ConnectionStatus;
+  lobby: LobbyView | null;
+  game: GameState | null;
+  result: GameResult | null;
+  /** Transient (non-fatal) server error, cleared on the next state change. */
+  error: string | null;
+  /** Why the connection ended for good (kicked, replaced, room gone). */
+  closedReason: string | null;
+  outdated: boolean;
+  send: (msg: ClientMessage) => void;
+  reconnect: () => void;
+  dismissResult: () => void;
+  clearError: () => void;
 }
 
-export function useWebSocket({ path, enabled = true, onMessage, onConnect }: UseWebSocketOptions) {
+/**
+ * Single WebSocket for the lifetime of the room page. Handles join/rejoin,
+ * heartbeats, backoff reconnects, and folding server messages into state.
+ */
+export function useRoom(code: string, name: string | null): RoomConnection {
+  const [status, setStatus] = useState<ConnectionStatus>("connecting");
+  const [lobby, setLobby] = useState<LobbyView | null>(null);
+  const [game, setGame] = useState<GameState | null>(null);
+  const [result, setResult] = useState<GameResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [closedReason, setClosedReason] = useState<string | null>(null);
+  const [outdated, setOutdated] = useState(false);
+  const [generation, setGeneration] = useState(0);
+
   const wsRef = useRef<WebSocket | null>(null);
-  const [status, setStatus] = useState<ConnectionStatus>("disconnected");
-  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reconnectAttempts = useRef(0);
-  const disposed = useRef(false);
-  const onMessageRef = useRef(onMessage);
-  onMessageRef.current = onMessage;
-  const onConnectRef = useRef(onConnect);
-  onConnectRef.current = onConnect;
+  const historyRef = useRef<HistoryEntry[]>([]);
+  const nameRef = useRef(name);
+  nameRef.current = name;
 
-  const connect = useCallback(() => {
-    if (!enabled) return;
-
-    // Convert http(s) to ws(s) if needed
-    let wsBase = BASE_URL;
-    if (wsBase.startsWith("https://")) wsBase = "wss://" + wsBase.slice(8);
-    else if (wsBase.startsWith("http://")) wsBase = "ws://" + wsBase.slice(7);
-    if (!wsBase.startsWith("ws")) wsBase = "wss://" + wsBase;
-
-    const url = `${wsBase}${path}`;
-    setStatus("connecting");
-
-    const ws = new WebSocket(url);
-    wsRef.current = ws;
-
-    let pingInterval: ReturnType<typeof setInterval> | null = null;
-
-    ws.onopen = () => {
-      // Ignore if this WS is already stale
-      if (wsRef.current !== ws) return;
-      setStatus("connected");
-      reconnectAttempts.current = 0;
-
-      // Heartbeat: ping every 30s while tab is focused
-      pingInterval = setInterval(() => {
-        if (document.hasFocus() && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "ping" }));
-        }
-      }, 30_000);
-
-      onConnectRef.current?.((msg: ClientMessage) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify(msg));
-        }
-      });
-    };
-
-    ws.onmessage = (event) => {
-      // Ignore messages from stale connections
-      if (wsRef.current !== ws) return;
-      try {
-        const msg = JSON.parse(event.data) as ServerMessage;
-        if (msg.type === "version") {
-          if (msg.version !== PROTOCOL_VERSION) {
-            console.error(
-              `[coup] Protocol version mismatch! Client: ${PROTOCOL_VERSION}, Server: ${msg.version}. ` +
-              `The Cloudflare Worker may need redeployment.`
-            );
-          }
-          return; // don't forward version messages to consumers
-        }
-        onMessageRef.current?.(msg);
-      } catch {
-        // ignore malformed messages
+  const onMessage = useCallback((msg: ServerMessage) => {
+    switch (msg.type) {
+      case "welcome":
+        if (msg.protocol !== PROTOCOL) setOutdated(true);
+        break;
+      case "lobby":
+        historyRef.current = [];
+        setLobby(msg);
+        setGame(null);
+        setError(null);
+        break;
+      case "state": {
+        const h = historyRef.current;
+        const merged = msg.historyBase <= h.length ? h.slice(0, msg.historyBase).concat(msg.history) : msg.history;
+        historyRef.current = merged;
+        const { history: _h, historyBase: _b, deadlineMs, ...rest } = msg;
+        void _h; void _b;
+        setGame({ ...rest, history: merged, deadline: deadlineMs != null ? Date.now() + deadlineMs : null });
+        setLobby(null);
+        setResult((r) => (msg.turn <= 1 && r ? null : r));
+        setError(null);
+        break;
       }
-    };
-
-    ws.onclose = () => {
-      if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
-      // Ignore if this is a stale WS (a newer one has replaced it)
-      if (wsRef.current !== ws) return;
-      wsRef.current = null;
-
-      // Don't reconnect if disposed (cleanup was called)
-      if (disposed.current) {
-        setStatus("disconnected");
-        return;
+      case "game_over": {
+        const { type: _t, ...res } = msg;
+        void _t;
+        setResult(res);
+        break;
       }
-
-      // Reconnect with exponential backoff (max 10s)
-      const delay = Math.min(1000 * 2 ** reconnectAttempts.current, 10000);
-      reconnectAttempts.current++;
-      setStatus("reconnecting");
-      reconnectTimer.current = setTimeout(() => {
-        connect();
-      }, delay);
-    };
-
-    ws.onerror = () => {
-      ws.close();
-    };
-  }, [path, enabled]);
-
-  const send = useCallback((msg: ClientMessage) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(msg));
+      case "error":
+        if (msg.fatal) setClosedReason(msg.message);
+        else setError(msg.message);
+        break;
     }
-  }, []);
-
-  const disconnect = useCallback(() => {
-    if (reconnectTimer.current) {
-      clearTimeout(reconnectTimer.current);
-      reconnectTimer.current = null;
-    }
-    reconnectAttempts.current = 0;
-    disposed.current = true;
-    const ws = wsRef.current;
-    wsRef.current = null;
-    ws?.close();
-    setStatus("disconnected");
   }, []);
 
   useEffect(() => {
-    disposed.current = false;
+    if (!name || !code) return;
+    let disposed = false;
+    let attempts = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let pingTimer: ReturnType<typeof setInterval> | null = null;
+    let lastHeard = Date.now();
+
+    const clearTimers = () => {
+      if (retryTimer) clearTimeout(retryTimer);
+      if (pingTimer) clearInterval(pingTimer);
+      retryTimer = pingTimer = null;
+    };
+
+    const connect = () => {
+      if (disposed) return;
+      clearTimers();
+      setStatus(attempts === 0 ? "connecting" : "reconnecting");
+      const ws = new WebSocket(`${WS_BASE}/ws/game/${encodeURIComponent(code)}`);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (wsRef.current !== ws) return;
+        attempts = 0;
+        lastHeard = Date.now();
+        setStatus("connected");
+        ws.send(JSON.stringify({ type: "join", name: nameRef.current ?? "Player", cid: getClientId() }));
+        // Always heartbeat (background tabs included); the server answers without waking up.
+        pingTimer = setInterval(() => {
+          if (Date.now() - lastHeard > DEAD_AFTER_MS) {
+            ws.close(); // half-open connection; onclose schedules a reconnect
+            return;
+          }
+          if (ws.readyState === WebSocket.OPEN) ws.send('{"type":"ping"}');
+        }, PING_MS);
+      };
+
+      ws.onmessage = (ev) => {
+        if (wsRef.current !== ws) return;
+        lastHeard = Date.now();
+        let msg: ServerMessage;
+        try {
+          msg = JSON.parse(ev.data as string);
+        } catch {
+          return;
+        }
+        onMessage(msg);
+      };
+
+      ws.onclose = (ev) => {
+        if (wsRef.current !== ws) return;
+        wsRef.current = null;
+        clearTimers();
+        if (disposed) return;
+        const terminal = TERMINAL_CLOSE[ev.code];
+        if (terminal) {
+          setClosedReason((r) => r ?? terminal);
+          setStatus("closed");
+          return;
+        }
+        const delay = Math.min(500 * 2 ** attempts, 8000) * (0.75 + Math.random() * 0.5);
+        attempts++;
+        setStatus("reconnecting");
+        retryTimer = setTimeout(connect, delay);
+      };
+
+      ws.onerror = () => {
+        // onclose follows and handles retry
+      };
+    };
+
+    // Reconnect promptly when the tab wakes up or the network returns.
+    const kick = () => {
+      if (disposed || document.visibilityState !== "visible") return;
+      const ws = wsRef.current;
+      if (!ws || ws.readyState === WebSocket.CLOSED) {
+        attempts = Math.min(attempts, 1);
+        connect();
+      }
+    };
+    document.addEventListener("visibilitychange", kick);
+    window.addEventListener("online", kick);
+
+    setClosedReason(null);
     connect();
     return () => {
-      disconnect();
+      disposed = true;
+      clearTimers();
+      document.removeEventListener("visibilitychange", kick);
+      window.removeEventListener("online", kick);
+      const ws = wsRef.current;
+      wsRef.current = null;
+      ws?.close(1000);
     };
-  }, [connect, disconnect]);
+  }, [code, name, generation, onMessage]);
 
-  return { status, send, disconnect };
+  const send = useCallback((msg: ClientMessage) => {
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+  }, []);
+
+  const reconnect = useCallback(() => {
+    setClosedReason(null);
+    setGeneration((g) => g + 1);
+  }, []);
+
+  const dismissResult = useCallback(() => setResult(null), []);
+  const clearError = useCallback(() => setError(null), []);
+
+  return { status, lobby, game, result, error, closedReason, outdated, send, reconnect, dismissResult, clearError };
 }

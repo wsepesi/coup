@@ -1,6 +1,16 @@
-// Wrapper functions for inline helpers that need to be exported from WASM
+// WASM-facing wrappers around the C engine.
+//
+// The Workers server never mallocs: it keeps each room's Game bytes in JS and
+// copies them into this single static scratch struct before calling the
+// engine (see workers/src/engine.ts). That makes engine state trivially
+// serializable for Durable Object storage and rules out per-room leaks in the
+// shared per-isolate WASM instance.
 #include "coup_core.h"
-#include "text_render.h"
+
+static Game scratch;
+
+Game *wasm_scratch(void) { return &scratch; }
+int wasm_game_struct_size(void) { return (int)sizeof(Game); }
 
 int wasm_get_phase(const Game *g) { return get_phase(g); }
 int wasm_get_turn_player(const Game *g) { return get_turn_player(g); }
@@ -22,12 +32,6 @@ int wasm_get_exchange_card1(const Game *g) { return get_exchange_card1(g); }
 int wasm_get_blocker(const Game *g) { return get_blocker(g); }
 int wasm_get_block_card(const Game *g) { return get_block_card(g); }
 int wasm_get_responded_mask(const Game *g) { return get_responded_mask(g); }
-
-int wasm_game_struct_size(void) { return (int)sizeof(Game); }
-int wasm_gamelog_struct_size(void) { return (int)sizeof(GameLog); }
-int wasm_history_struct_size(void) { return (int)sizeof(HistoryBuffer); }
-int wasm_textactionmap_struct_size(void) { return (int)sizeof(TextActionMap); }
-int wasm_chanceoutcome_struct_size(void) { return (int)sizeof(ChanceOutcome); }
 
 void wasm_set_refund_on_challenge(Game *g, int flag) { game_set_refund_on_challenge(g, flag); }
 int wasm_get_refund_on_challenge(const Game *g) { return game_get_refund_on_challenge(g); }

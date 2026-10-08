@@ -1,11 +1,14 @@
-// Heuristic bots for the Coup Workers backend.
-// Easy = random legal action (always passes on challenges/blocks).
-// Medium = rule-based honest play, never bluffs, blocks when holding the card.
+// Heuristic bots for the Workers game server.
 //
-// SECURITY NOTE: Bots receive an unrestricted CoupWasm instance and can read ANY
-// player's cards via playerCard0Type/playerCard1Type. All card reads MUST be guarded:
-// only read own seat, or check !playerCardXAlive(p) before reading dead cards.
-// If bot logic grows more complex, add a FilteredWasm wrapper to enforce this.
+// Bots only ever see a BotView: public information (coins, influence, revealed
+// cards, public claims) plus their own hand. They cannot read other players'
+// hidden cards or the deck — the view is built by the room, not handed the
+// raw engine.
+//
+//   easy   — random legal main action, never challenges or blocks.
+//   medium — honest: only claims/blocks with roles it holds; challenges only
+//            when the claim is provably (or very likely) a bluff.
+//   hard   — bluffs, bluff-blocks, and challenges using card counting.
 
 import {
   ACTION_INCOME,
@@ -15,23 +18,51 @@ import {
   ACTION_CHALLENGE,
   ACTION_PASS,
   ACTION_BLOCK_CONTESSA,
-  ACTION_BLOCK_CAPTAIN,
-  ACTION_BLOCK_AMBASSADOR,
-  ACTION_BLOCK_DUKE,
   ACTION_DISCARD_SLOT0,
-  ACTION_DISCARD_SLOT3,
-  ACTION_COUP_P0,
-  ACTION_STEAL_P0,
-  ACTION_ASSASSINATE_P0,
+  PHASE_CHALLENGE_ACTION,
+  PHASE_CHALLENGE_BLOCK,
+  PHASE_BLOCK,
+  PHASE_EXCHANGE_DISCARD,
   DUKE,
   ASSASSIN,
   CAPTAIN,
   AMBASSADOR,
   CONTESSA,
-  getValidActionsFromMask,
+  isCoup,
+  isSteal,
+  isAssassinate,
+  isBlock,
+  isDiscard,
+  actionTarget,
+  claimedRole,
+  blockRole,
   type BotDifficulty,
 } from "./types.js";
-import type { CoupWasm } from "./wasm-bridge.js";
+
+const COPIES = 3;
+const DECK_SIZE = 15;
+
+/** Everything a bot may legitimately know when deciding. */
+export interface BotView {
+  seat: number;
+  numPlayers: number;
+  phase: number;
+  turnPlayer: number;
+  /** Main action under resolution (meaningless during the action phase). */
+  pending: number;
+  /** Seat and role of the current block (only meaningful in challenge_block). */
+  blocker: number;
+  blockCard: number;
+  actions: number[];
+  /** Own card type per discard slot: 0/1 = hand, 2/3 = drawn (exchange only). null = dead/absent. */
+  slots: (number | null)[];
+  coins: number[];
+  influence: number[];
+  /** Count of each role revealed face-up anywhere at the table. */
+  revealed: number[];
+  /** Roles each seat has publicly claimed this game. */
+  claims: Set<number>[];
+}
 
 const BOT_NAMES = [
   "Matt", "Lucia", "Elisa", "Tyrone", "Abby", "Ren", "Sakura", "Pierre",
@@ -40,571 +71,275 @@ const BOT_NAMES = [
   "Tommy", "Mia", "Fritz", "Elena", "Ravi", "Anna",
 ];
 
-let namePool: string[] = [];
-
-function shuffleNames(): void {
-  namePool = [...BOT_NAMES];
-  for (let i = namePool.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [namePool[i], namePool[j]] = [namePool[j], namePool[i]];
+/** A bot name not already used in the room. */
+export function pickBotName(taken: Iterable<string>): string {
+  const used = new Set(Array.from(taken, (n) => n.toLowerCase()));
+  const free = BOT_NAMES.filter((n) => !used.has(n.toLowerCase()));
+  if (free.length > 0) return free[Math.floor(Math.random() * free.length)];
+  for (let i = 2; ; i++) {
+    const n = `Bot ${i}`;
+    if (!used.has(n.toLowerCase())) return n;
   }
 }
 
-export function pickBotName(): string {
-  if (namePool.length === 0) shuffleNames();
-  return namePool.pop()!;
-}
-
-export function chooseBotAction(
-  difficulty: BotDifficulty,
-  seat: number,
-  wasm: CoupWasm,
-): number {
-  const mask = wasm.getValidActions();
-  const actions = getValidActionsFromMask(mask);
+export function chooseBotAction(difficulty: BotDifficulty, v: BotView): number {
+  const actions = v.actions;
   if (actions.length === 0) return ACTION_PASS;
   if (actions.length === 1) return actions[0];
 
+  if (actions.some(isDiscard)) return chooseDiscard(v, difficulty);
+
+  const responding = actions.includes(ACTION_PASS);
   if (difficulty === "easy") {
-    return easyAction(actions);
+    if (responding) return ACTION_PASS;
+    return actions[Math.floor(Math.random() * actions.length)];
   }
-  if (difficulty === "hard") {
-    return hardAction(actions, seat, wasm);
-  }
-  return mediumAction(actions, seat, wasm);
+  if (responding) return respond(v, difficulty === "hard");
+  return difficulty === "hard" ? hardMain(v) : mediumMain(v);
 }
 
-// ---- Easy: random legal, always pass on challenge/block ----
+// ---------------------------------------------------------------------------
+// Helpers
 
-function easyAction(actions: number[]): number {
-  if (actions.includes(ACTION_PASS)) return ACTION_PASS;
-  return actions[Math.floor(Math.random() * actions.length)];
+function myCards(v: BotView): number[] {
+  return [v.slots[0], v.slots[1]].filter((c): c is number => c != null);
 }
 
-// ---- Medium: honest rule-based play ----
-
-function mediumAction(actions: number[], seat: number, wasm: CoupWasm): number {
-  const myCards = getOwnCards(seat, wasm);
-  const myCoins = wasm.playerCoins(seat);
-
-  // Discard phase: lose the least valuable card
-  if (actions.some(a => a >= ACTION_DISCARD_SLOT0 && a <= ACTION_DISCARD_SLOT3)) {
-    return chooseLoseCard(actions, myCards, seat, wasm);
-  }
-
-  // Challenge/Block phase
-  if (actions.includes(ACTION_CHALLENGE) || actions.includes(ACTION_PASS)) {
-    return handleChallengeBlock(actions, myCards);
-  }
-
-  // Main action phase
-  return chooseMainAction(actions, myCards, myCoins, seat, wasm);
+function aliveOpponents(v: BotView): number[] {
+  const out: number[] = [];
+  for (let p = 0; p < v.numPlayers; p++) if (p !== v.seat && v.influence[p] > 0) out.push(p);
+  return out;
 }
 
-function chooseMainAction(
-  actions: number[],
-  myCards: number[],
-  myCoins: number,
-  seat: number,
-  wasm: CoupWasm,
-): number {
-  const coupTargets = actions.filter(a => a >= ACTION_COUP_P0 && a <= ACTION_COUP_P0 + 5);
-
-  // Must coup at 10+
-  if (myCoins >= 10 && coupTargets.length > 0) {
-    return pickTarget(coupTargets, ACTION_COUP_P0, wasm, "strongest");
-  }
-
-  // Coup at 7+ targeting strongest
-  if (myCoins >= 7 && coupTargets.length > 0) {
-    return pickTarget(coupTargets, ACTION_COUP_P0, wasm, "strongest");
-  }
-
-  // Tax if holding Duke
-  if (myCards.includes(DUKE) && actions.includes(ACTION_TAX)) {
-    return ACTION_TAX;
-  }
-
-  // Exchange if holding Ambassador
-  if (myCards.includes(AMBASSADOR) && actions.includes(ACTION_EXCHANGE)) {
-    return ACTION_EXCHANGE;
-  }
-
-  // Steal if holding Captain
-  if (myCards.includes(CAPTAIN)) {
-    const stealTargets = actions.filter(a => a >= ACTION_STEAL_P0 && a <= ACTION_STEAL_P0 + 5);
-    if (stealTargets.length > 0) {
-      return pickTarget(stealTargets, ACTION_STEAL_P0, wasm, "weakest");
-    }
-  }
-
-  // Assassinate if holding Assassin and can afford
-  if (myCards.includes(ASSASSIN) && myCoins >= 3) {
-    const assTargets = actions.filter(a => a >= ACTION_ASSASSINATE_P0 && a <= ACTION_ASSASSINATE_P0 + 5);
-    if (assTargets.length > 0) {
-      return pickTarget(assTargets, ACTION_ASSASSINATE_P0, wasm, "weakest");
-    }
-  }
-
-  // Foreign Aid as fallback — but only if all 3 Dukes are known dead (face-up),
-  // otherwise someone could block with a Duke
-  const revDukes = countRevealedDukes(seat, wasm);
-  if (actions.includes(ACTION_FOREIGN_AID) && revDukes >= 3) {
-    console.warn(`[Bot] seat=${seat} medium chose Foreign Aid (revealed dukes: ${revDukes})`);
-    return ACTION_FOREIGN_AID;
-  }
-
-  // Income as last resort
-  if (actions.includes(ACTION_INCOME)) {
-    console.warn(`[Bot] seat=${seat} medium fell through to Income (cards: [${myCards}], coins: ${myCoins}, actions: [${actions}])`);
-    return ACTION_INCOME;
-  }
-
-  console.warn(`[Bot] seat=${seat} medium fallthrough to actions[0]=${actions[0]} (cards: [${myCards}], coins: ${myCoins}, actions: [${actions}])`);
-  return actions[0];
+/** Probability that `seat` holds at least one `role`, from public info + own hand. */
+function probHolds(v: BotView, seat: number, role: number): number {
+  const mine = myCards(v).filter((c) => c === role).length;
+  const unseenCopies = COPIES - v.revealed[role] - mine;
+  if (unseenCopies <= 0) return 0;
+  // Cards whose identity is unknown to us: everything except revealed cards and our hand.
+  const revealedTotal = v.revealed.reduce((a, b) => a + b, 0);
+  const unknown = DECK_SIZE - revealedTotal - myCards(v).length;
+  const k = v.influence[seat];
+  if (k <= 0 || unknown <= 0) return 0;
+  // P(none of k hidden cards is the role) = C(unknown - copies, k) / C(unknown, k)
+  let pNone = 1;
+  for (let i = 0; i < k; i++) pNone *= Math.max(0, unknown - unseenCopies - i) / (unknown - i);
+  return 1 - pNone;
 }
 
-function handleChallengeBlock(actions: number[], myCards: number[]): number {
-  // Block if holding the correct card (honest play)
-  if (actions.includes(ACTION_BLOCK_CONTESSA) && myCards.includes(CONTESSA)) {
-    return ACTION_BLOCK_CONTESSA;
-  }
-  if (actions.includes(ACTION_BLOCK_CAPTAIN) && myCards.includes(CAPTAIN)) {
-    return ACTION_BLOCK_CAPTAIN;
-  }
-  if (actions.includes(ACTION_BLOCK_AMBASSADOR) && myCards.includes(AMBASSADOR)) {
-    return ACTION_BLOCK_AMBASSADOR;
-  }
-  if (actions.includes(ACTION_BLOCK_DUKE) && myCards.includes(DUKE)) {
-    return ACTION_BLOCK_DUKE;
-  }
-
-  // Medium never challenges
-  return ACTION_PASS;
+function targetsOf(actions: number[], pred: (a: number) => boolean): number[] {
+  return actions.filter(pred);
 }
 
-function chooseLoseCard(
-  actions: number[],
-  myCards: number[],
-  seat: number,
-  wasm: CoupWasm,
-): number {
-  const cardValue: Record<number, number> = {
-    [DUKE]: 5,
-    [ASSASSIN]: 3,
-    [CAPTAIN]: 4,
-    [AMBASSADOR]: 2,
-    [CONTESSA]: 1,
-  };
-
-  const discardActions = actions.filter(a => a >= ACTION_DISCARD_SLOT0 && a <= ACTION_DISCARD_SLOT3);
-
-  // For exchange discard (slots 2-3 are the drawn cards), prefer discarding drawn cards
-  // For lose_card, lose the least valuable
-  let bestAction = discardActions[0];
-  let bestValue = Infinity;
-
-  for (const a of discardActions) {
-    const slot = a - ACTION_DISCARD_SLOT0;
-    let cardType: number;
-    if (slot === 0) cardType = wasm.playerCard0Type(seat);
-    else if (slot === 1) cardType = wasm.playerCard1Type(seat);
-    else if (slot === 2) cardType = wasm.exchangeCard0();
-    else cardType = wasm.exchangeCard1();
-
-    const v = cardValue[cardType] ?? 0;
-    if (v < bestValue) {
-      bestValue = v;
-      bestAction = a;
-    }
-  }
-  return bestAction;
+/** Threat score for picking targets: coins and influence, with a nudge toward leaders. */
+function threat(v: BotView, p: number): number {
+  return v.coins[p] * 10 + v.influence[p] * 25;
 }
 
-function pickTarget(
-  targetActions: number[],
-  baseAction: number,
-  wasm: CoupWasm,
-  strategy: "strongest" | "weakest" | "richest",
-): number {
-  let best = targetActions[0];
-  let bestScore = strategy === "weakest" ? Infinity : -1;
-
-  for (const a of targetActions) {
-    const targetSeat = a - baseAction;
-    const coins = wasm.playerCoins(targetSeat);
-    if ((strategy === "strongest" || strategy === "richest") && coins > bestScore) {
-      bestScore = coins;
-      best = a;
-    } else if (strategy === "weakest" && coins < bestScore) {
-      bestScore = coins;
-      best = a;
-    }
+function pickBy(actions: number[], score: (target: number) => number): number {
+  let best = actions[0];
+  let bestScore = -Infinity;
+  for (const a of actions) {
+    const t = actionTarget(a)!;
+    const s = score(t) + Math.random(); // random tie-break
+    if (s > bestScore) { bestScore = s; best = a; }
   }
   return best;
 }
 
-function countRevealedDukes(seat: number, wasm: CoupWasm): number {
-  let count = 0;
-  const numPlayers = wasm.getNumPlayers();
-  for (let p = 0; p < numPlayers; p++) {
-    // Dead cards are visible to all — check if dead card is a Duke
-    if (!wasm.playerCard0Alive(p) && wasm.playerCard0Type(p) === DUKE) count++;
-    if (!wasm.playerCard1Alive(p) && wasm.playerCard1Type(p) === DUKE) count++;
+// ---------------------------------------------------------------------------
+// Main actions
+
+function mediumMain(v: BotView): number {
+  const a = v.actions;
+  const cards = myCards(v);
+  const coins = v.coins[v.seat];
+  const coups = targetsOf(a, isCoup);
+  if (coups.length > 0 && coins >= 7) return pickBy(coups, (t) => threat(v, t));
+
+  if (cards.includes(ASSASSIN) && coins >= 3) {
+    const ts = targetsOf(a, isAssassinate);
+    if (ts.length) return pickBy(ts, (t) => -v.influence[t] * 100 + threat(v, t) - (v.claims[t].has(CONTESSA) ? 60 : 0));
   }
-  return count;
+  if (cards.includes(DUKE) && a.includes(ACTION_TAX)) return ACTION_TAX;
+  if (cards.includes(CAPTAIN)) {
+    const ts = targetsOf(a, isSteal).filter((x) => v.coins[actionTarget(x)!] > 0);
+    if (ts.length) return pickBy(ts, (t) => Math.min(2, v.coins[t]) * 100 - (v.claims[t].has(CAPTAIN) || v.claims[t].has(AMBASSADOR) ? 150 : 0));
+  }
+  if (cards.includes(AMBASSADOR) && a.includes(ACTION_EXCHANGE)) return ACTION_EXCHANGE;
+  // Foreign aid is only blockable by Duke; take it unless someone has been claiming Duke.
+  const dukeClaimed = aliveOpponents(v).some((p) => v.claims[p].has(DUKE));
+  if (a.includes(ACTION_FOREIGN_AID) && !dukeClaimed) return ACTION_FOREIGN_AID;
+  return a.includes(ACTION_INCOME) ? ACTION_INCOME : a[0];
 }
 
-function getOwnCards(seat: number, wasm: CoupWasm): number[] {
-  const cards: number[] = [];
-  if (wasm.playerCard0Alive(seat)) cards.push(wasm.playerCard0Type(seat));
-  if (wasm.playerCard1Alive(seat)) cards.push(wasm.playerCard1Type(seat));
-  return cards;
-}
+function hardMain(v: BotView): number {
+  const a = v.actions;
+  const cards = myCards(v);
+  const coins = v.coins[v.seat];
+  const opps = aliveOpponents(v);
+  const coups = targetsOf(a, isCoup);
+  if (coups.length > 0 && (coins >= 7 && (coins >= 8 || opps.length <= 2) || a.every(isCoup))) {
+    return pickBy(coups, (t) => threat(v, t));
+  }
 
-// ---- Hard: probabilistic with card tracking, bluffs strategically ----
-// Stateless port of packages/game-client/src/agents/heuristic-hard.ts
-// Uses direct WASM calls instead of obs tensor. DEFAULT_PROFILE (all 0.5).
-
-const CARD_COUNT = 3; // 3 of each card type in the deck
-const ALL_CARD_TYPES = [DUKE, ASSASSIN, CAPTAIN, AMBASSADOR, CONTESSA];
-
-function countAllRevealed(wasm: CoupWasm): Record<number, number> {
-  const counts: Record<number, number> = {
-    [DUKE]: 0, [ASSASSIN]: 0, [CAPTAIN]: 0, [AMBASSADOR]: 0, [CONTESSA]: 0,
+  const has = (r: number) => cards.includes(r);
+  const exposed = (r: number) => v.revealed[r] + cards.filter((c) => c === r).length;
+  // Willingness to bluff a role falls as more copies are visible and as we have less to lose.
+  const bluff = (r: number) => {
+    if (exposed(r) >= 2) return false;
+    let p = exposed(r) === 0 ? 0.45 : 0.2;
+    if (cards.length === 1) p -= 0.15;
+    if (v.claims[v.seat].has(r)) p += 0.3; // stay consistent with earlier claims
+    return Math.random() < p;
   };
-  const numPlayers = wasm.getNumPlayers();
-  for (let p = 0; p < numPlayers; p++) {
-    if (!wasm.playerCard0Alive(p)) counts[wasm.playerCard0Type(p)]++;
-    if (!wasm.playerCard1Alive(p)) counts[wasm.playerCard1Type(p)]++;
+
+  if (coins >= 3 && (has(ASSASSIN) || (coins < 7 && bluff(ASSASSIN)))) {
+    const ts = targetsOf(a, isAssassinate);
+    if (ts.length) return pickBy(ts, (t) => -v.influence[t] * 100 + threat(v, t) - (v.claims[t].has(CONTESSA) ? 80 : 0));
   }
-  return counts;
+  if (a.includes(ACTION_TAX) && (has(DUKE) || bluff(DUKE))) return ACTION_TAX;
+  const steals = targetsOf(a, isSteal).filter((x) => v.coins[actionTarget(x)!] >= 2);
+  if (steals.length && (has(CAPTAIN) || bluff(CAPTAIN))) {
+    return pickBy(steals, (t) => v.coins[t] * 10 - (v.claims[t].has(CAPTAIN) || v.claims[t].has(AMBASSADOR) ? 60 : 0));
+  }
+  if (a.includes(ACTION_EXCHANGE) && has(AMBASSADOR) && !has(DUKE)) return ACTION_EXCHANGE;
+  const dukeClaimed = opps.some((p) => v.claims[p].has(DUKE));
+  if (a.includes(ACTION_FOREIGN_AID) && !dukeClaimed) return ACTION_FOREIGN_AID;
+  if (a.includes(ACTION_TAX) && exposed(DUKE) < COPIES && Math.random() < 0.5) return ACTION_TAX;
+  return a.includes(ACTION_INCOME) ? ACTION_INCOME : a[0];
 }
 
-function countAliveOpponents(seat: number, wasm: CoupWasm): number {
-  let count = 0;
-  const numPlayers = wasm.getNumPlayers();
-  for (let p = 0; p < numPlayers; p++) {
-    if (p !== seat && wasm.playerIsAlive(p)) count++;
-  }
-  return count;
-}
+// ---------------------------------------------------------------------------
+// Responses: challenge / block / pass
 
-function getPendingActionFromWasm(wasm: CoupWasm): number {
-  return wasm.getPendingAction();
-}
+function respond(v: BotView, hard: boolean): number {
+  const a = v.actions;
+  const cards = myCards(v);
+  const lives = cards.length;
 
-function getTurnPlayerFromWasm(wasm: CoupWasm): number {
-  return wasm.getTurnPlayer();
-}
+  if (v.phase === PHASE_BLOCK) {
+    const blocks = a.filter(isBlock);
+    // Honest block when holding the card.
+    for (const b of blocks) if (cards.includes(blockRole(b)!)) return b;
 
-function blockToCard(action: number): number | null {
-  if (action === ACTION_BLOCK_CONTESSA) return CONTESSA;
-  if (action === ACTION_BLOCK_CAPTAIN) return CAPTAIN;
-  if (action === ACTION_BLOCK_AMBASSADOR) return AMBASSADOR;
-  if (action === ACTION_BLOCK_DUKE) return DUKE;
-  return null;
-}
-
-function hardAction(actions: number[], seat: number, wasm: CoupWasm): number {
-  const myCards = getOwnCards(seat, wasm);
-  const revealed = countAllRevealed(wasm);
-
-  // LOSE_CARD / EXCHANGE_DISCARD
-  if (actions.some(a => a >= ACTION_DISCARD_SLOT0 && a <= ACTION_DISCARD_SLOT3)) {
-    return hardChooseLoseCard(actions, myCards, seat, wasm, revealed);
-  }
-
-  // Challenge/Block phase
-  if (actions.includes(ACTION_CHALLENGE) || actions.includes(ACTION_PASS)) {
-    return hardChallengeBlock(actions, myCards, seat, wasm, revealed);
-  }
-
-  // Main action phase
-  return hardMainAction(actions, myCards, seat, wasm, revealed);
-}
-
-function hardMainAction(
-  actions: number[],
-  myCards: number[],
-  seat: number,
-  wasm: CoupWasm,
-  revealed: Record<number, number>,
-): number {
-  const myCoins = wasm.playerCoins(seat);
-
-  // Coup targets
-  const coupTargets = actions.filter(a => a >= ACTION_COUP_P0 && a <= ACTION_COUP_P0 + 5);
-  if (coupTargets.length > 0) {
-    const mustCoup = actions.length === coupTargets.length;
-    const coupThreshold = 8; // greed=0.5 → 7 + round(0.5) = 8
-    if (mustCoup || myCoins >= coupThreshold) {
-      return hardPickTarget(coupTargets, ACTION_COUP_P0, wasm, "strongest");
+    const pa = v.pending;
+    const targetedAtMe = actionTarget(pa) === v.seat;
+    if (isAssassinate(pa) && targetedAtMe) {
+      // Facing death with one card: bluff Contessa (both levels — passing loses anyway).
+      if (lives === 1 && a.includes(ACTION_BLOCK_CONTESSA) && v.revealed[CONTESSA] < COPIES) return ACTION_BLOCK_CONTESSA;
+      if (hard && a.includes(ACTION_BLOCK_CONTESSA) && v.revealed[CONTESSA] < 2 && Math.random() < 0.35) return ACTION_BLOCK_CONTESSA;
     }
-  }
-
-  // Assassinate if holding Assassin
-  if (myCards.includes(ASSASSIN)) {
-    const assTargets = actions.filter(a => a >= ACTION_ASSASSINATE_P0 && a <= ACTION_ASSASSINATE_P0 + 5);
-    if (assTargets.length > 0) {
-      return hardPickTarget(assTargets, ACTION_ASSASSINATE_P0, wasm, "weakest");
-    }
-  }
-
-  // Tax — claim Duke even without it (bluff) if favorable
-  if (actions.includes(ACTION_TAX)) {
-    if (myCards.includes(DUKE) || shouldBluff(DUKE, myCards, seat, wasm, revealed)) {
-      return ACTION_TAX;
-    }
-  }
-
-  // Steal — claim Captain
-  const stealTargets = actions.filter(a => a >= ACTION_STEAL_P0 && a <= ACTION_STEAL_P0 + 5);
-  if (stealTargets.length > 0) {
-    if (myCards.includes(CAPTAIN) || shouldBluff(CAPTAIN, myCards, seat, wasm, revealed)) {
-      return hardPickTarget(stealTargets, ACTION_STEAL_P0, wasm, "strongest");
-    }
-  }
-
-  // Exchange if holding Ambassador
-  if (myCards.includes(AMBASSADOR) && actions.includes(ACTION_EXCHANGE)) {
-    return ACTION_EXCHANGE;
-  }
-
-  // Always claim Tax over Income — unless all Dukes are revealed
-  if (actions.includes(ACTION_TAX) && revealed[DUKE] < CARD_COUNT) {
-    return ACTION_TAX;
-  }
-
-  // Foreign Aid only when all Dukes are revealed
-  if (actions.includes(ACTION_FOREIGN_AID) && revealed[DUKE] >= CARD_COUNT) {
-    console.warn(`[Bot] seat=${seat} hard chose Foreign Aid (revealed dukes: ${revealed[DUKE]})`);
-    return ACTION_FOREIGN_AID;
-  }
-
-  if (actions.includes(ACTION_INCOME)) {
-    console.warn(`[Bot] seat=${seat} hard fell through to Income (cards: [${myCards}], revealed: ${JSON.stringify(revealed)}, actions: [${actions}])`);
-    return ACTION_INCOME;
-  }
-  console.warn(`[Bot] seat=${seat} hard fallthrough to actions[0]=${actions[0]} (cards: [${myCards}], actions: [${actions}])`);
-  return actions[0];
-}
-
-function hardChallengeBlock(
-  actions: number[],
-  myCards: number[],
-  seat: number,
-  wasm: CoupWasm,
-  revealed: Record<number, number>,
-): number {
-  // Block with correct card if held
-  const blockActions = actions.filter(a => a >= ACTION_BLOCK_CONTESSA && a <= ACTION_BLOCK_DUKE);
-  for (const b of blockActions) {
-    const cardNeeded = blockToCard(b);
-    if (cardNeeded !== null && myCards.includes(cardNeeded)) {
-      return b;
-    }
-  }
-
-  // Counter-bluff: block assassination with Contessa even without one
-  if (blockActions.includes(ACTION_BLOCK_CONTESSA) && !myCards.includes(CONTESSA)) {
-    const aliveCards = myCards.length;
-
-    // Always bluff-block if it would be fatal (1 influence left)
-    if (aliveCards <= 1) {
-      return ACTION_BLOCK_CONTESSA;
-    }
-    // bluffTolerance=0.5: prob = 0.15 + 0.5*0.4 = 0.35
-    let bluffProb = 0.35;
-    if (revealed[CONTESSA] === 0) bluffProb += 0.1;
-    if (Math.random() < bluffProb) {
-      return ACTION_BLOCK_CONTESSA;
-    }
-  }
-
-  // Bluff-block steal with Captain/Ambassador even without holding them
-  for (const b of blockActions) {
-    if (b === ACTION_BLOCK_CONTESSA) continue;
-    const cardNeeded = blockToCard(b);
-    if (cardNeeded !== null && !myCards.includes(cardNeeded)) {
-      let prob = 0.5 * 0.35; // bluffTolerance=0.5 → 0.175
-      if (revealed[cardNeeded] === 0) prob += 0.1;
-      if (Math.random() < prob) {
-        return b;
+    if (hard && isSteal(pa) && targetedAtMe && v.coins[v.seat] >= 2) {
+      for (const b of blocks) {
+        const r = blockRole(b)!;
+        if (v.revealed[r] < 2 && Math.random() < 0.25) return b;
       }
     }
+    return ACTION_PASS;
   }
 
-  // Challenge
-  if (actions.includes(ACTION_CHALLENGE)) {
-    const pendingAction = getPendingActionFromWasm(wasm);
-    const claimedCard = claimedRoleForAction(pendingAction);
+  if (!a.includes(ACTION_CHALLENGE)) return ACTION_PASS;
 
-    // challengeRate=0.5 → cr = 1.0
-    const cr = 1.0;
+  let claimant: number;
+  let role: number | null;
+  if (v.phase === PHASE_CHALLENGE_ACTION) {
+    claimant = v.turnPlayer;
+    role = claimedRole(v.pending);
+  } else if (v.phase === PHASE_CHALLENGE_BLOCK) {
+    claimant = v.blocker;
+    role = v.blockCard;
+  } else {
+    return ACTION_PASS;
+  }
+  if (role == null || role < 0 || role > 4) return ACTION_PASS;
 
-    if (claimedCard !== null) {
-      const revCount = revealed[claimedCard];
+  const pHas = probHolds(v, claimant, role);
+  if (pHas === 0) return ACTION_CHALLENGE; // provably a bluff
 
-      // All copies revealed → guaranteed win
-      if (revCount >= CARD_COUNT) {
-        return ACTION_CHALLENGE;
-      }
+  // Stakes: an assassination aimed at us with one life left means passing is fatal.
+  const mortal = v.phase === PHASE_CHALLENGE_ACTION && isAssassinate(v.pending) && actionTarget(v.pending) === v.seat;
+  if (mortal && lives === 1 && !cards.includes(CONTESSA)) {
+    // Medium will also take this gamble — it costs nothing.
+    if (!hard || pHas < 0.85 || Math.random() < 0.5) return ACTION_CHALLENGE;
+  }
+  // Our own block being challenged-back isn't a decision here; blocked actor deciding whether
+  // to contest a block on their own action is the most valuable challenge.
+  const myActionBlocked = v.phase === PHASE_CHALLENGE_BLOCK && v.turnPlayer === v.seat;
 
-      // 2 revealed → very likely bluffing
-      if (revCount >= 2) {
-        if (Math.random() < 0.8 * cr) return ACTION_CHALLENGE;
-      }
-
-      // 1 revealed → moderate challenge chance
-      if (revCount === 1 && Math.random() < 0.2 * cr) {
-        return ACTION_CHALLENGE;
-      }
-    }
-
-    // Baseline random challenge
-    if (Math.random() < 0.1 * cr) {
-      return ACTION_CHALLENGE;
-    }
+  if (!hard) {
+    return pHas < 0.1 && lives === 2 ? ACTION_CHALLENGE : ACTION_PASS;
   }
 
+  let threshold = lives === 2 ? 0.3 : 0.15;
+  if (myActionBlocked) threshold += 0.1;
+  // A role claimed many times by different players is more suspicious.
+  const otherClaimers = v.claims.filter((s, p) => p !== claimant && v.influence[p] > 0 && s.has(role!)).length;
+  const adjusted = pHas - 0.1 * otherClaimers;
+  if (adjusted < threshold) return Math.random() < 0.75 ? ACTION_CHALLENGE : ACTION_PASS;
+  // Rare random challenge to stay unpredictable, spread over the table.
+  if (lives === 2 && Math.random() < 0.04) return ACTION_CHALLENGE;
   return ACTION_PASS;
 }
 
-function claimedRoleForAction(action: number): number | null {
-  if (action === ACTION_TAX) return DUKE;
-  if (action === ACTION_EXCHANGE) return AMBASSADOR;
-  if (action >= ACTION_STEAL_P0 && action <= ACTION_STEAL_P0 + 5) return CAPTAIN;
-  if (action >= ACTION_ASSASSINATE_P0 && action <= ACTION_ASSASSINATE_P0 + 5) return ASSASSIN;
-  // Block claims
-  if (action === ACTION_BLOCK_CONTESSA) return CONTESSA;
-  if (action === ACTION_BLOCK_CAPTAIN) return CAPTAIN;
-  if (action === ACTION_BLOCK_AMBASSADOR) return AMBASSADOR;
-  if (action === ACTION_BLOCK_DUKE) return DUKE;
-  return null;
+// ---------------------------------------------------------------------------
+// Discards: losing influence, or picking cards to return during an exchange.
+
+function cardValues(v: BotView, hard: boolean): number[] {
+  const val = [5, 3, 4, 2, 1]; // Duke, Assassin, Captain, Ambassador, Contessa
+  if (!hard) return val;
+  const opps = aliveOpponents(v);
+  if (opps.some((p) => v.coins[p] >= 3)) val[CONTESSA] += 3;
+  if (opps.every((p) => v.coins[p] < 2)) val[CAPTAIN] -= 2;
+  if (v.coins[v.seat] < 2) val[ASSASSIN] -= 1;
+  if (opps.length >= 3) val[AMBASSADOR] += 1;
+  return val;
 }
 
-function shouldBluff(
-  cardType: number,
-  myCards: number[],
-  seat: number,
-  wasm: CoupWasm,
-  revealed: Record<number, number>,
-): boolean {
-  const revCount = revealed[cardType];
-  if (revCount >= 2) return false;
+function chooseDiscard(v: BotView, difficulty: BotDifficulty): number {
+  const discards = v.actions.filter(isDiscard);
+  if (difficulty === "easy" && v.phase !== PHASE_EXCHANGE_DISCARD) {
+    return discards[Math.floor(Math.random() * discards.length)];
+  }
+  const val = cardValues(v, difficulty === "hard");
 
-  // bluffTolerance=0.5
-  let prob: number;
-  if (revCount === 0) prob = 0.2 + 0.5 * 0.4; // 0.4
-  else prob = 0.1 + 0.5 * 0.2; // 0.2
-
-  // Context: bluff more when desperate
-  const myCoins = wasm.playerCoins(seat);
-  const myInfluence = myCards.length;
-
-  if (myCoins <= 1 && myInfluence <= 1) prob += 0.25;
-  else if (myCoins <= 2) prob += 0.1;
-
-  if (myCoins >= 6 && myInfluence >= 2) prob -= 0.15;
-
-  const aliveOpp = countAliveOpponents(seat, wasm);
-  if (aliveOpp <= 1 && myInfluence >= 2) prob -= 0.1;
-
-  return Math.random() < Math.max(0, Math.min(1, prob));
-}
-
-function hardChooseLoseCard(
-  actions: number[],
-  myCards: number[],
-  seat: number,
-  wasm: CoupWasm,
-  revealed: Record<number, number>,
-): number {
-  const value = hardCardValues(myCards, seat, wasm);
-
-  const discardActions = actions.filter(a => a >= ACTION_DISCARD_SLOT0 && a <= ACTION_DISCARD_SLOT3);
-  let bestAction = discardActions[0];
-  let bestValue = Infinity;
-
-  for (const a of discardActions) {
-    const slot = a - ACTION_DISCARD_SLOT0;
-    let cardType: number;
-    if (slot === 0) cardType = wasm.playerCard0Type(seat);
-    else if (slot === 1) cardType = wasm.playerCard1Type(seat);
-    else if (slot === 2) cardType = wasm.exchangeCard0();
-    else cardType = wasm.exchangeCard1();
-
-    const v = value[cardType] ?? 0;
-    if (v < bestValue) {
-      bestValue = v;
-      bestAction = a;
+  if (v.phase === PHASE_EXCHANGE_DISCARD) {
+    // Deterministically choose the best cards to keep; the engine takes the two
+    // discards as two ordered steps (and only applies them after the second), so
+    // recomputing the same plan on step two yields the matching second slot.
+    const avail: number[] = [];
+    for (let s = 0; s < 4; s++) if (v.slots[s] != null) avail.push(s);
+    const keepN = avail.length - 2;
+    let best: number[] = [];
+    let bestScore = -Infinity;
+    const combos = keepN === 1 ? avail.map((s) => [s]) : pairs(avail);
+    for (const keep of combos) {
+      const types = keep.map((s) => v.slots[s]!);
+      let score = types.reduce((acc, t) => acc + val[t], 0);
+      if (types.length === 2 && types[0] === types[1]) score -= 2; // prefer variety
+      if (score > bestScore) { bestScore = score; best = keep; }
     }
-  }
-  return bestAction;
-}
-
-function hardCardValues(
-  myCards: number[],
-  seat: number,
-  wasm: CoupWasm,
-): Record<number, number> {
-  const base: Record<number, number> = {
-    [DUKE]: 5,
-    [CAPTAIN]: 4,
-    [ASSASSIN]: 3,
-    [AMBASSADOR]: 2,
-    [CONTESSA]: 1,
-  };
-
-  let anyCanAssassinate = false;
-  let maxOpponentCoins = 0;
-  let allOpponentsBroke = true;
-  const numPlayers = wasm.getNumPlayers();
-
-  for (let p = 0; p < numPlayers; p++) {
-    if (p === seat) continue;
-    if (!wasm.playerIsAlive(p)) continue;
-    const coins = wasm.playerCoins(p);
-    if (coins >= 3) anyCanAssassinate = true;
-    if (coins > maxOpponentCoins) maxOpponentCoins = coins;
-    if (coins >= 2) allOpponentsBroke = false;
-  }
-
-  if (anyCanAssassinate) base[CONTESSA] += 3;
-  if (allOpponentsBroke) base[CAPTAIN] -= 2;
-  else if (maxOpponentCoins >= 5) base[CAPTAIN] += 1;
-
-  const myCoins = wasm.playerCoins(seat);
-  if (myCoins < 2) base[ASSASSIN] -= 1;
-
-  const aliveOpp = countAliveOpponents(seat, wasm);
-  if (aliveOpp >= 3) base[AMBASSADOR] += 1;
-
-  return base;
-}
-
-function hardPickTarget(
-  targetActions: number[],
-  baseAction: number,
-  wasm: CoupWasm,
-  strategy: "strongest" | "weakest",
-): number {
-  let bestAction = targetActions[0];
-  let bestScore = strategy === "strongest" ? -1 : Infinity;
-
-  for (const a of targetActions) {
-    const targetSeat = a - baseAction;
-    const coins = wasm.playerCoins(targetSeat);
-    const influence = (wasm.playerCard0Alive(targetSeat) ? 1 : 0) + (wasm.playerCard1Alive(targetSeat) ? 1 : 0);
-
-    if (strategy === "strongest") {
-      const score = coins * 10 + influence;
-      if (score > bestScore) { bestScore = score; bestAction = a; }
-    } else {
-      const score = influence * 100 + coins;
-      if (score < bestScore) { bestScore = score; bestAction = a; }
+    const drop = avail.filter((s) => !best.includes(s)).sort((x, y) => x - y);
+    for (const s of drop) {
+      const act = ACTION_DISCARD_SLOT0 + s;
+      if (discards.includes(act)) return act;
     }
+    return discards[0];
   }
-  return bestAction;
+
+  let best = discards[0];
+  let bestVal = Infinity;
+  for (const a of discards) {
+    const t = v.slots[a - ACTION_DISCARD_SLOT0];
+    const value = t == null ? -1 : val[t];
+    if (value < bestVal) { bestVal = value; best = a; }
+  }
+  return best;
 }
+
+function pairs(xs: number[]): number[][] {
+  const out: number[][] = [];
+  for (let i = 0; i < xs.length; i++) for (let j = i + 1; j < xs.length; j++) out.push([xs[i], xs[j]]);
+  return out;
+}
+

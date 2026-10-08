@@ -133,28 +133,13 @@ for players in 2 6; do
 done
 echo ""
 
-# ---------- Build & run PufferLib benchmark ----------
+# ---------- Build & run PufferLib 5.0 env benchmark ----------
+# puffer/test_coup_env.c bench: single thread, 256 envs, agent-steps/sec.
+# Printed only (different unit from the games/sec table below).
 if ! $SKIP_PUFFER; then
-    echo "--- Building PufferLib extension ---"
-    (cd "$ROOT_DIR" && uv run --with setuptools --with numpy python setup.py build_ext --inplace 2>&1) || {
-        echo "  FAILED to build PufferLib extension — skipping"
-        SKIP_PUFFER=true
-    }
-
-    if ! $SKIP_PUFFER; then
-        echo "--- PufferLib benchmarks ---"
-        for players in 2 6; do
-            for policy in random heuristic; do
-                for num_envs in 100 1000 10000; do
-                    run_bench "PufferLib p=${players} ${policy} envs=${num_envs}" \
-                        uv run --with setuptools --with numpy python "$SCRIPT_DIR/bench_pufferlib.py" \
-                        --players "$players" --policy "$policy" \
-                        --num-envs "$num_envs" --duration "$DURATION"
-                done
-            done
-        done
-        echo ""
-    fi
+    echo "--- PufferLib env benchmark (make bench-puffer) ---"
+    (cd "$ROOT_DIR" && make -s bench-puffer 2>&1) || echo "  FAILED to build/run PufferLib env benchmark — skipping"
+    echo ""
 fi
 
 # ---------- Build & run C++ benchmark ----------
@@ -182,31 +167,6 @@ if ! $SKIP_CPP; then
     echo ""
 fi
 
-# ---------- Run OpenSpiel Python benchmark ----------
-if ! $SKIP_OPENSPIEL; then
-    echo "--- OpenSpiel (pyspiel) benchmarks ---"
-    if uv run python -c "import pyspiel" 2>/dev/null; then
-        for players in 2 6; do
-            for policy in random heuristic; do
-                run_bench "OpenSpiel p=${players} ${policy} t=1" \
-                    uv run python "$SCRIPT_DIR/bench_openspiel.py" \
-                    --players "$players" --policy "$policy" \
-                    --threads 1 --duration "$DURATION"
-            done
-        done
-        # Multi-process run
-        for players in 2 6; do
-            run_bench "OpenSpiel p=${players} random t=${CORES}" \
-                uv run python "$SCRIPT_DIR/bench_openspiel.py" \
-                --players "$players" --policy random \
-                --threads "$CORES" --duration "$DURATION"
-        done
-    else
-        echo "  pyspiel not available — skipping"
-        SKIP_OPENSPIEL=true
-    fi
-    echo ""
-fi
 
 # ---------- Write results.md ----------
 echo "--- Writing results ---"
@@ -239,14 +199,10 @@ for line in "${RESULTS[@]}"; do
     gps=$(echo "$line" | grep -o 'gps=[^ ]*' | cut -d= -f2)
     avg_len=$(echo "$line" | grep -o 'avg_len=[^ ]*' | cut -d= -f2)
 
-    # Extract optional num_envs for PufferLib
-    num_envs=$(echo "$line" | grep -o 'num_envs=[^ ]*' | cut -d= -f2)
-
     # Format engine name
     case "$engine" in
         c)         eng_display="C (raw)" ;;
         cpp)       eng_display="C++ (OpenSpiel)" ;;
-        pufferlib) eng_display="PufferLib (${num_envs:-?} envs)" ;;
         openspiel) eng_display="pyspiel" ;;
         *)         eng_display="$engine" ;;
     esac
@@ -264,7 +220,7 @@ cat >> "$RESULTS_FILE" <<'FOOTER'
 
 - **C (raw)**: Direct `step_with_rng()` loop, no Python overhead. Compiled with `-O3 -march=native -flto`.
 - **C++ (OpenSpiel)**: OpenSpiel `State` API with explicit chance node handling. More steps per game than C engine.
-- **PufferLib**: CPython extension (`binding.c`) with vectorized environments. Includes observation generation overhead.
+- **PufferLib**: not in this table. `make bench-puffer` (puffer/test_coup_env.c) reports agent-steps/sec for the 5.0 env.
 - **pyspiel**: Python game loop via `pyspiel.load_game()`. Includes Python/SWIG overhead. Multi-process for threading.
 
 ### Player Policies

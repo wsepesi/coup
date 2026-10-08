@@ -1,40 +1,62 @@
+/*
+ * coup_core.c — Coup game engine (rules, chance nodes, legacy observation).
+ *
+ * Turn structure (one step = one decision):
+ *
+ *   MAIN_ACTION ── income / coup ─────────────────────────────────▶ resolve
+ *        │
+ *        ├─ foreign aid ─────────────────────────────▶ BLOCK (anyone, Duke)
+ *        └─ tax / exchange / steal / assassinate ─▶ CHALLENGE_ACTION (anyone)
+ *                                                       │ all pass, or
+ *                                                       │ challenge failed
+ *                                                       ▼
+ *                       steal / assassinate ─▶ BLOCK (target only)
+ *                       tax / exchange ──────▶ resolve
+ *
+ *   BLOCK: all pass ─▶ resolve;  block ─▶ CHALLENGE_BLOCK (anyone but blocker)
+ *   CHALLENGE_BLOCK: all pass ─▶ block stands, turn ends
+ *
+ * A challenge is resolved immediately: the loser enters LOSE_CARD; the
+ * _pad "lose-card continuation" says what happens once they discard. A
+ * claimant who proves their card returns it to the deck and redraws
+ * (CHANCE_REDRAW). Exchange draws two cards (CHANCE_EXCHANGE x2) and then
+ * discards two (EXCHANGE_DISCARD x2).
+ */
 #include "coup_core.h"
 #include <string.h>
 
 /* ---- Internal helpers ---- */
 
-static int alive_count(const Game *g) {
-    int c = 0;
-    int np = get_num_players(g);
-    for (int i = 0; i < np; i++)
-        if (player_is_alive(g, i)) c++;
-    return c;
+static inline int is_coup(int a)        { return a >= ACT_COUP_P0 && a < ACT_COUP_P0 + 6; }
+static inline int is_steal(int a)       { return a >= ACT_STEAL_P0 && a < ACT_STEAL_P0 + 6; }
+static inline int is_assassinate(int a) { return a >= ACT_ASSASSINATE_P0 && a < ACT_ASSASSINATE_P0 + 6; }
+
+/* Bitmask of seats with at least one living influence. */
+static inline int alive_mask(const Game *g) {
+    int m = 0;
+    for (int i = 0, np = get_num_players(g); i < np; i++)
+        m |= player_is_alive(g, i) << i;
+    return m;
 }
 
-static int dead_mask(const Game *g) {
-    int mask = 0;
-    int np = get_num_players(g);
-    for (int i = 0; i < np; i++)
-        if (!player_is_alive(g, i)) mask |= (1 << i);
-    /* also set bits for non-existent player slots */
-    for (int i = np; i < 6; i++)
-        mask |= (1 << i);
-    return mask;
+static inline int dead_mask(const Game *g) {
+    return ~alive_mask(g) & 0x3F; /* includes non-existent seats */
 }
 
-static int next_alive_player(const Game *g, int after) {
-    int np = get_num_players(g);
-    for (int i = 1; i < np; i++) {
-        int p = (after + i) % np;
-        if (player_is_alive(g, p)) return p;
-    }
-    return after;
+/* First seat in `mask` strictly after `after` in seating order (wrapping);
+ * `after` itself is only returned last. -1 if mask is empty. */
+static inline int next_in_mask(int mask, int after) {
+    int later = mask & ~((2 << after) - 1);
+    if (later) return __builtin_ctz((unsigned)later);
+    if (mask) return __builtin_ctz((unsigned)mask);
+    return -1;
 }
 
 static void advance_turn(Game *g) {
     g->turn_count++;
     int tp = get_turn_player(g);
-    int next = next_alive_player(g, tp);
+    int next = next_in_mask(alive_mask(g) & ~(1 << tp), tp);
+    if (next < 0) next = tp;
     set_turn_player(g, next);
     set_active_player(g, next);
     set_phase(g, PHASE_MAIN_ACTION);
@@ -43,12 +65,12 @@ static void advance_turn(Game *g) {
     set_first_discard(g, FIRST_DISCARD_NONE);
 }
 
-/* Which card is claimed by a given action */
+/* Which card is claimed by a given action (-1 for unclaimed actions) */
 static int claimed_card_for_action(int action) {
     if (action == ACT_TAX) return DUKE;
-    if (action >= ACT_STEAL_P0 && action <= ACT_STEAL_P0 + 5) return CAPTAIN;
-    if (action >= ACT_ASSASSINATE_P0 && action <= ACT_ASSASSINATE_P0 + 5) return ASSASSIN;
     if (action == ACT_EXCHANGE) return AMBASSADOR;
+    if (is_steal(action)) return CAPTAIN;
+    if (is_assassinate(action)) return ASSASSIN;
     return -1;
 }
 
@@ -62,123 +84,15 @@ static int claimed_card_for_block(int block_action) {
     }
 }
 
-static int action_target(int action) {
-    if (action >= ACT_COUP_P0 && action <= ACT_COUP_P0 + 5) return action - ACT_COUP_P0;
-    if (action >= ACT_STEAL_P0 && action <= ACT_STEAL_P0 + 5) return action - ACT_STEAL_P0;
-    if (action >= ACT_ASSASSINATE_P0 && action <= ACT_ASSASSINATE_P0 + 5) return action - ACT_ASSASSINATE_P0;
-    return -1;
-}
+/* ---- Engine-internal state in Game._pad ---- */
 
-
-static int player_has_card(const Game *g, int p, int card_type) {
-    if (player_card0_alive(g, p) && player_card0_type(g, p) == card_type) return 1;
-    if (player_card1_alive(g, p) && player_card1_type(g, p) == card_type) return 1;
-    return 0;
-}
-
-/* Find next responder starting from current active_player+1, skipping dead/responded/excluded */
-static int find_next_responder(const Game *g, int exclude) {
-    int np = get_num_players(g);
-    int mask = get_responded_mask(g);
-    int start = get_active_player(g);
-    for (int i = 1; i <= np; i++) {
-        int p = (start + i) % np;
-        if (p == exclude) continue;
-        if (mask & (1 << p)) continue;
-        if (!player_is_alive(g, p)) continue;
-        return p;
-    }
-    return -1; /* all responded */
-}
-
-static int all_responded(const Game *g, int exclude) {
-    int np = get_num_players(g);
-    int mask = get_responded_mask(g);
-    for (int i = 0; i < np; i++) {
-        if (i == exclude) continue;
-        if (!player_is_alive(g, i)) continue;
-        if (!(mask & (1 << i))) return 0;
-    }
-    return 1;
-}
-
-/* Start cycling for challenge/block from player after turn_player */
-static void start_cycling(Game *g, int phase, int exclude) {
-    int np = get_num_players(g);
-    int rmask = dead_mask(g);
-    /* exclude the excluded player */
-    rmask |= (1 << exclude);
-    set_responded_mask(g, rmask);
-    set_phase(g, phase);
-
-    /* find first responder */
-    int tp = get_turn_player(g);
-    for (int i = 1; i <= np; i++) {
-        int p = (tp + i) % np;
-        if (p == exclude) continue;
-        if (!player_is_alive(g, p)) continue;
-        set_active_player(g, p);
-        return;
-    }
-    /* nobody to cycle through — skip to next phase */
-    /* This shouldn't happen in normal play but handle it */
-    set_active_player(g, get_turn_player(g));
-}
-
-static void goto_resolve(Game *g);
-static void resolve_action(Game *g);
-
-/* After challenge action: continue based on whether action is blockable */
-static void after_challenge_action_all_pass(Game *g) {
-    int pa = get_pending_action(g);
-    if (pa == ACT_FOREIGN_AID) {
-        /* Foreign aid goes to BLOCK - anyone can block with duke */
-        int tp = get_turn_player(g);
-        start_cycling(g, PHASE_BLOCK, tp);
-    } else if ((pa >= ACT_STEAL_P0 && pa <= ACT_STEAL_P0 + 5) ||
-               (pa >= ACT_ASSASSINATE_P0 && pa <= ACT_ASSASSINATE_P0 + 5)) {
-        /* Blockable by target only - go to BLOCK */
-        int target = action_target(pa);
-        if (player_is_alive(g, target)) {
-            set_phase(g, PHASE_BLOCK);
-            set_active_player(g, target);
-            /* responded mask: everyone except target has responded */
-            int rmask = 0x3F; /* all responded */
-            rmask &= ~(1 << target);
-            set_responded_mask(g, rmask);
-        } else {
-            goto_resolve(g);
-        }
-    } else {
-        /* Unblockable (tax, exchange) - go to resolve */
-        goto_resolve(g);
-    }
-}
-
-static void goto_resolve(Game *g) {
-    set_phase(g, PHASE_RESOLVE);
-    resolve_action(g);
-}
-
-/* Check if game is over after someone loses a card */
-static int check_game_over(const Game *g) {
-    return alive_count(g) <= 1;
-}
-
-/* Context tracking for what to do after LOSE_CARD completes.
- * We encode context in a combination of phase transitions:
- * - _pad field bits 0-3: return_phase after lose_card
- *   0 = advance turn (action cancelled / post-coup / post-assassinate-resolve)
- *   1 = continue action (challenger lost, action proceeds; claimant does redraw first)
- *   2 = block continues (block-challenger lost, block stands -> action cancelled, advance)
- *   3 = block failed (blocker lost challenge, action proceeds -> resolve)
- */
-#define LC_ADVANCE_TURN  0
-#define LC_CLAIMANT_REDRAW 1
-#define LC_BLOCK_STANDS  2
-#define LC_BLOCK_FAILED  3
-#define LC_RESOLVE_ASSASSINATE 4
-#define LC_RESOLVE_COUP 5
+/* What happens after the player in PHASE_LOSE_CARD discards. The values are
+ * persisted in serialized games (Workers), so never renumber them. */
+#define LC_ADVANCE_TURN        0 /* turn over (coup, assassination, failed bluff) */
+#define LC_CLAIMANT_REDRAW     1 /* action challenger lost: claimant redraws, action continues */
+#define LC_BLOCK_STANDS        2 /* block challenger lost: blocker redraws, action cancelled */
+#define LC_BLOCK_FAILED        3 /* blocker was bluffing: action resolves */
+/* 4, 5 were LC_RESOLVE_ASSASSINATE / LC_RESOLVE_COUP; identical to 0. */
 
 static int get_lose_card_context(const Game *g) {
     return g->_pad & 0xF;
@@ -186,29 +100,20 @@ static int get_lose_card_context(const Game *g) {
 static void set_lose_card_context(Game *g, int ctx) {
     g->_pad = (g->_pad & ~(uint16_t)0xF) | (uint16_t)(ctx & 0xF);
 }
-
-/* Store the challenger player for challenge resolution in _pad bits 4-6 */
-static void set_challenger(Game *g, int p) {
-    g->_pad = (g->_pad & ~(uint16_t)(0x7 << 4)) | (uint16_t)((p & 0x7) << 4);
-}
-
-/* Store claimant for challenge in _pad bits 7-9 */
 static int get_claimant(const Game *g) {
     return (g->_pad >> 7) & 0x7;
 }
 static void set_claimant(Game *g, int p) {
     g->_pad = (g->_pad & ~(uint16_t)(0x7 << 7)) | (uint16_t)((p & 0x7) << 7);
 }
-
-/* Store the claimed card type for redraw in _pad bits 10-12 */
 static int get_claimed_card_stored(const Game *g) {
     return (g->_pad >> 10) & 0x7;
 }
 static void set_claimed_card_stored(Game *g, int c) {
     g->_pad = (g->_pad & ~(uint16_t)(0x7 << 10)) | (uint16_t)((c & 0x7) << 10);
 }
-
-/* House rule: refund coins on successful challenge — _pad bit 13 */
+/* Official rule: coins paid for an action are returned when the action is
+ * cancelled by a successful challenge (only Assassinate has a cost). */
 static int get_refund_on_challenge(const Game *g) {
     return (g->_pad >> 13) & 0x1;
 }
@@ -216,170 +121,148 @@ static void set_refund_on_challenge(Game *g, int flag) {
     g->_pad = (g->_pad & ~(uint16_t)(0x1 << 13)) | (uint16_t)((flag & 0x1) << 13);
 }
 
-/* After lose_card completes */
-static void after_lose_card(Game *g) {
-    if (check_game_over(g)) return;
-    int ctx = get_lose_card_context(g);
-    switch (ctx) {
-    case LC_ADVANCE_TURN:
-        advance_turn(g);
-        break;
-    case LC_CLAIMANT_REDRAW: {
-        /* Challenger lost. Claimant shuffles revealed card back, draws replacement. */
-        int claimant = get_claimant(g);
-        int claimed = get_claimed_card_stored(g);
-        /* Put the claimed card back in deck */
-        deck_add(g, claimed);
-        /* Remove it from claimant's hand */
-        if (player_card0_alive(g, claimant) && player_card0_type(g, claimant) == claimed) {
-            /* We'll replace card0 — mark type as placeholder, CHANCE_REDRAW will set it */
-            set_player_card0_type(g, claimant, 0);
-            /* Use exchange_card0 to remember which slot to replace: 0 */
-            set_exchange_card0(g, 0);
+/* ---- Transitions ---- */
+
+static void resolve_action(Game *g);
+
+/* Open a response window in `phase` for every living seat except `exclude`,
+ * with the first decision going to the first eligible seat at or after
+ * `first`. Returns 0 (and changes nothing) if nobody is eligible. */
+static int open_window(Game *g, int phase, int exclude, int first) {
+    int eligible = alive_mask(g) & ~(1 << exclude);
+    if (!eligible) return 0;
+    set_responded_mask(g, ~eligible & 0x3F);
+    set_phase(g, phase);
+    set_active_player(g, next_in_mask(eligible, (first + MAX_PLAYERS - 1) % MAX_PLAYERS));
+    return 1;
+}
+
+/* Record that the active player passed. Returns the next seat to respond
+ * (after the active player in seating order), or -1 if the window closed. */
+static int pass_and_next(Game *g) {
+    int ap = get_active_player(g);
+    int responded = get_responded_mask(g) | (1 << ap);
+    set_responded_mask(g, responded);
+    int next = next_in_mask(alive_mask(g) & ~responded, ap);
+    if (next >= 0) set_active_player(g, next);
+    return next;
+}
+
+/* The action's claim stands (unchallenged, or the challenger lost):
+ * offer the block to the target if any, else resolve. */
+static void action_claim_stands(Game *g) {
+    int pa = get_pending_action(g);
+    int tp = get_turn_player(g);
+    if (pa == ACT_FOREIGN_AID) {
+        /* Not challengeable, so not reached in practice; kept for safety. */
+        if (!open_window(g, PHASE_BLOCK, tp, tp + 1)) resolve_action(g);
+    } else if (is_steal(pa) || is_assassinate(pa)) {
+        int target = (pa - ACT_COUP_P0) % 6;
+        if (player_is_alive(g, target)) {
+            /* Only the target may block. */
+            set_phase(g, PHASE_BLOCK);
+            set_active_player(g, target);
+            set_responded_mask(g, 0x3F & ~(1 << target));
         } else {
-            set_player_card1_type(g, claimant, 0);
-            set_exchange_card0(g, 1);
+            resolve_action(g); /* target died challenging */
         }
-        set_phase(g, PHASE_CHANCE_REDRAW);
-        set_active_player(g, claimant);
-        break;
+    } else {
+        resolve_action(g); /* tax, exchange: unblockable */
     }
+}
+
+/* A challenged claim was true: the card goes back to the deck and the
+ * claimant draws a replacement (PHASE_CHANCE_REDRAW). */
+static void begin_redraw(Game *g, int p, int card) {
+    deck_add(g, card);
+    int slot = (player_card0_alive(g, p) && player_card0_type(g, p) == card) ? 0 : 1;
+    /* Placeholder type 0 until the chance node fills the slot. */
+    if (slot == 0) set_player_card0_type(g, p, 0);
+    else           set_player_card1_type(g, p, 0);
+    set_exchange_card0(g, slot); /* redraw slot is stashed in exchange_card0 */
+    set_phase(g, PHASE_CHANCE_REDRAW);
+    set_active_player(g, p);
+}
+
+static void begin_lose_card(Game *g, int p, int ctx) {
+    set_phase(g, PHASE_LOSE_CARD);
+    set_active_player(g, p);
+    set_lose_card_context(g, ctx);
+}
+
+static void after_lose_card(Game *g) {
+    if (__builtin_popcount((unsigned)alive_mask(g)) <= 1) return; /* game over */
+    switch (get_lose_card_context(g)) {
+    case LC_CLAIMANT_REDRAW:
+        begin_redraw(g, get_claimant(g), get_claimed_card_stored(g));
+        break;
     case LC_BLOCK_STANDS:
-        /* Block challenge: challenger lost, block stands, action cancelled */
-        /* But blocker needs redraw first */
-        {
-            int blocker = get_blocker(g);
-            int block_card = get_block_card(g);
-            deck_add(g, block_card);
-            if (player_card0_alive(g, blocker) && player_card0_type(g, blocker) == block_card) {
-                set_player_card0_type(g, blocker, 0);
-                set_exchange_card0(g, 0);
-            } else {
-                set_player_card1_type(g, blocker, 0);
-                set_exchange_card0(g, 1);
-            }
-            set_phase(g, PHASE_CHANCE_REDRAW);
-            set_active_player(g, blocker);
-            /* After redraw, we need to advance turn (action cancelled by block) */
-            /* We'll repurpose context: after redraw in block_stands, advance turn */
-            set_lose_card_context(g, LC_ADVANCE_TURN);
-        }
+        begin_redraw(g, get_blocker(g), get_block_card(g));
+        /* after the redraw the blocked action is cancelled */
+        set_lose_card_context(g, LC_ADVANCE_TURN);
         break;
     case LC_BLOCK_FAILED:
-        /* Blocker lost challenge on their block, block fails, action proceeds */
-        goto_resolve(g);
+        resolve_action(g);
         break;
-    case LC_RESOLVE_ASSASSINATE:
-        /* Target lost card from assassination resolve */
-        advance_turn(g);
-        break;
-    case LC_RESOLVE_COUP:
+    default: /* LC_ADVANCE_TURN and legacy values */
         advance_turn(g);
         break;
     }
 }
 
-/* Resolve the pending action */
+static void after_redraw(Game *g) {
+    if (get_lose_card_context(g) == LC_ADVANCE_TURN)
+        advance_turn(g);       /* block stood */
+    else
+        action_claim_stands(g); /* action challenge failed: action continues */
+}
+
+static int add_coins(int coins, int n) {
+    /* Max reachable is 12 (9 + tax): you must coup at 10+, and coins only
+     * grow on your own turn. The clamp just protects the 4-bit field. */
+    coins += n;
+    return coins > 15 ? 15 : coins;
+}
+
+/* Carry out the pending action (all challenges/blocks are settled). */
 static void resolve_action(Game *g) {
     int pa = get_pending_action(g);
     int tp = get_turn_player(g);
 
-    if (pa == ACT_INCOME) {
-        set_player_coins(g, tp, player_coins(g, tp) + 1);
-        advance_turn(g);
-    } else if (pa == ACT_FOREIGN_AID) {
-        set_player_coins(g, tp, player_coins(g, tp) + 2);
-        advance_turn(g);
-    } else if (pa == ACT_TAX) {
-        int c = player_coins(g, tp) + 3;
-        if (c > 12) c = 12;
-        set_player_coins(g, tp, c);
+    if (pa == ACT_INCOME || pa == ACT_FOREIGN_AID || pa == ACT_TAX) {
+        static const int gain[3] = {1, 2, 3};
+        set_player_coins(g, tp, add_coins(player_coins(g, tp), gain[pa]));
         advance_turn(g);
     } else if (pa == ACT_EXCHANGE) {
-        /* Draw 2 cards from deck via chance nodes */
         set_phase(g, PHASE_CHANCE_EXCHANGE);
         set_active_player(g, tp);
         set_exchange_card0(g, 7); /* sentinel: not yet drawn */
         set_exchange_card1(g, 7);
-    } else if (pa >= ACT_COUP_P0 && pa <= ACT_COUP_P0 + 5) {
-        int target = pa - ACT_COUP_P0;
-        if (player_is_alive(g, target)) {
-            set_phase(g, PHASE_LOSE_CARD);
-            set_active_player(g, target);
-            set_lose_card_context(g, LC_RESOLVE_COUP);
-        } else {
-            advance_turn(g);
-        }
-    } else if (pa >= ACT_STEAL_P0 && pa <= ACT_STEAL_P0 + 5) {
+    } else if (is_steal(pa)) {
+        /* A target eliminated mid-turn (by losing a challenge) is out of the
+         * game along with their coins: nothing to steal, like coup/assassinate. */
         int target = pa - ACT_STEAL_P0;
-        int steal = player_coins(g, target);
-        if (steal > 2) steal = 2;
-        set_player_coins(g, target, player_coins(g, target) - steal);
-        int c = player_coins(g, tp) + steal;
-        if (c > 12) c = 12;
-        set_player_coins(g, tp, c);
+        int amount = player_is_alive(g, target) ? player_coins(g, target) : 0;
+        if (amount > 2) amount = 2;
+        set_player_coins(g, target, player_coins(g, target) - amount);
+        set_player_coins(g, tp, add_coins(player_coins(g, tp), amount));
         advance_turn(g);
-    } else if (pa >= ACT_ASSASSINATE_P0 && pa <= ACT_ASSASSINATE_P0 + 5) {
-        int target = pa - ACT_ASSASSINATE_P0;
-        if (player_is_alive(g, target)) {
-            set_phase(g, PHASE_LOSE_CARD);
-            set_active_player(g, target);
-            set_lose_card_context(g, LC_RESOLVE_ASSASSINATE);
-        } else {
+    } else { /* coup or assassinate */
+        int target = (pa - ACT_COUP_P0) % 6;
+        if (player_is_alive(g, target))
+            begin_lose_card(g, target, LC_ADVANCE_TURN);
+        else
             advance_turn(g);
-        }
     }
 }
 
-/* After CHANCE_REDRAW completes (card replaced), continue */
-static void after_redraw(Game *g) {
-    int ctx = get_lose_card_context(g);
-    if (ctx == LC_ADVANCE_TURN) {
-        /* came from block_stands path: after redraw, advance turn */
-        advance_turn(g);
-        return;
-    }
-    /* Normal path: claimant redraw after successful defense.
-     * The action was NOT cancelled, so continue. */
-    int pa = get_pending_action(g);
-    /* After challenge_action defense: continue to block or resolve */
-    if (pa == ACT_FOREIGN_AID) {
-        /* FA doesn't go through challenge_action normally, but handle anyway */
-        int tp = get_turn_player(g);
-        start_cycling(g, PHASE_BLOCK, tp);
-    } else if ((pa >= ACT_STEAL_P0 && pa <= ACT_STEAL_P0 + 5) ||
-               (pa >= ACT_ASSASSINATE_P0 && pa <= ACT_ASSASSINATE_P0 + 5)) {
-        /* blockable: go to BLOCK */
-        int target = action_target(pa);
-        if (player_is_alive(g, target)) {
-            set_phase(g, PHASE_BLOCK);
-            set_active_player(g, target);
-            int rmask = 0x3F;
-            rmask &= ~(1 << target);
-            set_responded_mask(g, rmask);
-        } else {
-            goto_resolve(g);
-        }
-    } else {
-        /* unblockable: resolve */
-        goto_resolve(g);
-    }
-}
-
-/* ---- Deal phase tracking ----
- * During DEAL, we use:
- *   active_player = player being dealt to
- *   pending_action bits = deal counter (0..2*num_players-1)
- */
+/* ---- Deal ----
+ * During PHASE_DEAL the pending-action bits hold the deal counter
+ * (0 .. 2*num_players-1) and active_player is the seat being dealt to. */
 
 static void deal_advance(Game *g) {
-    int counter = get_pending_action(g);
-    int np = get_num_players(g);
-    int total_cards = np * 2;
-
-    counter++;
-    if (counter >= total_cards) {
-        /* Done dealing, start the game */
+    int counter = get_pending_action(g) + 1;
+    if (counter >= get_num_players(g) * 2) {
         set_pending_action(g, 0);
         set_turn_player(g, 0);
         set_active_player(g, 0);
@@ -392,60 +275,56 @@ static void deal_advance(Game *g) {
     }
 }
 
+/* Draw a card type uniformly from the deck (-1 if empty). This exact sampler
+ * is shared by dealing and step_with_rng; changing it changes every seeded
+ * game, so don't. */
+static int sample_card(const Game *g, Xoshiro256 *rng) {
+    int total = deck_total(g);
+    if (total == 0) return -1;
+    int r = (int)xoshiro256_uniform(rng, (uint32_t)total);
+    for (int i = 0; i < 5; i++) {
+        r -= deck_count(g, i);
+        if (r < 0) return i;
+    }
+    return -1; /* unreachable */
+}
+
+/* Resolve chance nodes from rng until a decision node or the end. */
+static void resolve_chance(Game *g, Xoshiro256 *rng) {
+    while (is_chance_node(g) && !is_done(g)) {
+        int card = sample_card(g, rng);
+        if (card < 0 || apply_chance(g, card) != 0) break;
+    }
+}
+
 /* ---- Public API ---- */
 
 void game_init(Game *g, int num_players, uint64_t deal_seed, uint64_t proc_seed) {
     memset(g, 0, sizeof(Game));
+    if (num_players < 2) num_players = 2;
+    if (num_players > MAX_PLAYERS) num_players = MAX_PLAYERS;
     set_num_players(g, num_players);
 
-    /* Initialize deck: 3 of each card type = 15 cards */
     for (int i = 0; i < 5; i++)
-        deck_set_count(g, i, 3);
+        deck_set_count(g, i, 3); /* 3 of each role = 15 cards */
 
-    /* Set all players to 2 coins, cards dead initially (deal will bring alive) */
+    /* Cards start dead; dealing brings them alive. Unused seats stay 0.
+     * Official 2-player rule: the starting player (seat 0) gets 1 coin. */
     for (int i = 0; i < num_players; i++)
-        set_player_coins(g, i, 2);
+        set_player_coins(g, i, num_players == 2 && i == 0 ? 1 : 2);
 
-    /* Setup deal phase */
     set_phase(g, PHASE_DEAL);
     set_active_player(g, 0);
     set_pending_action(g, 0);
     set_first_discard(g, FIRST_DISCARD_NONE);
-
-    /* Default: refund coins on successful challenge (official rules) */
     set_refund_on_challenge(g, 1);
 
-    /* Seed the procedural RNG */
     xoshiro256_seed(&g->rng, proc_seed);
 
-    /* If deal_seed provided, deal using a separate RNG */
     if (deal_seed != 0 || proc_seed != 0) {
-        /* Deal will happen via chance nodes (PHASE_DEAL) */
-        /* The caller (step_with_rng) will use g->rng to resolve them */
-        /* But we want deal randomness from deal_seed */
-        /* Store deal_seed's rng temporarily — actually, for step_with_rng,
-         * we want the deal to use deal_seed. We'll seed g->rng with deal_seed
-         * first, deal all cards, then re-seed with proc_seed. */
-        Xoshiro256 saved_rng;
-        xoshiro256_seed(&saved_rng, proc_seed);
-        xoshiro256_seed(&g->rng, deal_seed);
-
-        /* Auto-deal using the RNG */
-        while (get_phase(g) == PHASE_DEAL) {
-            int total = deck_total(g);
-            if (total == 0) break;
-            uint32_t r = xoshiro256_uniform(&g->rng, (uint32_t)total);
-            int card = -1;
-            int cum = 0;
-            for (int i = 0; i < 5; i++) {
-                cum += deck_count(g, i);
-                if ((int)r < cum) { card = i; break; }
-            }
-            apply_chance(g, card);
-        }
-
-        /* Restore procedural RNG */
-        g->rng = saved_rng;
+        Xoshiro256 deal_rng;
+        xoshiro256_seed(&deal_rng, deal_seed);
+        resolve_chance(g, &deal_rng);
     }
 }
 
@@ -469,368 +348,179 @@ int chance_outcomes(const Game *g, ChanceOutcome *out) {
     return n;
 }
 
-void apply_chance(Game *g, int outcome) {
-    int ph = get_phase(g);
-    switch (ph) {
+int apply_chance(Game *g, int outcome) {
+    if (!is_chance_node(g) || outcome < 0 || outcome >= 5 || deck_count(g, outcome) == 0)
+        return -1;
+    deck_remove(g, outcome);
+    switch (get_phase(g)) {
     case PHASE_DEAL: {
         int counter = get_pending_action(g);
         int p = counter / 2;
-        int slot = counter % 2;
-        if (slot == 0) {
+        if (counter % 2 == 0) {
             set_player_card0_type(g, p, outcome);
             set_player_card0_alive(g, p, 1);
         } else {
             set_player_card1_type(g, p, outcome);
             set_player_card1_alive(g, p, 1);
         }
-        deck_remove(g, outcome);
         deal_advance(g);
         break;
     }
     case PHASE_CHANCE_REDRAW: {
-        /* Replace the card — slot stored in exchange_card0 */
-        int claimant = get_active_player(g);
-        int slot = get_exchange_card0(g);
-        deck_remove(g, outcome);
-        if (slot == 0) {
-            set_player_card0_type(g, claimant, outcome);
-        } else {
-            set_player_card1_type(g, claimant, outcome);
-        }
+        int p = get_active_player(g);
+        if (get_exchange_card0(g) == 0) set_player_card0_type(g, p, outcome);
+        else                            set_player_card1_type(g, p, outcome);
         after_redraw(g);
         break;
     }
-    case PHASE_CHANCE_EXCHANGE: {
-        deck_remove(g, outcome);
+    case PHASE_CHANCE_EXCHANGE:
         if (get_exchange_card0(g) == 7) {
-            /* First card */
             set_exchange_card0(g, outcome);
         } else {
-            /* Second card */
             set_exchange_card1(g, outcome);
-            /* Now go to EXCHANGE_DISCARD */
             set_phase(g, PHASE_EXCHANGE_DISCARD);
             set_active_player(g, get_turn_player(g));
             set_first_discard(g, FIRST_DISCARD_NONE);
         }
         break;
     }
-    }
+    return 0;
 }
 
-void step_deterministic(Game *g, int action) {
-    int ph = get_phase(g);
+/* Called when the active player challenges `claimant`'s claim of `card`. */
+static void challenge(Game *g, int claimant, int card, int ctx_if_true, int ctx_if_false) {
+    int challenger = get_active_player(g);
+    set_claimant(g, claimant);
+    set_claimed_card_stored(g, card);
+    if (player_has_card(g, claimant, card))
+        begin_lose_card(g, challenger, ctx_if_true);
+    else
+        begin_lose_card(g, claimant, ctx_if_false);
+}
 
-    switch (ph) {
-    case PHASE_MAIN_ACTION: {
-        int tp = get_turn_player(g);
+int step_deterministic(Game *g, int action) {
+    if ((unsigned)action >= 32u || !((get_valid_actions(g) >> action) & 1u))
+        return -1;
+
+    int tp = get_turn_player(g);
+
+    switch (get_phase(g)) {
+    case PHASE_MAIN_ACTION:
         set_pending_action(g, action);
-
         if (action == ACT_INCOME) {
-            goto_resolve(g);
-        } else if (action == ACT_FOREIGN_AID) {
-            /* Goes directly to BLOCK (anyone can block with Duke) */
-            start_cycling(g, PHASE_BLOCK, tp);
-        } else if (action == ACT_TAX || action == ACT_EXCHANGE) {
-            start_cycling(g, PHASE_CHALLENGE_ACTION, tp);
-        } else if (action >= ACT_COUP_P0 && action <= ACT_COUP_P0 + 5) {
-            /* Pay 7 coins immediately */
+            resolve_action(g);
+        } else if (is_coup(action)) {
             set_player_coins(g, tp, player_coins(g, tp) - 7);
-            goto_resolve(g);
-        } else if (action >= ACT_STEAL_P0 && action <= ACT_STEAL_P0 + 5) {
-            start_cycling(g, PHASE_CHALLENGE_ACTION, tp);
-        } else if (action >= ACT_ASSASSINATE_P0 && action <= ACT_ASSASSINATE_P0 + 5) {
-            /* Pay 3 coins immediately */
-            set_player_coins(g, tp, player_coins(g, tp) - 3);
-            start_cycling(g, PHASE_CHALLENGE_ACTION, tp);
+            resolve_action(g);
+        } else if (action == ACT_FOREIGN_AID) {
+            /* Unclaimed, so unchallengeable; anyone may block with Duke. */
+            if (!open_window(g, PHASE_BLOCK, tp, tp + 1)) resolve_action(g);
+        } else {
+            if (is_assassinate(action))
+                set_player_coins(g, tp, player_coins(g, tp) - 3); /* paid up front */
+            if (!open_window(g, PHASE_CHALLENGE_ACTION, tp, tp + 1))
+                action_claim_stands(g);
         }
         break;
-    }
 
-    case PHASE_CHALLENGE_ACTION: {
-        int tp = get_turn_player(g);
+    case PHASE_CHALLENGE_ACTION:
         if (action == ACT_PASS) {
-            int ap = get_active_player(g);
-            int mask = get_responded_mask(g);
-            mask |= (1 << ap);
-            set_responded_mask(g, mask);
-            if (all_responded(g, tp)) {
-                after_challenge_action_all_pass(g);
-            } else {
-                int next = find_next_responder(g, tp);
-                if (next >= 0) set_active_player(g, next);
-                else after_challenge_action_all_pass(g);
-            }
-        } else if (action == ACT_CHALLENGE) {
-            /* Resolve challenge against turn_player's claim */
-            int challenger = get_active_player(g);
-            int claimant = tp;
-            int claimed = claimed_card_for_action(get_pending_action(g));
-            set_challenger(g, challenger);
-            set_claimant(g, claimant);
-            set_claimed_card_stored(g, claimed);
-
-            if (player_has_card(g, claimant, claimed)) {
-                /* Claimant has the card — challenger loses */
-                set_phase(g, PHASE_LOSE_CARD);
-                set_active_player(g, challenger);
-                set_lose_card_context(g, LC_CLAIMANT_REDRAW);
-            } else {
-                /* Claimant doesn't have it — claimant loses, action cancelled */
-                if (get_refund_on_challenge(g)) {
-                    int pa = get_pending_action(g);
-                    if (pa >= ACT_ASSASSINATE_P0 && pa <= ACT_ASSASSINATE_P0 + 5)
-                        set_player_coins(g, claimant, player_coins(g, claimant) + 3);
-                }
-                set_phase(g, PHASE_LOSE_CARD);
-                set_active_player(g, claimant);
-                set_lose_card_context(g, LC_ADVANCE_TURN);
-            }
+            if (pass_and_next(g) < 0) action_claim_stands(g);
+        } else { /* ACT_CHALLENGE */
+            int pa = get_pending_action(g);
+            int claimed = claimed_card_for_action(pa);
+            if (!player_has_card(g, tp, claimed) && is_assassinate(pa) &&
+                get_refund_on_challenge(g))
+                set_player_coins(g, tp, player_coins(g, tp) + 3);
+            challenge(g, tp, claimed, LC_CLAIMANT_REDRAW, LC_ADVANCE_TURN);
         }
         break;
-    }
 
-    case PHASE_BLOCK: {
-        int pa = get_pending_action(g);
+    case PHASE_BLOCK:
         if (action == ACT_PASS) {
-            int ap = get_active_player(g);
-            int mask = get_responded_mask(g);
-            mask |= (1 << ap);
-            set_responded_mask(g, mask);
-
-            int tp = get_turn_player(g);
-            if (pa == ACT_FOREIGN_AID) {
-                /* Multiple players can block — cycle */
-                if (all_responded(g, tp)) {
-                    goto_resolve(g);
-                } else {
-                    int next = find_next_responder(g, tp);
-                    if (next >= 0) set_active_player(g, next);
-                    else goto_resolve(g);
-                }
-            } else {
-                /* Only target could block, and they passed */
-                goto_resolve(g);
-            }
-        } else if (action >= ACT_BLOCK_CONTESSA && action <= ACT_BLOCK_DUKE) {
-            /* Someone is blocking */
+            /* Foreign aid: every opponent gets a chance. Steal/assassinate:
+             * the window holds only the target, so it closes here. */
+            if (pass_and_next(g) < 0) resolve_action(g);
+        } else { /* a block */
             int blocker = get_active_player(g);
             set_blocker(g, blocker);
-            int block_card = claimed_card_for_block(action);
-            set_block_card(g, block_card);
-
-            /* Go to CHALLENGE_BLOCK — turn_player and other alive players can challenge */
-            int rmask = dead_mask(g);
-            rmask |= (1 << blocker); /* blocker can't challenge their own block */
-            set_responded_mask(g, rmask);
-            set_phase(g, PHASE_CHALLENGE_BLOCK);
-
-            /* Find first responder — start from turn_player direction */
-            int tp = get_turn_player(g);
-            int found = 0;
-            int np = get_num_players(g);
-            for (int i = 0; i < np; i++) {
-                int p = (tp + i) % np;
-                if (p == blocker) continue;
-                if (!player_is_alive(g, p)) continue;
-                set_active_player(g, p);
-                found = 1;
-                break;
-            }
-            if (!found) {
-                /* Nobody can challenge — block stands */
+            set_block_card(g, claimed_card_for_block(action));
+            /* Anyone but the blocker may challenge, turn player first. */
+            if (!open_window(g, PHASE_CHALLENGE_BLOCK, blocker, tp))
                 advance_turn(g);
-            }
         }
         break;
-    }
 
-    case PHASE_CHALLENGE_BLOCK: {
-        int blocker = get_blocker(g);
+    case PHASE_CHALLENGE_BLOCK:
         if (action == ACT_PASS) {
-            int ap = get_active_player(g);
-            int mask = get_responded_mask(g);
-            mask |= (1 << ap);
-            set_responded_mask(g, mask);
-            if (all_responded(g, blocker)) {
-                /* All passed — block stands, action cancelled */
-                advance_turn(g);
-            } else {
-                int next = find_next_responder(g, blocker);
-                if (next >= 0) set_active_player(g, next);
-                else advance_turn(g);
-            }
-        } else if (action == ACT_CHALLENGE) {
-            int challenger = get_active_player(g);
-            int block_card = get_block_card(g);
-            set_challenger(g, challenger);
-            set_claimant(g, blocker);
-            set_claimed_card_stored(g, block_card);
-
-            if (player_has_card(g, blocker, block_card)) {
-                /* Blocker has the card — challenger loses, block stands */
-                set_phase(g, PHASE_LOSE_CARD);
-                set_active_player(g, challenger);
-                set_lose_card_context(g, LC_BLOCK_STANDS);
-            } else {
-                /* Blocker doesn't have it — blocker loses, block fails, action proceeds */
-                set_phase(g, PHASE_LOSE_CARD);
-                set_active_player(g, blocker);
-                set_lose_card_context(g, LC_BLOCK_FAILED);
-            }
+            if (pass_and_next(g) < 0) advance_turn(g); /* block stands */
+        } else { /* ACT_CHALLENGE */
+            challenge(g, get_blocker(g), get_block_card(g), LC_BLOCK_STANDS, LC_BLOCK_FAILED);
         }
         break;
-    }
 
     case PHASE_LOSE_CARD: {
         int ap = get_active_player(g);
-        if (action == ACT_DISCARD_SLOT0) {
-            set_player_card0_alive(g, ap, 0);
-        } else if (action == ACT_DISCARD_SLOT1) {
-            set_player_card1_alive(g, ap, 0);
-        }
+        if (action == ACT_DISCARD_SLOT0) set_player_card0_alive(g, ap, 0);
+        else                             set_player_card1_alive(g, ap, 0);
         after_lose_card(g);
         break;
     }
 
     case PHASE_EXCHANGE_DISCARD: {
-        int tp = get_turn_player(g);
-        int slot = action - ACT_DISCARD_SLOT0; /* 0-3 */
-        int fd = get_first_discard(g);
-
-        if (fd == FIRST_DISCARD_NONE) {
-            /* First discard */
-            set_first_discard(g, slot);
-            /* Stay in EXCHANGE_DISCARD for second pick */
-        } else {
-            /* Second discard — apply both discards */
-            int discard1 = fd;
-            int discard2 = slot;
-
-            /* Build the 4 card slots:
-             * 0 = player card0, 1 = player card1,
-             * 2 = exchange_card0, 3 = exchange_card1 */
-            int cards[4];
-            int alive[4];
-            cards[0] = player_card0_type(g, tp);
-            alive[0] = player_card0_alive(g, tp);
-            cards[1] = player_card1_type(g, tp);
-            alive[1] = player_card1_alive(g, tp);
-            cards[2] = get_exchange_card0(g);
-            alive[2] = 1;
-            cards[3] = get_exchange_card1(g);
-            alive[3] = 1;
-
-            /* Return discarded cards to deck */
-            deck_add(g, cards[discard1]);
-            deck_add(g, cards[discard2]);
-
-            /* Mark discarded slots */
-            alive[discard1] = 0;
-            alive[discard2] = 0;
-
-            /* Assign remaining cards to player hand slots */
-            int kept[4];
-            int nkept = 0;
-            for (int i = 0; i < 4; i++) {
-                if (alive[i]) kept[nkept++] = cards[i];
-            }
-
-            /* Player's alive cards should be updated */
-            /* First, figure out which hand slots are alive */
-            int c0_was_alive = player_card0_alive(g, tp);
-            int c1_was_alive = player_card1_alive(g, tp);
-
-            int ki = 0;
-            if (c0_was_alive) {
-                set_player_card0_type(g, tp, kept[ki++]);
-            }
-            if (c1_was_alive) {
-                set_player_card1_type(g, tp, kept[ki++]);
-            }
-
-            advance_turn(g);
+        int slot = action - ACT_DISCARD_SLOT0; /* 0,1 = hand; 2,3 = drawn */
+        int first = get_first_discard(g);
+        if (first == FIRST_DISCARD_NONE) {
+            set_first_discard(g, slot); /* wait for the second pick */
+            break;
         }
+        int cards[4] = {
+            player_card0_type(g, tp), player_card1_type(g, tp),
+            get_exchange_card0(g), get_exchange_card1(g),
+        };
+        int keep = 0xF & ~(1 << first) & ~(1 << slot);
+        if (!player_card0_alive(g, tp)) keep &= ~1; /* dead cards stay put */
+        if (!player_card1_alive(g, tp)) keep &= ~2;
+        deck_add(g, cards[first]);
+        deck_add(g, cards[slot]);
+        /* Refill the living hand slots with the kept cards, in slot order. */
+        if (player_card0_alive(g, tp)) {
+            int k = __builtin_ctz((unsigned)keep);
+            set_player_card0_type(g, tp, cards[k]);
+            keep &= keep - 1;
+        }
+        if (player_card1_alive(g, tp))
+            set_player_card1_type(g, tp, cards[__builtin_ctz((unsigned)keep)]);
+        advance_turn(g);
         break;
     }
-
-    default:
-        break;
     }
+    return 0;
 }
 
-void step_with_rng(Game *g, int action) {
-    step_deterministic(g, action);
-    while (is_chance_node(g) && !is_done(g)) {
-        int total = deck_total(g);
-        if (total == 0) break;
-        uint32_t r = xoshiro256_uniform(&g->rng, (uint32_t)total);
-        int card = -1;
-        int cum = 0;
-        for (int i = 0; i < 5; i++) {
-            cum += deck_count(g, i);
-            if ((int)r < cum) { card = i; break; }
-        }
-        if (card >= 0) apply_chance(g, card);
-        else break;
-    }
-    /* Also auto-resolve RESOLVE phase */
-    while (get_phase(g) == PHASE_RESOLVE && !is_done(g)) {
-        resolve_action(g);
-        /* resolve_action may chain into chance nodes */
-        while (is_chance_node(g) && !is_done(g)) {
-            int total = deck_total(g);
-            if (total == 0) break;
-            uint32_t r = xoshiro256_uniform(&g->rng, (uint32_t)total);
-            int card = -1;
-            int cum = 0;
-            for (int i = 0; i < 5; i++) {
-                cum += deck_count(g, i);
-                if ((int)r < cum) { card = i; break; }
-            }
-            if (card >= 0) apply_chance(g, card);
-            else break;
-        }
-    }
+int step_with_rng(Game *g, int action) {
+    int rc = step_deterministic(g, action);
+    resolve_chance(g, &g->rng);
+    return rc;
 }
 
 uint32_t get_valid_actions(const Game *g) {
-    int ph = get_phase(g);
+    if (is_done(g)) return 0;
     uint32_t mask = 0;
-    int np = get_num_players(g);
 
-    switch (ph) {
+    switch (get_phase(g)) {
     case PHASE_MAIN_ACTION: {
         int tp = get_turn_player(g);
         int coins = player_coins(g, tp);
+        uint32_t targets = (uint32_t)(alive_mask(g) & ~(1 << tp));
 
-        /* Build alive target mask (exclude self, exclude dead) */
-        uint32_t target_mask = 0;
-        for (int i = 0; i < np; i++) {
-            if (i != tp && player_is_alive(g, i))
-                target_mask |= (1u << i);
-        }
-
-        if (coins >= 10) {
-            /* Must coup */
-            mask = target_mask << ACT_COUP_P0;
-        } else {
-            mask |= (1u << ACT_INCOME);
-            mask |= (1u << ACT_FOREIGN_AID);
-            mask |= (1u << ACT_TAX);
-            mask |= (1u << ACT_EXCHANGE);
-
-            /* Coup targets (need 7+ coins) */
-            if (coins >= 7)
-                mask |= target_mask << ACT_COUP_P0;
-
-            /* Steal targets */
-            mask |= target_mask << ACT_STEAL_P0;
-
-            /* Assassinate targets (need 3+ coins) */
-            if (coins >= 3)
-                mask |= target_mask << ACT_ASSASSINATE_P0;
-        }
+        if (coins >= 10) /* must coup */
+            return targets << ACT_COUP_P0;
+        mask = (1u << ACT_INCOME) | (1u << ACT_FOREIGN_AID) |
+               (1u << ACT_TAX) | (1u << ACT_EXCHANGE) |
+               (targets << ACT_STEAL_P0);
+        if (coins >= 7) mask |= targets << ACT_COUP_P0;
+        if (coins >= 3) mask |= targets << ACT_ASSASSINATE_P0;
         break;
     }
 
@@ -841,63 +531,40 @@ uint32_t get_valid_actions(const Game *g) {
 
     case PHASE_BLOCK: {
         int pa = get_pending_action(g);
-        mask = (1u << ACT_PASS);
-        if (pa == ACT_FOREIGN_AID) {
-            mask |= (1u << ACT_BLOCK_DUKE);
-        } else if (pa >= ACT_STEAL_P0 && pa <= ACT_STEAL_P0 + 5) {
-            mask |= (1u << ACT_BLOCK_CAPTAIN);
-            mask |= (1u << ACT_BLOCK_AMBASSADOR);
-        } else if (pa >= ACT_ASSASSINATE_P0 && pa <= ACT_ASSASSINATE_P0 + 5) {
-            mask |= (1u << ACT_BLOCK_CONTESSA);
-        }
+        mask = 1u << ACT_PASS;
+        if (pa == ACT_FOREIGN_AID)
+            mask |= 1u << ACT_BLOCK_DUKE;
+        else if (is_steal(pa))
+            mask |= (1u << ACT_BLOCK_CAPTAIN) | (1u << ACT_BLOCK_AMBASSADOR);
+        else if (is_assassinate(pa))
+            mask |= 1u << ACT_BLOCK_CONTESSA;
         break;
     }
 
     case PHASE_LOSE_CARD: {
         int ap = get_active_player(g);
-        if (player_card0_alive(g, ap)) mask |= (1u << ACT_DISCARD_SLOT0);
-        if (player_card1_alive(g, ap)) mask |= (1u << ACT_DISCARD_SLOT1);
+        mask = ((uint32_t)player_card0_alive(g, ap) << ACT_DISCARD_SLOT0) |
+               ((uint32_t)player_card1_alive(g, ap) << ACT_DISCARD_SLOT1);
         break;
     }
 
     case PHASE_EXCHANGE_DISCARD: {
+        /* Discard two of the 4 slots (0,1 = living hand cards, 2,3 = drawn)
+         * as an ordered pair first < second, so each choice of two discards
+         * has exactly one action sequence. */
         int tp = get_turn_player(g);
-        int fd = get_first_discard(g);
-        int c0_alive = player_card0_alive(g, tp);
-        int c1_alive = player_card1_alive(g, tp);
-
-        if (fd == FIRST_DISCARD_NONE) {
-            /* First discard: can pick any available slot, but must leave at
-             * least one higher-indexed slot for the second discard (canonical
-             * ordering: second pick index > first pick index). */
-            int avail[4];
-            avail[0] = c0_alive;
-            avail[1] = c1_alive;
-            avail[2] = 1; /* drawn card 0 always available */
-            avail[3] = 1; /* drawn card 1 always available */
-            for (int s = 0; s < 4; s++) {
-                if (!avail[s]) continue;
-                /* Check that at least one available slot exists above s */
-                int has_higher = 0;
-                for (int t = s + 1; t < 4; t++) {
-                    if (avail[t]) { has_higher = 1; break; }
-                }
-                if (has_higher)
-                    mask |= (1u << (ACT_DISCARD_SLOT0 + s));
-            }
-        } else {
-            /* Second discard: only slots strictly above first pick */
-            for (int s = fd + 1; s < 4; s++) {
-                if (s == 0 && !c0_alive) continue;
-                if (s == 1 && !c1_alive) continue;
-                /* slots 2,3 are always available (drawn cards) */
-                mask |= (1u << (ACT_DISCARD_SLOT0 + s));
-            }
-        }
+        uint32_t avail = (uint32_t)player_card0_alive(g, tp) |
+                         ((uint32_t)player_card1_alive(g, tp) << 1) | 0xCu;
+        int first = get_first_discard(g);
+        if (first == FIRST_DISCARD_NONE)
+            avail &= 0x7u; /* slot 3 can't be first: nothing above it */
+        else
+            avail &= ~((2u << first) - 1);
+        mask = avail << ACT_DISCARD_SLOT0;
         break;
     }
 
-    default:
+    default: /* chance nodes */
         break;
     }
 
@@ -910,38 +577,23 @@ int get_active_player_ext(const Game *g) {
 }
 
 int is_done(const Game *g) {
-    if (alive_count(g) <= 1) return 1;
+    if (get_phase(g) == PHASE_DEAL) return 0;
     if (g->turn_count >= MAX_TURNS) return 1;
-    return 0;
+    return __builtin_popcount((unsigned)alive_mask(g)) <= 1;
 }
 
 int get_winner(const Game *g) {
-    int np = get_num_players(g);
+    int alive = alive_mask(g);
+    if (!alive) return -1;
 
-    /* Collect alive players */
-    int alive[6];
-    int n_alive = 0;
-    for (int i = 0; i < np; i++) {
-        if (player_is_alive(g, i))
-            alive[n_alive++] = i;
-    }
-
-    if (n_alive == 0) return -1;
-    if (n_alive == 1) return alive[0];
-
-    /* Tiebreaker: most alive cards, then most coins */
-    int best = alive[0];
-    int best_cards = player_card0_alive(g, best) + player_card1_alive(g, best);
-    int best_coins = player_coins(g, best);
-    for (int j = 1; j < n_alive; j++) {
-        int p = alive[j];
-        int cards = player_card0_alive(g, p) + player_card1_alive(g, p);
-        int coins = player_coins(g, p);
-        if (cards > best_cards || (cards == best_cards && coins > best_coins)) {
-            best = p;
-            best_cards = cards;
-            best_coins = coins;
-        }
+    /* Sole survivor, or the MAX_TURNS tiebreak: most living cards, then most
+     * coins, then lowest seat. */
+    int best = -1, best_key = -1;
+    for (int p = 0; p < MAX_PLAYERS; p++) {
+        if (!((alive >> p) & 1)) continue;
+        int key = (player_card0_alive(g, p) + player_card1_alive(g, p)) * 16 +
+                  player_coins(g, p);
+        if (key > best_key) { best = p; best_key = key; }
     }
     return best;
 }
@@ -1102,227 +754,4 @@ void observe(const Game *g, int player_id, const HistoryBuffer *history,
         }
     }
     /* off += 256; total = 407 */
-}
-
-/* ---- Incremental observation ---- */
-
-/* Extract fields from raw bit-packed uint16_t (mirrors inline helpers) */
-static inline int snap_card0_type(uint16_t pw) { return pw & 0x7; }
-static inline int snap_card0_alive(uint16_t pw) { return (pw >> 3) & 1; }
-static inline int snap_card1_type(uint16_t pw) { return (pw >> 4) & 0x7; }
-static inline int snap_card1_alive(uint16_t pw) { return (pw >> 7) & 1; }
-static inline int snap_coins(uint16_t pw) { return (pw >> 8) & 0xF; }
-static inline int snap_is_alive(uint16_t pw) { return snap_card0_alive(pw) || snap_card1_alive(pw); }
-
-static inline int snap_phase(uint16_t ps) { return ps & 0xF; }
-static inline int snap_turn_player(uint16_t ps) { return (ps >> 4) & 0x7; }
-static inline int snap_active_player(uint16_t ps) { return (ps >> 7) & 0x7; }
-static inline int snap_pending_action(uint16_t ps) { return (ps >> 10) & 0x3F; }
-static inline int snap_responded_mask(uint16_t ax) { return ax & 0x3F; }
-static inline int snap_exchange_card0(uint16_t ax) { return (ax >> 6) & 0x7; }
-static inline int snap_exchange_card1(uint16_t ax) { return (ax >> 9) & 0x7; }
-
-static int phase_to_obs_idx(int phase) {
-    switch (phase) {
-        case PHASE_MAIN_ACTION:      return 0;
-        case PHASE_CHALLENGE_ACTION: return 1;
-        case PHASE_BLOCK:            return 2;
-        case PHASE_CHALLENGE_BLOCK:  return 3;
-        case PHASE_LOSE_CARD:        return 4;
-        case PHASE_EXCHANGE_DISCARD: return 5;
-        default:                     return 6;
-    }
-}
-
-void observe_incremental(const Game *g, int player_id,
-                         const HistoryBuffer *history,
-                         float *out, ObsSnapshot *snap)
-{
-    /* First call: full recompute */
-    if (snap->player_id < 0) {
-        observe(g, player_id, history, out);
-        for (int i = 0; i < 6; i++) snap->players[i] = g->players[i];
-        snap->phase_state = g->phase_state;
-        snap->aux = g->aux;
-        snap->history_len = history ? history->len : 0;
-        snap->player_id = (int8_t)player_id;
-        return;
-    }
-
-    int np = get_num_players(g);
-    int old_pid = snap->player_id;
-
-    /* --- Cards [0-71] — absolute encoding --- */
-    /* With absolute encoding, card state + visibility can change from two sources:
-     * 1. player_id changed (is_self toggled for two players)
-     * 2. Card state changed (reveal, loss, exchange)
-     * Both can happen simultaneously. Simplest correct approach: rewrite any
-     * player whose card state OR is_self status changed. */
-    for (int p = 0; p < np; p++) {
-        int was_self = (p == old_pid);
-        int is_self = (p == player_id);
-        int state_changed = (g->players[p] != snap->players[p]);
-        int self_changed = (was_self != is_self);
-
-        if (!state_changed && !self_changed) continue;
-
-        int off = p * 12;
-        uint16_t old_pw = snap->players[p];
-
-        /* Zero old card0 type (was visible if was_self or was dead) */
-        int old_c0_alive = snap_card0_alive(old_pw);
-        int old_c0_type = snap_card0_type(old_pw);
-        if (was_self || !old_c0_alive)
-            out[off + old_c0_type] = 0.0f;
-
-        /* Write new card0 type (visible if is_self or dead) */
-        int new_c0_alive = player_card0_alive(g, p);
-        int new_c0_type = player_card0_type(g, p);
-        if (is_self || !new_c0_alive)
-            out[off + new_c0_type] = 1.0f;
-        if (state_changed)
-            out[off + 5] = (float)new_c0_alive;
-
-        /* Zero old card1 type */
-        int old_c1_alive = snap_card1_alive(old_pw);
-        int old_c1_type = snap_card1_type(old_pw);
-        if (was_self || !old_c1_alive)
-            out[off + 6 + old_c1_type] = 0.0f;
-
-        /* Write new card1 type */
-        int new_c1_alive = player_card1_alive(g, p);
-        int new_c1_type = player_card1_type(g, p);
-        if (is_self || !new_c1_alive)
-            out[off + 6 + new_c1_type] = 1.0f;
-        if (state_changed)
-            out[off + 11] = (float)new_c1_alive;
-    }
-
-    /* --- Coins [72-77] --- */
-    for (int i = 0; i < np; i++) {
-        if (snap_coins(snap->players[i]) != player_coins(g, i)) {
-            out[72 + i] = (float)player_coins(g, i) / 12.0f;
-        }
-    }
-
-    /* --- Alive mask [78-83] --- */
-    for (int i = 0; i < np; i++) {
-        int old_alive = snap_is_alive(snap->players[i]);
-        int new_alive = player_is_alive(g, i) ? 1 : 0;
-        if (old_alive != new_alive) {
-            out[78 + i] = (float)new_alive;
-        }
-    }
-
-    /* --- Phase one-hot [84-90] --- */
-    {
-        int old_phase = snap_phase(snap->phase_state);
-        int new_phase = get_phase(g);
-        if (old_phase != new_phase) {
-            out[84 + phase_to_obs_idx(old_phase)] = 0.0f;
-            out[84 + phase_to_obs_idx(new_phase)] = 1.0f;
-        }
-    }
-
-    /* --- Active player one-hot [91-96] --- */
-    {
-        int old_ap = snap_active_player(snap->phase_state);
-        int new_ap = get_active_player(g);
-        if (old_ap != new_ap) {
-            out[91 + old_ap] = 0.0f;
-            out[91 + new_ap] = 1.0f;
-        }
-    }
-
-    /* --- Turn player one-hot [97-102] --- */
-    {
-        int old_tp = snap_turn_player(snap->phase_state);
-        int new_tp = get_turn_player(g);
-        if (old_tp != new_tp) {
-            out[97 + old_tp] = 0.0f;
-            out[97 + new_tp] = 1.0f;
-        }
-    }
-
-    /* --- Pending action one-hot [103-134] --- */
-    {
-        int old_pa = snap_pending_action(snap->phase_state);
-        int new_pa = get_pending_action(g);
-        if (old_pa != new_pa) {
-            if (old_pa < 32) out[103 + old_pa] = 0.0f;
-            if (new_pa < 32) out[103 + new_pa] = 1.0f;
-        }
-    }
-
-    /* --- Responded mask [135-140] --- */
-    {
-        int old_rm = snap_responded_mask(snap->aux);
-        int new_rm = get_responded_mask(g);
-        if (old_rm != new_rm) {
-            for (int i = 0; i < MAX_PLAYERS; i++) {
-                int old_bit = (old_rm >> i) & 1;
-                int new_bit = (new_rm >> i) & 1;
-                if (old_bit != new_bit) {
-                    out[135 + i] = new_bit ? 1.0f : 0.0f;
-                }
-            }
-        }
-    }
-
-    /* --- Exchange cards [141-150] --- */
-    {
-        int old_phase = snap_phase(snap->phase_state);
-        int new_phase = get_phase(g);
-        int old_in_exchange = (old_phase == PHASE_EXCHANGE_DISCARD &&
-                               snap_active_player(snap->phase_state) == old_pid);
-        int new_in_exchange = (new_phase == PHASE_EXCHANGE_DISCARD &&
-                               get_active_player(g) == player_id);
-
-        if (old_in_exchange && !new_in_exchange) {
-            /* Leaving exchange: zero out */
-            int oec0 = snap_exchange_card0(snap->aux);
-            int oec1 = snap_exchange_card1(snap->aux);
-            if (oec0 < 5) out[141 + oec0] = 0.0f;
-            if (oec1 < 5) out[146 + oec1] = 0.0f;
-        } else if (new_in_exchange) {
-            /* In exchange (entering or cards changed): update */
-            if (old_in_exchange) {
-                /* Zero old */
-                int oec0 = snap_exchange_card0(snap->aux);
-                int oec1 = snap_exchange_card1(snap->aux);
-                if (oec0 < 5) out[141 + oec0] = 0.0f;
-                if (oec1 < 5) out[146 + oec1] = 0.0f;
-            }
-            int ec0 = get_exchange_card0(g);
-            int ec1 = get_exchange_card1(g);
-            if (ec0 < 5) out[141 + ec0] = 1.0f;
-            if (ec1 < 5) out[146 + ec1] = 1.0f;
-        }
-    }
-
-    /* --- History [151-406] --- */
-    /* History is newest-first (slot 0 = most recent). Every new entry shifts
-     * all existing slots down by one. So we always rewrite the full history
-     * section — but without the memset, just overwriting in place. This is
-     * still faster than full observe() since we skip the memset + card
-     * sections when unchanged. */
-    if (history && history->len > 0) {
-        int n = history->len;
-        if (n > 64) n = 64;
-        for (int i = 0; i < n; i++) {
-            HistoryEntry e = history_get(history, i);
-            int base = 151 + i * 4;
-            out[base + 0] = (float)e.acting_player / 6.0f;
-            out[base + 1] = (float)e.action / 32.0f;
-            out[base + 2] = (float)e.phase / 10.0f;
-            out[base + 3] = (float)e.result / 255.0f;
-        }
-    }
-
-    /* --- Save snapshot --- */
-    for (int i = 0; i < 6; i++) snap->players[i] = g->players[i];
-    snap->phase_state = g->phase_state;
-    snap->aux = g->aux;
-    snap->history_len = history ? (history->len > 64 ? 64 : history->len) : 0;
-    snap->player_id = (int8_t)player_id;
 }

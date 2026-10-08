@@ -93,23 +93,28 @@ html, body {
   50% { box-shadow: 0 0 12px rgba(68, 68, 68, 0.5); }
 }
 
-/* Braille spinner for bot thinking */
-@keyframes spin-braille {
-  0% { content: "⠋"; }
-  10% { content: "⠙"; }
-  20% { content: "⠹"; }
-  30% { content: "⠸"; }
-  40% { content: "⠼"; }
-  50% { content: "⠴"; }
-  60% { content: "⠦"; }
-  70% { content: "⠧"; }
-  80% { content: "⠇"; }
-  90% { content: "⠏"; }
+/* "deciding…" indicator next to the active player */
+@keyframes dots {
+  0% { content: "·"; }
+  33% { content: "··"; }
+  66% { content: "···"; }
 }
 
-.animate-spin-slow {
+.thinking-dots::after {
+  content: "·";
   display: inline-block;
-  animation: spin-braille 1s step-end infinite;
+  width: 1.5em;
+  animation: dots 1.2s steps(1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thinking-dots::after { animation: none; content: "…"; }
+  *, *::before, *::after { transition-duration: 0ms !important; animation-duration: 0ms !important; }
+}
+
+button:focus-visible, a:focus-visible, input:focus-visible {
+  outline: 2px solid var(--cursor);
+  outline-offset: 2px;
 }
 
 /* Scrollbar styling */

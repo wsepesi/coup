@@ -3,13 +3,12 @@ main = "src/index.ts"
 compatibility_date = "2024-12-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Allow wrangler to bundle the Emscripten JS glue + WASM
+# Generates src/version.ts (git hash, reported by /api/health).
 [build]
-command = "echo \"export const PROTOCOL_VERSION = \\\"$(git rev-parse --short HEAD)\\\"\" > src/version.ts"
+command = "bash scripts/version.sh"
 
 [durable_objects]
 bindings = [
-  { name = "MATCHMAKER", class_name = "Matchmaker" },
   { name = "GAME", class_name = "GameRoom" }
 ]
 
@@ -17,7 +16,14 @@ bindings = [
 tag = "v1"
 new_sqlite_classes = ["Matchmaker", "GameRoom"]
 
-# Rules for importing .wasm files as WebAssembly modules
+# Room creation moved to POST /api/rooms; the Matchmaker DO (which kept its room
+# list only in memory and lost it on eviction) is gone.
+[[migrations]]
+tag = "v2"
+deleted_classes = ["Matchmaker"]
+
+# Import .wasm files as WebAssembly.Module
 [[rules]]
 type = "CompiledWasm"
 globs = ["**/*.wasm"]
+fallthrough = false

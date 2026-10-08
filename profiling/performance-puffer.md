@@ -1,4 +1,11 @@
-# PufferLib Performance Notes
+# PufferLib Performance Notes (historical)
+
+> These notes describe the removed PufferLib 3.0-era CPython binding
+> (`pufferlib/binding.c`, 407-float observation). The current env is the
+> PufferLib 5.0 header `puffer/coup.h` (uint8 `coup_obs.h` observation, every
+> seat an agent). It runs in PufferLib's own C/OpenMP vector loop, so the
+> multiprocessing notes below no longer apply. Current numbers: `make bench-puffer`
+> and `results.md`.
 
 ## Current Numbers (Mac Mini M4, single worker)
 

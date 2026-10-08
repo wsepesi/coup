@@ -1,4 +1,8 @@
-// Shared types and constants for the Coup Workers backend
+// Shared types and constants for the Coup Workers backend.
+// Keep in sync with site/src/lib/types.ts (protocol) and c_engine/coup_core.h (indices).
+
+/** Bump when the client<->server message format changes incompatibly. */
+export const PROTOCOL = 2;
 
 // ---- Card types ----
 export const DUKE = 0;
@@ -7,13 +11,7 @@ export const CAPTAIN = 2;
 export const AMBASSADOR = 3;
 export const CONTESSA = 4;
 
-export const CARD_NAMES: Record<number, string> = {
-  [DUKE]: "Duke",
-  [ASSASSIN]: "Assassin",
-  [CAPTAIN]: "Captain",
-  [AMBASSADOR]: "Ambassador",
-  [CONTESSA]: "Contessa",
-};
+export const CARD_NAMES = ["Duke", "Assassin", "Captain", "Ambassador", "Contessa"] as const;
 
 // ---- Phases ----
 export const PHASE_DEAL = 0;
@@ -60,136 +58,164 @@ export const ACTION_DISCARD_SLOT2 = 30;
 export const ACTION_DISCARD_SLOT3 = 31;
 
 export const NUM_ACTIONS = 32;
-export const OBS_SIZE = 407;
 
-// ---- Helper functions ----
-
-export function getValidActionsFromMask(mask: number): number[] {
-  const actions: number[] = [];
-  for (let i = 0; i < 32; i++) {
-    if ((mask >>> i) & 1) actions.push(i);
-  }
-  return actions;
-}
+export const isCoup = (a: number) => a >= ACTION_COUP_P0 && a < ACTION_COUP_P0 + 6;
+export const isSteal = (a: number) => a >= ACTION_STEAL_P0 && a < ACTION_STEAL_P0 + 6;
+export const isAssassinate = (a: number) => a >= ACTION_ASSASSINATE_P0 && a < ACTION_ASSASSINATE_P0 + 6;
+export const isBlock = (a: number) => a >= ACTION_BLOCK_CONTESSA && a <= ACTION_BLOCK_DUKE;
+export const isDiscard = (a: number) => a >= ACTION_DISCARD_SLOT0 && a <= ACTION_DISCARD_SLOT3;
 
 export function actionTarget(action: number): number | null {
-  if (action >= 4 && action <= 9) return action - 4;
-  if (action >= 10 && action <= 15) return action - 10;
-  if (action >= 16 && action <= 21) return action - 16;
+  if (isCoup(action)) return action - ACTION_COUP_P0;
+  if (isSteal(action)) return action - ACTION_STEAL_P0;
+  if (isAssassinate(action)) return action - ACTION_ASSASSINATE_P0;
   return null;
 }
 
+/** Role claimed by a main action, or null for income/foreign aid/coup. */
 export function claimedRole(action: number): number | null {
   if (action === ACTION_TAX) return DUKE;
   if (action === ACTION_EXCHANGE) return AMBASSADOR;
-  if (action >= ACTION_STEAL_P0 && action <= ACTION_STEAL_P0 + 5) return CAPTAIN;
-  if (action >= ACTION_ASSASSINATE_P0 && action <= ACTION_ASSASSINATE_P0 + 5) return ASSASSIN;
+  if (isSteal(action)) return CAPTAIN;
+  if (isAssassinate(action)) return ASSASSIN;
   return null;
 }
 
-export function actionLabel(action: number, playerNames: string[]): string {
+/** Role claimed by a block action. */
+export function blockRole(action: number): number | null {
+  if (action === ACTION_BLOCK_CONTESSA) return CONTESSA;
+  if (action === ACTION_BLOCK_CAPTAIN) return CAPTAIN;
+  if (action === ACTION_BLOCK_AMBASSADOR) return AMBASSADOR;
+  if (action === ACTION_BLOCK_DUKE) return DUKE;
+  return null;
+}
+
+export function actionLabel(action: number, names: string[], you: number): string {
+  const who = (s: number) => (s === you ? "yourself" : names[s] ?? `Player ${s + 1}`);
   if (action === ACTION_INCOME) return "Income";
   if (action === ACTION_FOREIGN_AID) return "Foreign Aid";
-  if (action === ACTION_TAX) return "Tax (Duke)";
-  if (action === ACTION_EXCHANGE) return "Exchange (Ambassador)";
-
-  if (action >= 4 && action <= 9) {
-    const t = action - 4;
-    return `Coup \u2192 ${playerNames[t] ?? `Player ${t}`}`;
-  }
-  if (action >= 10 && action <= 15) {
-    const t = action - 10;
-    return `Steal from ${playerNames[t] ?? `Player ${t}`} (Captain)`;
-  }
-  if (action >= 16 && action <= 21) {
-    const t = action - 16;
-    return `Assassinate ${playerNames[t] ?? `Player ${t}`} (Assassin)`;
-  }
-
+  if (action === ACTION_TAX) return "Tax";
+  if (action === ACTION_EXCHANGE) return "Exchange";
+  if (isCoup(action)) return `Coup ${who(action - ACTION_COUP_P0)}`;
+  if (isSteal(action)) return `Steal from ${who(action - ACTION_STEAL_P0)}`;
+  if (isAssassinate(action)) return `Assassinate ${who(action - ACTION_ASSASSINATE_P0)}`;
   if (action === ACTION_CHALLENGE) return "Challenge";
   if (action === ACTION_PASS) return "Pass";
-  if (action === ACTION_BLOCK_CONTESSA) return "Block (Contessa)";
-  if (action === ACTION_BLOCK_CAPTAIN) return "Block (Captain)";
-  if (action === ACTION_BLOCK_AMBASSADOR) return "Block (Ambassador)";
-  if (action === ACTION_BLOCK_DUKE) return "Block (Duke)";
-
-  if (action === ACTION_DISCARD_SLOT0) return "Discard Card 1";
-  if (action === ACTION_DISCARD_SLOT1) return "Discard Card 2";
-  if (action === ACTION_DISCARD_SLOT2) return "Discard Card 3";
-  if (action === ACTION_DISCARD_SLOT3) return "Discard Card 4";
-
+  const br = blockRole(action);
+  if (br != null) return `Block (${CARD_NAMES[br]})`;
+  if (isDiscard(action)) return `Discard card ${action - ACTION_DISCARD_SLOT0 + 1}`;
   return `Action ${action}`;
 }
 
-// ---- Protocol types ----
+// ---- Room / protocol types ----
 
 export type BotDifficulty = "easy" | "medium" | "hard";
+export const isDifficulty = (d: unknown): d is BotDifficulty => d === "easy" || d === "medium" || d === "hard";
 
 export interface HouseRules {
-  refundOnChallenge?: boolean;
+  /** Return the 3 coins of an assassination whose claim is successfully challenged (official rule). */
+  refundOnChallenge: boolean;
+  /** Auto-pass a connected human's challenge/block decision after RESPONSE_TIMEOUT_MS. */
+  responseTimer: boolean;
 }
 
-export interface PlayerSlot {
-  username: string;
+export const DEFAULT_RULES: HouseRules = { refundOnChallenge: true, responseTimer: true };
+
+export type HistoryKind =
+  | "turn" | "action" | "claim" | "challenge" | "block" | "reveal" | "lose" | "elim" | "info" | "win";
+
+export interface HistoryEntry {
+  turn: number;
+  text: string;
+  kind: HistoryKind;
+}
+
+export interface LobbySeat {
+  name: string;
+  bot: BotDifficulty | null;
+  online: boolean;
+  host: boolean;
+  you: boolean;
+}
+
+export interface Standing {
   seat: number;
-  isBot: boolean;
-  botDifficulty?: BotDifficulty;
-  ready: boolean;
+  name: string;
+  bot: boolean;
+  alive: boolean;
+  eliminatedTurn?: number;
 }
 
-// Client -> Server messages
-export type ClientMessage =
-  | { type: "create"; username: string; numPlayers: number; numBots: number; botDifficulty: BotDifficulty; houseRules?: HouseRules }
-  | { type: "join"; username: string; code: string }
-  | { type: "quick_play"; username: string }
-  | { type: "action"; action: number }
-  | { type: "start" }
-  | { type: "house_rules"; houseRules: HouseRules }
-  | { type: "bot_config"; numBots: number; botDifficulty: BotDifficulty }
-  | { type: "forfeit" }
-  | { type: "ping" };
+export interface GameResult {
+  winner: number;
+  winnerName: string;
+  standings: Standing[];
+  turns: number;
+  history: HistoryEntry[];
+  /** Hidden cards of survivors, revealed at the end. */
+  finalCards: number[][];
+}
 
-// Server -> Client messages
+export interface PlayerView {
+  name: string;
+  coins: number;
+  influence: number;
+  revealed: number[];
+  bot: boolean;
+  online: boolean;
+  /** Human seat currently auto-played (disconnected past grace, or left). */
+  away: boolean;
+  alive: boolean;
+  claims: string[];
+}
+
+export interface GameView {
+  type: "state";
+  code: string;
+  you: number; // -1 = spectator
+  cards: { type: number; alive: boolean }[];
+  /** Two drawn cards, only for the exchanging player during exchange_discard. */
+  drawn?: number[];
+  players: PlayerView[];
+  phase: string;
+  active: number;
+  turnPlayer: number;
+  /** Main action under resolution (absent during the action phase). */
+  pending?: number;
+  /** Current block, during challenge_block. */
+  block?: { seat: number; card: number };
+  actions: { id: number; label: string }[];
+  prompt: string;
+  /** Milliseconds until the server auto-acts for the active player. */
+  deadlineMs?: number;
+  /** History entries starting at absolute index historyBase. */
+  history: HistoryEntry[];
+  historyBase: number;
+  deck: number;
+  turn: number;
+  /** Decision counter; echo it with actions so stale clicks are ignored. */
+  step: number;
+  isHost: boolean;
+  rules: HouseRules;
+}
+
 export type ServerMessage =
-  | { type: "room_created"; code: string }
-  | { type: "lobby"; code: string; players: PlayerSlot[]; houseRules?: HouseRules; isHost?: boolean; numBots: number; botDifficulty: BotDifficulty; numPlayers: number }
+  | { type: "welcome"; protocol: number; code: string }
   | {
-      type: "state";
-      yourSeat: number;
-      yourCards: { type: number; alive: boolean }[];
-      players: {
-        name: string;
-        coins: number;
-        influence: number;
-        revealed: { type: number }[];
-        isBot: boolean;
-        alive: boolean;
-      }[];
-      phase: string;
-      activePlayer: number;
-      isYourTurn: boolean;
-      availableActions: { id: number; label: string }[];
-      history: { text: string; turn: number }[];
-      claims: Record<number, string[]>;
-      context?: string;
-      pendingAction?: number;
-      deckSize: number;
+      type: "lobby";
+      code: string;
+      seats: LobbySeat[];
+      rules: HouseRules;
+      isHost: boolean;
+      maxSeats: number;
+      lastResult?: GameResult;
     }
-  | {
-      type: "game_over";
-      winner: number;
-      winnerName: string;
-      finalStandings: { seat: number; name: string; alive: boolean; eliminatedTurn?: number }[];
-      totalTurns: number;
-      history: { text: string; turn: number }[];
-    }
-  | { type: "error"; message: string }
-  | { type: "forfeited"; by: string }
-  | { type: "pong" }
-  | { type: "version"; version: string };
+  | GameView
+  | ({ type: "game_over" } & GameResult)
+  | { type: "error"; message: string; fatal?: boolean }
+  | { type: "pong" };
 
 // ---- Env type ----
 export interface Env {
-  MATCHMAKER: DurableObjectNamespace;
   GAME: DurableObjectNamespace;
 }

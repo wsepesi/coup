@@ -1,0 +1,59 @@
+# Python env for OpenSpiel algorithms on Coup.
+#
+# `pyspiel` (with the `coup` game) is NOT a dependency here: it is built from
+# the lib/OpenSpiel submodule by `make pyspiel`, which also drops a .pth file
+# into .venv so `import pyspiel` and `import open_spiel.python...` resolve to
+# the build dir and the submodule source. See training/README.md.
+#
+#   uv sync --extra torch --extra jax   # full CPU env (macOS / Linux)
+#   make pyspiel                        # build pyspiel.so + write the .pth
+#   make test-py                        # smoke tests
+#
+# Versions follow lib/OpenSpiel/open_spiel/scripts/python_extra_deps.sh for
+# Python 3.12 (torch 2.9.1, jax 0.8.1, dm-haiku 0.0.16, optax 0.2.6, chex 0.1.91).
+[project]
+name = "coup-training"
+version = "0.1.0"
+description = "OpenSpiel (pyspiel built from source) + neural algorithms on Coup"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  # open_spiel/requirements.txt (core python API)
+  "absl-py>=0.10.0",
+  "attrs>=19.3.0",
+  "numpy>=1.21.5",
+  "scipy>=1.10.1",
+  "ml-collections>=0.1.1",
+]
+
+[project.optional-dependencies]
+# PyTorch algorithms: open_spiel/python/pytorch (DQN, NFSP, Deep CFR, PPO,
+# policy gradient, ESCHER, NeuRD, RCFR, ...). On Linux x86_64 PyPI's
+# torch 2.9.1 wheel is already CUDA 12.8; see training/README.md for others.
+torch = ["torch>=2.9.1,<2.10", "dm-tree>=0.1.8"]
+# JAX algorithms: open_spiel/python/jax (DQN, NFSP, Deep CFR, policy gradient)
+# and the vendored R-NaD (training/rnad). CPU jaxlib; for CUDA use `jax-cuda`.
+jax = [
+  "jax==0.8.1",
+  "jaxlib==0.8.1",
+  "dm-haiku==0.0.16",
+  "optax==0.2.6",
+  "chex==0.1.91",
+  "flax==0.12.1",
+  "rlax==0.1.8",      # jax policy_gradient (also used by PSRO rl_policy)
+  "distrax==0.1.7",
+]
+# open_spiel.python.algorithms.lp_solver (imported by PSRO meta-strategies,
+# sequence-form LP, ...); matplotlib: psro_v2 imports the alpharank visualizer.
+misc = ["cvxpy>=1.7.5", "matplotlib>=3.10"]
+# Linux + NVIDIA only: CUDA 12 jaxlib plugin (use together with `jax`).
+jax-cuda = ["jax[cuda12]==0.8.1"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["training/tests"]

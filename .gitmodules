@@ -1,3 +1,7 @@
 [submodule "lib/OpenSpiel"]
 	path = lib/OpenSpiel
 	url = https://github.com/google-deepmind/open_spiel
+[submodule "lib/PufferLib"]
+	path = lib/PufferLib
+	url = https://github.com/PufferAI/PufferLib.git
+	branch = 5.0

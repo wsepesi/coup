@@ -1,146 +1,100 @@
-// coup_game.h -- OpenSpiel integration for Coup
-// Pure C++ implementation, no dependency on the C engine.
+// coup_game.h — OpenSpiel adapter over the C engine (c_engine/coup_core.c).
+//
+// There is exactly one implementation of the Coup rules in this repo: the C
+// engine. This file only adapts it to OpenSpiel's State/Game interface, so
+// OpenSpiel (CFR/MCCFR, exploitability, ...) and PufferLib/web/TUI all play
+// the same game by construction.
+//
+// Mapping:
+//   - State     = C `Game` (POD) + per-player event log (for infostates) +
+//                 CoupObsTracker (for observation tensors). Clone = copy.
+//   - Tensors   = ObservationTensor: coup_obs.h (current state + last 8
+//                 events), identical to the PufferLib observation.
+//                 InformationStateTensor: the same plus whole-game per-seat
+//                 claim/block/challenge counters and the observer's own
+//                 returned cards. A function of InformationStateString, but
+//                 a fixed-size summary (not injective over histories).
+//   - Resample  = ResampleFromInfostate samples a full history consistent with
+//                 one player's infostate (see coup_game.cc), for IS-MCTS etc.
+//   - Chance    = C chance nodes (deal, challenge redraw, exchange draws).
+//                 Outcome index = card type (0..4). The RNG embedded in `Game`
+//                 is never used: game_init(g, n, 0, 0) leaves the deal as
+//                 explicit chance nodes and we never call step_with_rng.
+//   - Decisions = step_deterministic with ABSOLUTE engine actions (0..31).
+//                 (coup_obs.h's relative action indices only appear inside the
+//                 observation tensor.)
+//   - Returns   = winner +1, every other player -1/(n-1): zero-sum for any n.
+//                 At MAX_TURNS the C engine's get_winner() tiebreak decides.
+#ifndef COUP_CPP_ENGINE_COUP_GAME_H_
+#define COUP_CPP_ENGINE_COUP_GAME_H_
 
-#ifndef OPEN_SPIEL_GAMES_COUP_GAME_H_
-#define OPEN_SPIEL_GAMES_COUP_GAME_H_
-
-#include <array>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "open_spiel/spiel.h"
 
+// Both headers carry their own extern "C" guards.
+#include "coup_core.h"
+#include "coup_obs.h"
+
 namespace open_spiel {
 namespace coup {
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-inline constexpr int kMaxPlayers = 6;
 inline constexpr int kMinPlayers = 2;
+inline constexpr int kMaxPlayers = MAX_PLAYERS;
+inline constexpr int kDefaultPlayers = 2;
+inline constexpr bool kDefaultRefundOnChallenge = true;
+inline constexpr int kNumActions = COUP_NUM_ACTIONS;  // 32
 inline constexpr int kNumCardTypes = 5;
-inline constexpr int kCardsPerType = 3;
-inline constexpr int kTotalCards = kNumCardTypes * kCardsPerType;  // 15
-inline constexpr int kNumActions = 32;
-inline constexpr int kMaxCoins = 12;
-inline constexpr int kForceCoupThreshold = 10;
-inline constexpr int kCoupCost = 7;
-inline constexpr int kAssassinateCost = 3;
-inline constexpr int kStartingCoins = 2;
-inline constexpr int kCardsPerPlayer = 2;
+inline constexpr int kDeckSize = 15;  // 3 copies x 5 roles
+inline constexpr int kObservationTensorSize = COUP_OBS_SIZE;
+// InformationStateTensor = observation + per relative seat counters + own
+// returned cards. See CoupState::InformationStateTensor.
+inline constexpr int kInfoSeatSize = 43;
+inline constexpr int kInfoStateTensorSize =
+    kObservationTensorSize + kMaxPlayers * kInfoSeatSize + 5 * 3;
 
-// Maximum turns (main actions) before tiebreak. Matches C engine MAX_TURNS.
-inline constexpr int kMaxTurns = 200;
+// Upper bound on player decisions in one turn (one main action):
+//   1 main action
+//   + 3 response windows (challenge-action, block, challenge-block), each at
+//     most n-1 decisions (every other player passes, or someone acts)
+//   + 3 LOSE_CARD decisions (lost challenge on the action, lost challenge on
+//     the block, assassination/coup resolution)
+//   + 2 EXCHANGE_DISCARD picks
+// = 3n + 3. Loose (no single turn hits every term) but sound. A game has at
+// most MAX_TURNS turns: every turn ends in advance_turn() (turn_count++) or
+// game over, and is_done() fires at turn_count >= MAX_TURNS.
+inline int MaxDecisionsPerTurn(int num_players) { return 3 * num_players + 3; }
+// Chance nodes: 2n deal + at most 3 per turn (one redraw after a defended
+// action challenge + two exchange draws; a defended block challenge redraw
+// cannot co-occur with an exchange).
+inline int MaxChancePerTurn() { return 3; }
 
-// History ring buffer for observation tensor.
-inline constexpr int kHistoryLength = 64;
-inline constexpr int kHistoryEntrySize = 4;  // floats per entry
-
-// Observation tensor size.
-// See plan.md section 6 for layout.
-inline constexpr int kObservationTensorSize = 407;
-
-// ---------------------------------------------------------------------------
-// Card types
-// ---------------------------------------------------------------------------
-
-enum CardType : int {
-  kDuke = 0,
-  kAssassin = 1,
-  kCaptain = 2,
-  kAmbassador = 3,
-  kContessa = 4,
+// One entry per applied action (chance or decision). Holds the extra facts
+// needed to render each player's information state without replaying.
+struct LoggedEvent {
+  uint8_t phase;   // engine phase BEFORE the action
+  uint8_t actor;   // decision: acting seat; chance: seat receiving the card
+  uint8_t action;  // decision: absolute action; chance: card type drawn
+  uint8_t info;    // LOSE_CARD: revealed card type;
+                   // CHALLENGE: 1 if the claim was true (challenger loses);
+                   // CHANCE_REDRAW: hand slot being replaced;
+                   // EXCHANGE_DISCARD: type of the discarded card (private)
+  uint8_t claimant;  // CHALLENGE: seat whose claim is challenged
+  uint8_t role;      // CHALLENGE: the challenged role
 };
-
-// ---------------------------------------------------------------------------
-// Phase enum (must match plan.md section 5)
-// ---------------------------------------------------------------------------
-
-enum Phase : int {
-  kDeal = 0,
-  kChanceRedraw = 1,
-  kChanceExchange = 2,
-  kMainAction = 3,
-  kChallengeAction = 4,
-  kBlock = 5,
-  kChallengeBlock = 6,
-  kLoseCard = 7,
-  kExchangeDiscard = 8,
-  kResolve = 9,
-};
-
-// ---------------------------------------------------------------------------
-// Action indices (must match plan.md section 4)
-// ---------------------------------------------------------------------------
-
-enum ActionIndex : int {
-  kIncome = 0,
-  kForeignAid = 1,
-  kTax = 2,
-  kExchange = 3,
-  kCoupPlayer0 = 4,
-  // 4-9: coup -> player 0-5
-  kStealPlayer0 = 10,
-  // 10-15: steal -> player 0-5
-  kAssassinatePlayer0 = 16,
-  // 16-21: assassinate -> player 0-5
-  kChallenge = 22,
-  kPass = 23,
-  kBlockContessa = 24,
-  kBlockCaptain = 25,
-  kBlockAmbassador = 26,
-  kBlockDuke = 27,
-  kDiscardSlot0 = 28,
-  kDiscardSlot1 = 29,
-  kDiscardSlot2 = 30,
-  kDiscardSlot3 = 31,
-};
-
-// ---------------------------------------------------------------------------
-// Per-player card info
-// ---------------------------------------------------------------------------
-
-struct CardInfo {
-  int type = 0;       // CardType 0-4
-  bool alive = true;  // face-down = alive
-};
-
-struct PlayerState {
-  CardInfo cards[kCardsPerPlayer];
-  int coins = kStartingCoins;
-
-  bool IsAlive() const { return cards[0].alive || cards[1].alive; }
-  int NumAliveCards() const {
-    return (cards[0].alive ? 1 : 0) + (cards[1].alive ? 1 : 0);
-  }
-};
-
-// ---------------------------------------------------------------------------
-// History entry for observation tensor
-// ---------------------------------------------------------------------------
-
-struct HistoryEntry {
-  int acting_player;  // 0-5
-  int action;         // 0-31
-  int phase;          // Phase enum
-  int result;         // outcome flags
-};
-
-// ---------------------------------------------------------------------------
-// CoupState
-// ---------------------------------------------------------------------------
 
 class CoupGame;
 
 class CoupState : public State {
  public:
-  explicit CoupState(std::shared_ptr<const Game> game);
+  explicit CoupState(std::shared_ptr<const Game> game, int num_players,
+                     bool refund_on_challenge);
   CoupState(const CoupState&) = default;
-  CoupState& operator=(const CoupState&) = default;
 
-  // --- OpenSpiel State interface ---
   Player CurrentPlayer() const override;
   std::vector<Action> LegalActions() const override;
   std::string ActionToString(Player player, Action action) const override;
@@ -148,146 +102,54 @@ class CoupState : public State {
   bool IsTerminal() const override;
   std::vector<double> Returns() const override;
   std::string InformationStateString(Player player) const override;
-  void InformationStateTensor(Player player,
-                              absl::Span<float> values) const override;
   std::string ObservationString(Player player) const override;
   void ObservationTensor(Player player,
                          absl::Span<float> values) const override;
+  void InformationStateTensor(Player player,
+                              absl::Span<float> values) const override;
   std::unique_ptr<State> Clone() const override;
+  std::unique_ptr<State> ResampleFromInfostate(
+      int player_id, std::function<double()> rng) const override;
   std::vector<std::pair<Action, double>> ChanceOutcomes() const override;
+  void UndoAction(Player player, Action action) override;
 
-  // Test accessors
-  Phase GetPhase() const { return phase_; }
-  int GetFirstDiscard() const { return first_discard_; }
+  // Read-only access to the underlying C engine state (tests, tools).
+  const ::Game& engine() const { return g_; }
+  const CoupObsTracker& tracker() const { return tracker_; }
 
  protected:
   void DoApplyAction(Action action) override;
 
  private:
-  const CoupGame* parent_game() const;
-  int NumPlayers() const;
-
-  // --- Game state ---
-  std::array<PlayerState, kMaxPlayers> players_;
-  std::array<int, kNumCardTypes> deck_;  // count per card type
-  Phase phase_ = kDeal;
-  int turn_player_ = 0;
-  int active_player_ = 0;
-  int pending_action_ = -1;
-
-  // Auxiliary state
-  uint8_t responded_mask_ = 0;  // 6-bit mask
-  int exchange_cards_[2] = {-1, -1};  // types of drawn exchange cards
-  int first_discard_ = -1;  // slot index of first exchange discard
-  int blocker_ = -1;
-  int block_card_ = -1;
-
-  // Deal tracking
-  int deal_count_ = 0;  // how many cards dealt so far (0..2*num_players-1)
-
-  // Exchange draw tracking
-  int exchange_draw_count_ = 0;  // 0 or 1 (which exchange card being drawn)
-
-  // For challenge resolution: who challenged, and who was challenged
-  int challenger_ = -1;
-  // The card type that was claimed (for challenge resolution)
-  int claimed_card_ = -1;
-
-  // Track whether the action was blocked (for resolve)
-  bool action_blocked_ = false;
-
-  // For lose_card: who needs to lose a card
-  int lose_card_player_ = -1;
-  // After lose_card, what phase to go to
-  Phase post_lose_card_phase_ = kResolve;
-  // For challenge defense: was the challenge on a block?
-  bool challenge_on_block_ = false;
-  // After a failed action challenge, the action still needs to go through
-  // the block phase if blockable. This flag tracks that.
-  bool needs_block_ = false;
-
-  // Turn counter (incremented each main action; game ends at kMaxTurns)
-  int turn_count_ = 0;
-
-  // Cached vectors to avoid per-call heap allocation
-  mutable std::vector<Action> legal_actions_cache_;
-  mutable std::vector<std::pair<Action, double>> chance_outcomes_cache_;
-
-  // History buffer for observation
-  std::vector<HistoryEntry> history_buffer_;
-
-  // Winner cache (-1 if not terminal)
-  int winner_ = -1;
-
-  // --- Helper methods ---
-  int DeckTotal() const;
-  void DeckRemove(int card_type);
-  void DeckAdd(int card_type);
-
-  // Phase transitions
-  void AdvanceDeal(int card_type);
-  void StartMainAction();
-  void AdvanceTurn();
-  int NextAlivePlayer(int from) const;
-  int NextResponder(int from) const;
-
-  // Action processing
-  void ApplyMainAction(Action action);
-  void ApplyChallengeAction(Action action);
-  void ApplyBlock(Action action);
-  void ApplyChallengeBlock(Action action);
-  void ApplyLoseCard(Action action);
-  void ApplyExchangeDiscard(Action action);
-  void ApplyResolve();
-
-  // Utility
-  bool PlayerIsAlive(int p) const;
-  int CountAlivePlayers() const;
-  void CheckGameOver();
-  int GetTarget(int action) const;
-  int GetClaimedCard(int action) const;
-  bool IsChallengeable(int action) const;
-  bool IsBlockable(int action) const;
-  void AddHistoryEntry(int acting_player, int action, int phase, int result);
-
-  // Legal action helpers (fill legal_actions_cache_)
-  void LegalActionsMainAction() const;
-  void LegalActionsChallengeAction() const;
-  void LegalActionsBlock() const;
-  void LegalActionsChallengeBlock() const;
-  void LegalActionsLoseCard() const;
-  void LegalActionsExchangeDiscard() const;
-
-  // Observation helpers
-  void FillObservationTensor(Player player,
-                             absl::Span<float> values) const;
+  ::Game g_;
+  CoupObsTracker tracker_;
+  std::vector<LoggedEvent> events_;
 };
-
-// ---------------------------------------------------------------------------
-// CoupGame
-// ---------------------------------------------------------------------------
 
 class CoupGame : public Game {
  public:
   explicit CoupGame(const GameParameters& params);
 
-  std::unique_ptr<State> NewInitialState() const override;
   int NumDistinctActions() const override { return kNumActions; }
+  std::unique_ptr<State> NewInitialState() const override;
+  int MaxChanceOutcomes() const override { return MAX_CHANCE_OUTCOMES; }
   int NumPlayers() const override { return num_players_; }
-  double MinUtility() const override { return -1.0; }
+  double MinUtility() const override { return -1.0 / (num_players_ - 1); }
   double MaxUtility() const override { return 1.0; }
   absl::optional<double> UtilitySum() const override { return 0.0; }
-  int MaxGameLength() const override { return 1000; }
-  int MaxChanceOutcomes() const override { return kNumCardTypes; }
-
-  std::vector<int> InformationStateTensorShape() const override {
-    return {kObservationTensorSize};
-  }
   std::vector<int> ObservationTensorShape() const override {
     return {kObservationTensorSize};
   }
+  std::vector<int> InformationStateTensorShape() const override {
+    return {kInfoStateTensorSize};
+  }
+  int MaxGameLength() const override {
+    return MAX_TURNS * MaxDecisionsPerTurn(num_players_);
+  }
+  int MaxChanceNodesInHistory() const override {
+    return 2 * num_players_ + MAX_TURNS * MaxChancePerTurn();
+  }
 
- public:
   bool refund_on_challenge() const { return refund_on_challenge_; }
 
  private:
@@ -295,7 +157,12 @@ class CoupGame : public Game {
   bool refund_on_challenge_;
 };
 
+// Human-readable names.
+std::string CardName(int card);
+std::string ActionName(int action);  // absolute engine action, no actor
+std::string PhaseName(int phase);
+
 }  // namespace coup
 }  // namespace open_spiel
 
-#endif  // OPEN_SPIEL_GAMES_COUP_GAME_H_
+#endif  // COUP_CPP_ENGINE_COUP_GAME_H_

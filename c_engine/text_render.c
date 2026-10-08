@@ -309,6 +309,7 @@ static void render_action_event(char **cur, int *rem, const GameEvent *e) {
 
 static void render_history(char **cur, int *rem, const GameLog *log,
                            int player_id, int info_mode) {
+    (void)player_id; /* history is public; kept for symmetry with callers */
     if (log->len == 0) return;
 
     buf_printf(cur, rem, "History:\n");
