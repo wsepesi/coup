@@ -1,21 +1,3 @@
-// ── Theme colors (CSS variable names → values) ───────────────────
-
-export const THEME = {
-  bg: "#111111",
-  border: "#555555",
-  textDefault: "#DDDDDD",
-  textDim: "#888888",
-  textBright: "#FFFFFF",
-  selectionBg: "#444455",
-  you: "#00FFAA",
-  dead: "#CC0000",
-  coinGain: "#00DD00",
-  coinLoss: "#FF5555",
-  challengeWin: "#00FF00",
-  challengeFail: "#FF5555",
-  cursor: "#CCCCCC",
-} as const;
-
 // ── Card / role definitions ───────────────────────────────────────
 
 export const ROLE_NAMES = ["Duke", "Assassin", "Captain", "Ambassador", "Contessa"] as const;
@@ -29,11 +11,11 @@ export const ROLE_COLORS: Record<string, string> = {
 };
 
 export const ROLE_SYMBOLS: Record<string, string> = {
-  Duke: "\u2666\u2666\u2666",
-  Assassin: "\u2020\u2020\u2020",
-  Captain: "\u2693\u2693\u2693",
-  Ambassador: "\u2726\u2726\u2726",
-  Contessa: "\u2665\u2665\u2665",
+  Duke: "♦♦♦",
+  Assassin: "†††",
+  Captain: "⚓⚓⚓",
+  Ambassador: "✦✦✦",
+  Contessa: "♥♥♥",
 };
 
 export const ROLE_SHORT: Record<string, string> = {
@@ -44,24 +26,38 @@ export const ROLE_SHORT: Record<string, string> = {
   Contessa: "Ct",
 };
 
-export const HIDDEN_CARD = "\u2593\u2593";
+export const ROLE_ABILITY: Record<string, string> = {
+  Duke: "Tax +3 coins; blocks Foreign Aid",
+  Assassin: "Pay 3 to assassinate",
+  Captain: "Steal 2 coins; blocks stealing",
+  Ambassador: "Exchange with the deck; blocks stealing",
+  Contessa: "Blocks assassination",
+};
 
-// ── Influence indicators ──────────────────────────────────────────
-
-export const INFLUENCE = {
-  alive2: "\u25CF", // ●
-  alive1: "\u25CB", // ○
-  dead: "\u2620",   // ☠
-} as const;
+export const HIDDEN_CARD = "▓▓";
 
 // ── Action space (matches the 32-action fixed layout) ─────────────
 
-// Action categories for color coding
-export function actionCategory(action: number): "general" | "aggressive" | "response" | "block" | "discard" {
-  if (action <= 3) return "general";
-  if (action <= 21) return "aggressive";
-  if (action === 22) return "response";
-  if (action === 23) return "response";
-  if (action >= 24 && action <= 27) return "block";
-  return "discard";
+export const ACTION = {
+  INCOME: 0,
+  FOREIGN_AID: 1,
+  TAX: 2,
+  EXCHANGE: 3,
+  COUP0: 4,
+  STEAL0: 10,
+  ASSASSINATE0: 16,
+  CHALLENGE: 22,
+  PASS: 23,
+  BLOCK_CONTESSA: 24,
+  BLOCK_CAPTAIN: 25,
+  BLOCK_AMBASSADOR: 26,
+  BLOCK_DUKE: 27,
+  DISCARD0: 28,
+} as const;
+
+export function actionTarget(a: number): number | null {
+  if (a >= 4 && a <= 9) return a - 4;
+  if (a >= 10 && a <= 15) return a - 10;
+  if (a >= 16 && a <= 21) return a - 16;
+  return null;
 }

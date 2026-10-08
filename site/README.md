@@ -27,11 +27,11 @@ Opens at `http://localhost:3000`. Requires the workers backend running locally (
 src/
   app/
     page.tsx          Landing page
-    lobby/[code]/     Lobby waiting room
-    game/[code]/      Game view
+    lobby/[code]/     Room page: lobby -> game -> results -> rematch (one WebSocket)
+    game/[code]/      Redirects to /lobby/[code]
   components/         React components
-  hooks/              Custom hooks (WebSocket, game state)
-  lib/                Shared utilities
+  hooks/              Keyboard + history tracking hooks
+  lib/                Protocol types, room WebSocket hook (ws.ts), identity/API (identity.ts)
 ```
 
 ## Stack

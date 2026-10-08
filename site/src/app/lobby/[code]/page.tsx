@@ -1,327 +1,233 @@
 "use client";
 
-import { useState, useCallback, useRef, useEffect } from "react";
-import { useParams, useSearchParams, useRouter } from "next/navigation";
-import { useWebSocket } from "@/lib/ws";
+import { useState, useCallback, useEffect, useRef } from "react";
+import { useParams, useRouter } from "next/navigation";
+import { useRoom } from "@/lib/ws";
+import { getSavedName, saveName } from "@/lib/identity";
 import { useKeyboard } from "@/hooks/useKeyboard";
-import type { ServerMessage, LobbyPlayer, ClientMessage, HouseRules } from "@/lib/types";
+import GameBoard from "@/components/GameBoard";
+import Lobby from "@/components/Lobby";
+import GameOver from "@/components/GameOver";
+import RulesContent from "@/components/Rules";
 
-export default function LobbyPage() {
-  const params = useParams();
-  const searchParams = useSearchParams();
-  const router = useRouter();
-  const rawCode = params.code as string;
+/**
+ * The room page: one WebSocket for the whole lobby → game → game-over → rematch
+ * cycle. (/game/[code] redirects here.)
+ */
+export default function RoomPage() {
+  const params = useParams<{ code: string }>();
+  const code = (params.code ?? "").toUpperCase();
+  const [name, setName] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
 
-  const [roomCode, setRoomCode] = useState<string>(
-    rawCode === "new" ? "" : rawCode
-  );
-  const [players, setPlayers] = useState<LobbyPlayer[]>([]);
-  const [houseRules, setHouseRules] = useState<HouseRules>({ refundOnChallenge: true });
-  const [numBots, setNumBots] = useState(0);
-  const [botDifficulty, setBotDifficulty] = useState("hard");
-  const [numPlayers, setNumPlayers] = useState(6);
-  const [error, setError] = useState<string | null>(null);
-  const [isHost, setIsHost] = useState(false);
-  const [phase, setPhase] = useState<"matchmaker" | "game">(
-    rawCode === "new" ? "matchmaker" : "game"
-  );
-  // Store all search params in state/refs so they survive the URL rewrite from matchmaker
-  const [username] = useState(() =>
-    searchParams.get("username")
-    ?? (typeof window !== "undefined" ? localStorage.getItem("coup_username") : null)
-    ?? "anonymous"
-  );
-  const [action] = useState(() => searchParams.get("action"));
-  const initParams = useRef({
-    numPlayers: Number(searchParams.get("numPlayers") ?? 6),
-    numBots: Number(searchParams.get("numBots") ?? 0),
-    botDifficulty: (searchParams.get("botDifficulty") ?? "medium") as "easy" | "medium",
-  });
-
-  // Timeout for matchmaker phase
-  const [matchmakerTimedOut, setMatchmakerTimedOut] = useState(false);
   useEffect(() => {
-    if (phase !== "matchmaker") return;
-    const timer = setTimeout(() => setMatchmakerTimedOut(true), 8000);
-    return () => clearTimeout(timer);
-  }, [phase]);
-
-  // Matchmaker connection
-  const onMatchmakerMessage = useCallback((msg: ServerMessage) => {
-    switch (msg.type) {
-      case "room_created":
-        setRoomCode(msg.code);
-        setIsHost(true);
-        window.history.replaceState(null, "", `/lobby/${msg.code}`);
-        setPhase("game");
-        break;
-      case "error":
-        setError(msg.message);
-        break;
-    }
+    setName(getSavedName() || null);
+    setLoaded(true);
   }, []);
 
-  const matchmaker = useWebSocket({
-    path: "/ws/matchmaker",
-    enabled: phase === "matchmaker",
-    onMessage: onMatchmakerMessage,
-    onConnect: useCallback((send: (msg: ClientMessage) => void) => {
-      if (action === "create") {
-        send({
-          type: "create",
-          username,
-          ...initParams.current,
-        });
-      }
-    }, [action, username]),
-  });
+  if (!loaded) return <Centered>Loading…</Centered>;
+  if (!name) return <NamePrompt code={code} onSubmit={(n) => { saveName(n); setName(n); }} />;
+  return <Room code={code} name={name} />;
+}
 
-  // Game room connection
-  const onGameMessage = useCallback((msg: ServerMessage) => {
-    switch (msg.type) {
-      case "lobby":
-        setPlayers(msg.players);
-        if (msg.houseRules) setHouseRules(msg.houseRules);
-        if (msg.isHost != null) setIsHost(msg.isHost);
-        if (msg.numBots != null) setNumBots(msg.numBots);
-        if (msg.botDifficulty) setBotDifficulty(msg.botDifficulty);
-        if (msg.numPlayers) setNumPlayers(msg.numPlayers);
-        break;
-      case "state":
-        router.push(`/game/${roomCode || rawCode}`);
-        break;
-      case "error":
-        setError(msg.message);
-        break;
-    }
-  }, [roomCode, rawCode, router]);
+function Room({ code, name }: { code: string; name: string }) {
+  const router = useRouter();
+  const conn = useRoom(code, name);
+  const { game, lobby, result, status, send } = conn;
+  const [confirmQuit, setConfirmQuit] = useState(false);
+  const [showRules, setShowRules] = useState(false);
+  const [sentStep, setSentStep] = useState<number | null>(null);
 
-  const gameWsCode = roomCode || (rawCode !== "new" ? rawCode : "");
-  const gameJoined = useRef(false);
-  const game = useWebSocket({
-    path: `/ws/game/${gameWsCode}`,
-    enabled: phase === "game" && !!gameWsCode,
-    onMessage: onGameMessage,
-    onConnect: useCallback((send: (msg: ClientMessage) => void) => {
-      send({ type: "join", username, code: gameWsCode });
-      gameJoined.current = true;
-    }, [username, gameWsCode]),
-  });
+  // Clear the "waiting for server" lock once the decision moves on (or on error).
+  useEffect(() => { setSentStep(null); }, [game, conn.error]);
 
+  // Hold the final board for a moment so players see the winning blow before the results.
+  const lastGame = useRef(game);
+  if (game) lastGame.current = game;
+  const [holdBoard, setHoldBoard] = useState(false);
+  useEffect(() => {
+    if (!result) return;
+    setHoldBoard(true);
+    const t = setTimeout(() => setHoldBoard(false), 2200);
+    return () => clearTimeout(t);
+  }, [result]);
+  const boardGame = game ?? (result && holdBoard ? lastGame.current : null);
 
-  const handleStart = useCallback(() => game.send({ type: "start" }), [game]);
-  const copyCode = () => { if (roomCode) navigator.clipboard.writeText(roomCode); };
+  const busy = sentStep != null && game?.step === sentStep;
+  const handleAction = useCallback((action: number, then?: number) => {
+    if (!game || busy) return;
+    setSentStep(game.step);
+    send({ type: "action", action, then, step: game.step });
+  }, [game, busy, send]);
 
-  // Keyboard: Enter to start, Escape to leave
+  const leave = useCallback(() => {
+    send({ type: "leave" });
+    router.push("/");
+  }, [send, router]);
+
+  // Tab title: flag when it's your move (handy with the tab in the background).
+  const yourMove = !!game && game.you >= 0 && game.active === game.you && game.actions.length > 0;
+  useEffect(() => {
+    document.title = yourMove ? "▶ Your move — COUP" : result ? "Game over — COUP" : game ? `COUP · ${code}` : `Lobby ${code} — COUP`;
+  }, [yourMove, result, game, code]);
+
+  useKeyboard({ q: () => setConfirmQuit(true), "?": () => setShowRules((v) => !v) }, [], !!game && !confirmQuit && !showRules);
   useKeyboard(
-    {
-      Enter: () => { if (isHost && players.length >= 1) handleStart(); },
-      Escape: () => router.push("/"),
-    },
-    [isHost, players.length, handleStart, router],
+    { y: () => { setConfirmQuit(false); leave(); }, n: () => setConfirmQuit(false), Escape: () => setConfirmQuit(false) },
+    [leave],
+    confirmQuit,
   );
+  useKeyboard({ Escape: () => setShowRules(false), "?": () => setShowRules(false) }, [], showRules);
 
-  const humanCount = Math.max(1, players.filter(p => !p.isBot).length);
-  const botCount = players.filter(p => p.isBot).length;
+  if (conn.closedReason) {
+    const replaced = /another tab/.test(conn.closedReason);
+    return (
+      <Centered>
+        <p className="text-text-bright mb-4">{conn.closedReason}</p>
+        <div className="flex gap-2 justify-center">
+          {replaced && (
+            <button onClick={conn.reconnect} className="border border-you text-you px-4 py-2 hover:bg-you/10">use this tab</button>
+          )}
+          <button onClick={() => router.push("/")} className="border border-border-term px-4 py-2 text-text-dim hover:text-text-default">main menu</button>
+        </div>
+      </Centered>
+    );
+  }
+
+  let body: React.ReactNode;
+  if (result && !boardGame) {
+    body = (
+      <GameOver
+        result={result}
+        lobby={lobby}
+        youName={lobby?.seats.find((s) => s.you)?.name ?? name}
+        onRematch={() => send({ type: "start" })}
+        onLobby={conn.dismissResult}
+        onHome={leave}
+      />
+    );
+  } else if (boardGame) {
+    body = (
+      <GameBoard
+        state={game ? boardGame : { ...boardGame, actions: [], deadline: null, prompt: `${result?.winnerName ?? "Someone"} wins!` }}
+        busy={busy}
+        onAction={handleAction}
+        onQuit={() => setConfirmQuit(true)}
+        onRules={() => setShowRules(true)}
+      />
+    );
+  } else if (lobby) {
+    body = <Lobby lobby={lobby} send={send} onLeave={leave} />;
+  } else {
+    body = (
+      <Centered>
+        <ConnectionDot status={status} />
+        <p className="text-text-dim mt-3">{status === "reconnecting" ? "Can't reach the server — retrying…" : `Joining room ${code}…`}</p>
+      </Centered>
+    );
+  }
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center p-4">
-      <div className="text-center mb-6">
-        <h1 className="text-you text-xl mb-2">LOBBY</h1>
-        {roomCode ? (
-          <div className="flex items-center gap-3 justify-center">
-            <span className="text-text-dim">Room:</span>
-            <span className="text-cursor text-2xl tracking-[0.3em] font-bold">{roomCode}</span>
-            <button onClick={copyCode} className="text-text-dim hover:text-text-default text-xs border border-border-term px-2 py-0.5">
-              copy
-            </button>
-          </div>
-        ) : matchmakerTimedOut ? (
-          <div className="space-y-2">
-            <span className="text-dead">Failed to create room.</span>
-            <div className="flex gap-3 justify-center">
-              <button
-                onClick={() => { setMatchmakerTimedOut(false); window.location.reload(); }}
-                className="text-text-dim hover:text-text-default text-xs border border-border-term px-2 py-0.5"
-              >
-                retry
+    <div className="relative">
+      {conn.outdated && (
+        <Banner tone="info">
+          A new version is available. <button className="underline" onClick={() => window.location.reload()}>Refresh</button>
+        </Banner>
+      )}
+      {status === "reconnecting" && (lobby || game) && (
+        <Banner tone="warn"><ConnectionDot status={status} /> Connection lost — reconnecting…</Banner>
+      )}
+      {conn.error && (
+        <Banner tone="error">
+          {conn.error}
+          <button onClick={conn.clearError} className="ml-3 text-xs underline" aria-label="Dismiss">dismiss</button>
+        </Banner>
+      )}
+
+      {body}
+
+      {confirmQuit && game && (
+        <div className="fixed inset-0 z-50 bg-bg/90 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label="Leave game">
+          <div className="border border-border-term p-6 max-w-sm w-full text-center bg-bg">
+            <div className="text-text-bright text-lg mb-2">{game.you >= 0 && game.players[game.you]?.alive ? "Leave the game?" : "Leave the room?"}</div>
+            <div className="text-text-dim text-sm mb-4">
+              {game.you >= 0 && game.players[game.you]?.alive
+                ? "A bot will play your cards for the rest of this game. The others can keep playing."
+                : "You can come back with the room link."}
+            </div>
+            <div className="flex gap-2 justify-center">
+              <button onClick={() => { setConfirmQuit(false); leave(); }} className="border border-dead text-dead px-4 py-2 text-sm">
+                Leave <span className="text-xs opacity-60">(Y)</span>
               </button>
-              <button
-                onClick={() => router.push("/")}
-                className="text-text-dim hover:text-text-default text-xs border border-border-term px-2 py-0.5"
-              >
-                back
+              <button autoFocus onClick={() => setConfirmQuit(false)} className="border border-border-term text-text-dim px-4 py-2 text-sm">
+                Stay <span className="text-xs opacity-60">(N)</span>
               </button>
             </div>
           </div>
-        ) : matchmaker.status === "reconnecting" ? (
-          <span className="text-text-dim">Connection lost. Retrying...</span>
-        ) : (
-          <span className="text-text-dim">Creating room...</span>
-        )}
-      </div>
-
-      {error && (
-        <div className="border border-dead text-dead p-2 mb-4 max-w-md w-full text-center text-sm">
-          {error}
         </div>
       )}
 
-      {/* Player list */}
-      <div className="w-full max-w-md border border-border-term mb-4">
-        <div className="border-b border-border-term px-3 py-1 text-text-dim text-xs">
-          {"// "}{humanCount} human{humanCount !== 1 ? "s" : ""}{botCount > 0 && ` + ${botCount} bot${botCount !== 1 ? "s" : ""}`}
-        </div>
-        {players.length === 0 ? (
-          <div className="p-3 text-text-dim text-sm text-center">
-            Waiting for players...
+      {showRules && (
+        <div className="fixed inset-0 z-50 bg-bg overflow-y-auto p-4" role="dialog" aria-label="Rules">
+          <div className="max-w-5xl mx-auto">
+            <button onClick={() => setShowRules(false)} className="text-text-dim hover:text-text-default text-sm mb-3 border border-border-term px-2 py-0.5">
+              ✕ close <span className="text-xs hidden sm:inline">(Esc)</span>
+            </button>
+            <RulesContent />
           </div>
-        ) : (
-          <div className="divide-y divide-border-term">
-            {players.map((p) => (
-              <div key={p.seat} className="flex items-center justify-between px-3 py-2 text-sm">
-                <div className="flex items-center gap-2">
-                  <span className="text-text-dim w-5">P{p.seat}</span>
-                  <span className={p.username === username ? "text-you" : "text-text-default"}>
-                    {p.username}
-                    {p.username === username && <span className="text-xs ml-1">(you)</span>}
-                  </span>
-                </div>
-                {p.isBot && (
-                  <span className="text-text-dim text-xs">bot</span>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* House Rules */}
-      <div className="w-full max-w-md border border-border-term mb-4">
-        <div className="border-b border-border-term px-3 py-1 text-text-dim text-xs">
-          {"// "}house rules
         </div>
-        <div className="px-3 py-2">
-          <label className="flex items-center justify-between text-sm">
-            <span className="text-text-default">Refund coins on challenge</span>
-            {isHost ? (
-              <button
-                onClick={() => {
-                  const updated = { ...houseRules, refundOnChallenge: !houseRules.refundOnChallenge };
-                  setHouseRules(updated);
-                  game.send({ type: "house_rules", houseRules: updated });
-                }}
-                className={`px-2 py-0.5 text-xs border transition-colors ${
-                  houseRules.refundOnChallenge
-                    ? "border-you text-you"
-                    : "border-border-term text-text-dim"
-                }`}
-              >
-                {houseRules.refundOnChallenge ? "ON" : "OFF"}
-              </button>
-            ) : (
-              <span className={`text-xs ${houseRules.refundOnChallenge ? "text-you" : "text-text-dim"}`}>
-                {houseRules.refundOnChallenge ? "ON" : "OFF"}
-              </span>
-            )}
-          </label>
-          <p className="text-text-dim text-xs mt-1">
-            Refund coins when action claim is successfully challenged (official rule)
-          </p>
-        </div>
-      </div>
-
-      {/* Bot configuration */}
-      <div className="w-full max-w-md border border-border-term mb-4">
-        <div className="border-b border-border-term px-3 py-1 text-text-dim text-xs">
-          {"// "}bot fill
-        </div>
-        <div className="px-3 py-2 space-y-3">
-          <div className="flex items-center justify-between text-sm">
-            <span className="text-text-default">Fill with bots</span>
-            {isHost ? (
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => {
-                    const next = Math.max(0, numBots - 1);
-                    setNumBots(next);
-                    game.send({ type: "bot_config", numBots: next, botDifficulty });
-                  }}
-                  className="text-text-dim hover:text-text-bright px-2"
-                >
-                  ◀
-                </button>
-                <span className="text-you w-4 text-center">{numBots}</span>
-                <button
-                  onClick={() => {
-                    const humanCount = players.filter(p => !p.isBot).length;
-                    const maxBots = numPlayers - humanCount;
-                    const next = Math.min(maxBots, numBots + 1);
-                    setNumBots(next);
-                    game.send({ type: "bot_config", numBots: next, botDifficulty });
-                  }}
-                  className="text-text-dim hover:text-text-bright px-2"
-                >
-                  ▶
-                </button>
-              </div>
-            ) : (
-              <span className="text-you text-xs">{numBots}</span>
-            )}
-          </div>
-          {numBots > 0 && (
-            <div className="flex items-center justify-between text-sm">
-              <span className="text-text-default">Difficulty</span>
-              {isHost ? (
-                <div className="flex gap-2">
-                  {(["easy", "medium", "hard"] as const).map((d) => (
-                    <button
-                      key={d}
-                      onClick={() => {
-                        setBotDifficulty(d);
-                        game.send({ type: "bot_config", numBots, botDifficulty: d });
-                      }}
-                      className={`px-2 py-0.5 text-xs border transition-colors ${
-                        botDifficulty === d
-                          ? "border-you text-you"
-                          : "border-border-term text-text-dim hover:text-text-default"
-                      }`}
-                    >
-                      {d}
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <span className="text-you text-xs">{botDifficulty}</span>
-              )}
-            </div>
-          )}
-          <p className="text-text-dim text-xs">
-            {numBots > 0
-              ? `${numBots} bot${numBots !== 1 ? "s" : ""} will join when game starts`
-              : `${numPlayers - players.filter(p => !p.isBot).length} seat${numPlayers - players.filter(p => !p.isBot).length !== 1 ? "s" : ""} open`}
-          </p>
-        </div>
-      </div>
-
-      {/* Host controls */}
-      <div className="w-full max-w-md space-y-2">
-        {isHost && (
-          <button
-            onClick={handleStart}
-            disabled={players.length < 1}
-            className="w-full border border-you text-you py-2 hover:bg-you/10 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-          >
-            {">> START GAME <<"}
-          </button>
-        )}
-        <button
-          onClick={() => router.push("/")}
-          className="w-full text-text-dim hover:text-text-default text-sm"
-        >
-          {"< leave"} <span className="text-text-dim text-xs">(ESC)</span>
-        </button>
-      </div>
+      )}
     </div>
   );
+}
+
+function NamePrompt({ code, onSubmit }: { code: string; onSubmit: (name: string) => void }) {
+  const [value, setValue] = useState("");
+  const ref = useRef<HTMLInputElement>(null);
+  const trimmed = value.trim();
+  return (
+    <Centered>
+      <form
+        className="w-full max-w-sm border border-border-term p-4 space-y-3 text-left"
+        onSubmit={(e) => { e.preventDefault(); if (trimmed) onSubmit(trimmed); }}
+      >
+        <h1 className="text-you text-lg">Join room {code}</h1>
+        <label className="flex items-center gap-2 border border-border-term p-3 focus-within:border-cursor">
+          <span className="text-text-dim">name:</span>
+          <input
+            ref={ref}
+            autoFocus
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            maxLength={20}
+            autoComplete="nickname"
+            aria-label="Your name"
+            placeholder="type your name"
+            className="flex-1 min-w-0 bg-transparent outline-none text-you placeholder:text-text-dim"
+          />
+        </label>
+        <button type="submit" disabled={!trimmed} className="w-full border border-you text-you py-2 hover:bg-you/10 disabled:opacity-30">
+          {">> JOIN <<"}
+        </button>
+      </form>
+    </Centered>
+  );
+}
+
+function Centered({ children }: { children: React.ReactNode }) {
+  return <main className="min-h-dvh flex flex-col items-center justify-center p-4 text-center">{children}</main>;
+}
+
+function Banner({ tone, children }: { tone: "info" | "warn" | "error"; children: React.ReactNode }) {
+  const cls = tone === "error" ? "border-dead text-dead" : tone === "warn" ? "border-coin-loss text-text-default" : "border-you text-text-default";
+  return (
+    <div role={tone === "error" ? "alert" : "status"} className={`fixed top-0 inset-x-0 z-40 bg-bg border-b ${cls} px-3 py-1.5 text-center text-sm flex items-center justify-center gap-2`}>
+      {children}
+    </div>
+  );
+}
+
+function ConnectionDot({ status }: { status: string }) {
+  const color = status === "connected" ? "bg-coin-gain" : status === "closed" ? "bg-dead" : "bg-cursor animate-pulse";
+  return <span className={`inline-block w-2 h-2 rounded-full ${color}`} aria-hidden />;
 }

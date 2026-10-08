@@ -1,15 +1,29 @@
-// GameRoom Durable Object
-// One instance per game. Runs the WASM sim, manages WebSocket connections,
-// runs bot turns, broadcasts state.
+// GameRoom Durable Object — one per room code.
+//
+// - WebSocket Hibernation API: the DO can be evicted between messages without
+//   dropping sockets; per-socket identity lives in the socket attachment.
+// - All room state (roster, rules, engine bytes, history) is persisted to DO
+//   storage after every change, so eviction, deploys and crashes don't lose games.
+// - Bots, response timers, away-player takeover, lobby cleanup and room expiry
+//   are all driven by a single alarm, so bot moves are paced and visible.
+// - Seats are bound to a client-generated secret id (cid) that is never sent to
+//   other clients; knowing someone's display name is not enough to take a seat.
 
-import { CoupWasm } from "./wasm-bridge.js";
-import { chooseBotAction, pickBotName } from "./bot.js";
+import { CoupGame, loadEngine } from "./engine.js";
+import { chooseBotAction, pickBotName, type BotView } from "./bot.js";
 import {
   type Env,
   type BotDifficulty,
   type HouseRules,
-  type PlayerSlot,
+  type HistoryEntry,
+  type HistoryKind,
+  type GameResult,
+  type GameView,
+  type LobbySeat,
+  type PlayerView,
   type ServerMessage,
+  PROTOCOL,
+  DEFAULT_RULES,
   CARD_NAMES,
   PHASE_NAMES,
   PHASE_MAIN_ACTION,
@@ -24,893 +38,994 @@ import {
   ACTION_EXCHANGE,
   ACTION_CHALLENGE,
   ACTION_PASS,
-  ACTION_BLOCK_CONTESSA,
-  ACTION_BLOCK_CAPTAIN,
-  ACTION_BLOCK_AMBASSADOR,
-  ACTION_BLOCK_DUKE,
-  ACTION_COUP_P0,
-  ACTION_STEAL_P0,
-  ACTION_ASSASSINATE_P0,
-  ACTION_DISCARD_SLOT0,
-  getValidActionsFromMask,
+  isCoup,
+  isSteal,
+  isAssassinate,
+  isBlock,
+  isDifficulty,
   actionLabel,
   actionTarget,
   claimedRole,
-  NUM_ACTIONS,
+  blockRole,
 } from "./types.js";
 
-interface PlayerConn {
-  ws: WebSocket;
-  username: string;
-  seat: number;
-  lastPing: number;
+export const MAX_SEATS = 6;
+const NAME_MAX = 20;
+const HISTORY_TAIL = 40;
+const HISTORY_CAP = 3000;
+const RESPONSE_TIMEOUT_MS = 20_000; // challenge/block windows for connected humans
+const AWAY_GRACE_MS = 30_000; // disconnected human is auto-played after this
+const LOBBY_DROP_MS = 60_000; // disconnected human is removed from the lobby after this
+const EMPTY_ROOM_TTL_MS = 30 * 60_000; // storage wiped once nobody has been connected this long
+const FORCED_MOVE_DELAY_MS = 800;
+
+/** Close codes understood by the client (4000-4999 are application codes). */
+export const CLOSE_LEFT = 4000;
+export const CLOSE_REPLACED = 4001;
+export const CLOSE_KICKED = 4003;
+export const CLOSE_NOT_FOUND = 4004;
+
+interface Seat {
+  name: string;
+  /** Secret client id of the human in this seat; null for bots. */
+  cid: string | null;
+  bot: BotDifficulty | null;
 }
 
-interface HistoryEntry {
-  text: string;
+interface GameSeat extends Seat {
+  /** Human who forfeited; a bot plays the seat out. */
+  left?: boolean;
+}
+
+interface GameData {
+  bytes: Uint8Array;
+  seats: GameSeat[];
+  history: HistoryEntry[];
+  claims: number[][];
+  eliminated: { seat: number; turn: number }[];
   turn: number;
+  /** Incremented on every applied action — identifies the current decision. */
+  step: number;
+  decisionSince: number;
+  turnAction: number;
+  turnActor: number;
+  turnCoins: number[];
+  turnBlock: { seat: number; card: number } | null;
+  turnBlockFailed: boolean;
+  /** When the server will act for the current decision (bot / timeout / away). */
+  due: number | null;
 }
 
-export class GameRoom {
-  private state: DurableObjectState;
-  private env: Env;
+interface RoomData {
+  code: string;
+  createdAt: number;
+  hostCid: string | null;
+  rules: HouseRules;
+  seats: Seat[];
+  autoStart: boolean;
+  /** cid -> time their last socket closed (absent while connected). */
+  offlineSince: Record<string, number>;
+  /** Last time any socket was connected (for expiry). */
+  lastSeen: number;
+  game: GameData | null;
+}
 
-  // Room config
-  private code = "";
-  private numPlayers = 0;
-  private numBots = 0;
-  private botDifficulty: BotDifficulty = "medium";
-  private houseRules: HouseRules = { refundOnChallenge: true };
-  private initialized = false;
-  private gameStarted = false;
+interface Attachment {
+  cid: string | null;
+  name: string | null;
+}
 
-  // Player management
-  private players: PlayerSlot[] = [];
-  private connections = new Map<WebSocket, PlayerConn>();
-  private hostWs: WebSocket | null = null;
-  private hostUsername: string | null = null;
+export interface InitBody {
+  code: string;
+  hostCid: string;
+  rules?: Partial<HouseRules>;
+  bots?: BotDifficulty[];
+  autoStart?: boolean;
+}
 
-  // Game engine
-  private wasm: CoupWasm | null = null;
-  private turnCounter = 0;
-  private history: HistoryEntry[] = [];
-  private pendingPasses: string[] = [];
-  private claimedRoles = new Map<number, Set<string>>(); // seat → claimed role names
-  private pendingChallenge: { challenger: number; claimant: number; claimedCard: string } | null = null;
-  private lastBlocker: { seat: number; cardName: string } | null = null;
-  private eliminationOrder: { seat: number; turn: number }[] = [];
-  private staleCheckInterval: ReturnType<typeof setInterval> | null = null;
+const CID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 
-  constructor(state: DurableObjectState, env: Env) {
-    this.state = state;
-    this.env = env;
+export function sanitizeName(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  // Strip control, zero-width and bidi-override characters (name spoofing).
+  const bad = (c: number) => c < 0x20 || (c >= 0x7f && c <= 0x9f) || (c >= 0x200b && c <= 0x200f) || (c >= 0x2028 && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069);
+  return Array.from(raw).filter((ch) => !bad(ch.codePointAt(0)!)).join("").replace(/\s+/g, " ").trim().slice(0, NAME_MAX);
+}
+
+function sanitizeRules(r: unknown, base: HouseRules): HouseRules {
+  const o = (r && typeof r === "object" ? r : {}) as Partial<HouseRules>;
+  return {
+    refundOnChallenge: typeof o.refundOnChallenge === "boolean" ? o.refundOnChallenge : base.refundOnChallenge,
+    responseTimer: typeof o.responseTimer === "boolean" ? o.responseTimer : base.responseTimer,
+  };
+}
+
+function uniqueName(want: string, taken: string[]): string {
+  const used = new Set(taken.map((n) => n.toLowerCase()));
+  if (!used.has(want.toLowerCase())) return want;
+  for (let i = 2; ; i++) {
+    const n = `${want.slice(0, NAME_MAX - 3)} ${i}`;
+    if (!used.has(n.toLowerCase())) return n;
   }
+}
+
+function shuffle<T>(xs: T[]): T[] {
+  const a = [...xs];
+  const r = new Uint32Array(a.length);
+  crypto.getRandomValues(r);
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = r[i] % (i + 1);
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+export class GameRoom implements DurableObject {
+  private ctx: DurableObjectState;
+  private room: RoomData | null = null;
+  private game: CoupGame | null = null;
+  /** Sockets whose close we're handling; getWebSockets() may still list them. */
+  private closing = new WeakSet<WebSocket>();
+
+  constructor(ctx: DurableObjectState, _env: Env) {
+    this.ctx = ctx;
+    // Answer heartbeats without waking the object.
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('{"type":"ping"}', '{"type":"pong"}'));
+    ctx.blockConcurrencyWhile(async () => {
+      await loadEngine();
+      this.room = (await ctx.storage.get<RoomData>("room")) ?? null;
+      if (this.room?.game) {
+        try {
+          this.game = CoupGame.restore(this.room.game.bytes);
+        } catch (e) {
+          // Engine layout changed under a running game (deploy mid-game): drop the game, keep the lobby.
+          console.error("[GameRoom] could not restore game:", (e as Error).message);
+          this.room.game = null;
+          this.save();
+        }
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // HTTP entry points
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/init" && request.method === "POST") {
-      return this.handleInit(request);
+      if (this.room) return new Response("exists", { status: 409 });
+      const body = (await request.json()) as InitBody;
+      const now = Date.now();
+      const seats: Seat[] = [];
+      for (const d of (body.bots ?? []).slice(0, MAX_SEATS - 1)) {
+        seats.push({ name: pickBotName(seats.map((s) => s.name)), cid: null, bot: isDifficulty(d) ? d : "medium" });
+      }
+      this.room = {
+        code: body.code,
+        createdAt: now,
+        hostCid: body.hostCid,
+        rules: sanitizeRules(body.rules, DEFAULT_RULES),
+        seats,
+        autoStart: !!body.autoStart,
+        offlineSince: {},
+        lastSeen: now,
+        game: null,
+      };
+      this.save();
+      await this.scheduleAlarm();
+      return new Response("ok");
     }
 
     if (url.pathname === "/ws") {
+      if (request.headers.get("Upgrade") !== "websocket") {
+        return new Response("Expected WebSocket", { status: 426 });
+      }
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
-      server.accept();
-      server.addEventListener("message", (event) => {
-        this.handleWsMessage(server, event.data);
-      });
-      server.addEventListener("close", () => {
-        this.handleWsClose(server);
-      });
-      server.addEventListener("error", () => {
-        this.handleWsError(server);
-      });
+      this.ctx.acceptWebSocket(server);
+      server.serializeAttachment({ cid: null, name: null } satisfies Attachment);
+      if (!this.room) {
+        this.send(server, { type: "error", message: "Room not found. It may have expired.", fatal: true });
+        server.close(CLOSE_NOT_FOUND, "Room not found");
+      } else {
+        this.send(server, { type: "welcome", protocol: PROTOCOL, code: this.room.code });
+      }
       return new Response(null, { status: 101, webSocket: client });
     }
 
     return new Response("Not found", { status: 404 });
   }
 
-  private async handleInit(request: Request): Promise<Response> {
-    if (this.initialized) {
-      return new Response("Already initialized", { status: 409 });
-    }
+  // ---------------------------------------------------------------------------
+  // WebSocket handlers (hibernation API)
 
-    const body = await request.json() as any;
-    this.code = body.code;
-    this.numPlayers = body.numPlayers;
-    this.numBots = body.numBots;
-    this.botDifficulty = body.botDifficulty || "medium";
-    this.houseRules = { refundOnChallenge: true, ...body.houseRules };
-    this.initialized = true;
-    this.players = [];
-
-    return new Response("OK", { status: 200 });
-  }
-
-  private async handleWsMessage(ws: WebSocket, data: string | ArrayBuffer): Promise<void> {
-    if (typeof data !== "string") return;
-
+  async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer): Promise<void> {
+    if (typeof data !== "string" || data.length > 4096) return;
     let msg: any;
     try {
       msg = JSON.parse(data);
     } catch {
-      this.send(ws, { type: "error", message: "Invalid JSON" });
-      return;
+      return this.send(ws, { type: "error", message: "Invalid message" });
     }
-
-    switch (msg.type) {
-      case "join":
-        this.handleJoin(ws, msg);
-        break;
-      case "start":
-        await this.handleStart(ws);
-        break;
-      case "action":
-        await this.handleAction(ws, msg);
-        break;
-      case "house_rules":
-        this.handleHouseRules(ws, msg);
-        break;
-      case "bot_config":
-        this.handleBotConfig(ws, msg);
-        break;
-      case "forfeit":
-        this.handleForfeit(ws);
-        break;
-      case "ping": {
-        const conn = this.connections.get(ws);
-        if (conn) conn.lastPing = Date.now();
-        this.send(ws, { type: "pong" });
-        break;
-      }
-      default:
-        this.send(ws, { type: "error", message: `Unknown message type: ${msg.type}` });
-    }
-  }
-
-  private handleWsClose(ws: WebSocket): void {
-    const conn = this.connections.get(ws);
-    if (conn) {
-      this.connections.delete(ws);
-      if (ws === this.hostWs) this.hostWs = null;
-    }
-  }
-
-  private handleWsError(ws: WebSocket): void {
-    this.connections.delete(ws);
-    if (ws === this.hostWs) this.hostWs = null;
-  }
-
-  private handleHouseRules(ws: WebSocket, msg: any): void {
-    if (ws !== this.hostWs) {
-      this.send(ws, { type: "error", message: "Only host can change house rules" });
-      return;
-    }
-    if (this.gameStarted) {
-      this.send(ws, { type: "error", message: "Cannot change rules after game start" });
-      return;
-    }
-    if (msg.houseRules && typeof msg.houseRules === "object") {
-      this.houseRules = {
-        refundOnChallenge: !!msg.houseRules.refundOnChallenge,
-      };
-      this.broadcastLobby();
-    }
-  }
-
-  private handleBotConfig(ws: WebSocket, msg: any): void {
-    if (ws !== this.hostWs) {
-      this.send(ws, { type: "error", message: "Only host can change bot config" });
-      return;
-    }
-    if (this.gameStarted) {
-      this.send(ws, { type: "error", message: "Cannot change bot config after game start" });
-      return;
-    }
-    const humanCount = this.players.filter(p => !p.isBot).length;
-    const maxBots = this.numPlayers - humanCount;
-
-    if (typeof msg.numBots === "number") {
-      this.numBots = Math.max(0, Math.min(maxBots, msg.numBots));
-    }
-    if (msg.botDifficulty === "easy" || msg.botDifficulty === "medium" || msg.botDifficulty === "hard") {
-      this.botDifficulty = msg.botDifficulty;
-    }
-    this.broadcastLobby();
-  }
-
-  private handleForfeit(ws: WebSocket): void {
-    const conn = this.connections.get(ws);
-    if (!conn) return;
-
-    if (!this.gameStarted) {
-      this.send(ws, { type: "error", message: "No game in progress" });
-      return;
-    }
-
-    const name = conn.username;
-
-    // Clean up WASM
-    if (this.wasm) {
-      this.wasm.dispose();
-      this.wasm = null;
-    }
-
-    // Broadcast forfeited to all players
-    const msg: ServerMessage = { type: "forfeited", by: name };
-    for (const [w] of this.connections) {
-      this.send(w, msg);
-    }
-
-    // Fully reset room state — everyone will re-join from lobby
-    this.stopStaleCheck();
-    this.gameStarted = false;
-    this.history = [];
-    this.turnCounter = 0;
-    this.pendingPasses = [];
-    this.claimedRoles.clear();
-    this.eliminationOrder = [];
-    this.players = [];
-    this.connections.clear();
-    this.hostWs = null;
-  }
-
-  // ---- Lobby ----
-
-  private handleJoin(ws: WebSocket, msg: any): void {
-    const { username } = msg;
-    if (!username || typeof username !== "string") {
-      this.send(ws, { type: "error", message: "Username required" });
-      return;
-    }
-
-    if (!this.initialized) {
-      this.send(ws, { type: "error", message: "Room not initialized" });
-      return;
-    }
-
-    if (this.gameStarted) {
-      // Allow reconnection if the username matches an existing player
-      const existing = this.players.find(p => p.username === username && !p.isBot);
-      if (existing) {
-        const conn: PlayerConn = { ws, username, seat: existing.seat, lastPing: Date.now() };
-        this.connections.set(ws, conn);
-        this.startStaleCheck();
-        this.broadcastState();
-        return;
-      }
-      this.send(ws, { type: "error", message: "Game already in progress" });
-      return;
-    }
-
-    const humanCount = this.players.filter(p => !p.isBot).length;
-    if (humanCount >= this.numPlayers) {
-      this.send(ws, { type: "error", message: "Room is full" });
-      return;
-    }
-
-    // Auto-reduce bot count if needed to make room for humans
-    const maxBots = this.numPlayers - (humanCount + 1);
-    if (this.numBots > maxBots) {
-      this.numBots = Math.max(0, maxBots);
-    }
-
-    // Assign next available seat
-    const takenSeats = new Set(this.players.map(p => p.seat));
-    let seat = 0;
-    while (takenSeats.has(seat)) seat++;
-
-    const slot: PlayerSlot = {
-      username,
-      seat,
-      isBot: false,
-      ready: true,
-    };
-    this.players.push(slot);
-
-    const conn: PlayerConn = { ws, username, seat, lastPing: Date.now() };
-    this.connections.set(ws, conn);
-    this.startStaleCheck();
-
-    // Restore host by username, or assign first human as host
-    if (this.hostUsername === username) {
-      this.hostWs = ws;
-    } else if (this.hostWs === null) {
-      this.hostWs = ws;
-      this.hostUsername = username;
-    }
-
-    this.broadcastLobby();
-  }
-
-  private broadcastLobby(): void {
-    const playerList = this.players.map(p => ({
-      username: p.username,
-      seat: p.seat,
-      isBot: p.isBot,
-      ready: p.ready,
-    }));
-
-    for (const [ws] of this.connections) {
-      this.send(ws, {
-        type: "lobby",
-        code: this.code,
-        players: playerList,
-        houseRules: this.houseRules,
-        isHost: ws === this.hostWs,
-        numBots: this.numBots,
-        botDifficulty: this.botDifficulty,
-        numPlayers: this.numPlayers,
-      });
-    }
-  }
-
-  // ---- Game Start ----
-
-  private async handleStart(ws: WebSocket): Promise<void> {
-    if (ws !== this.hostWs) {
-      this.send(ws, { type: "error", message: "Only the host can start the game" });
-      return;
-    }
-
-    if (this.gameStarted) {
-      this.send(ws, { type: "error", message: "Game already started" });
-      return;
-    }
-
-    const humanCount = this.players.filter(p => !p.isBot).length;
-    if (humanCount === 0) {
-      this.send(ws, { type: "error", message: "Need at least one human player" });
-      return;
-    }
+    if (!this.room || !msg || typeof msg !== "object") return;
 
     try {
-      // Add bots to fill remaining seats
-      const takenSeats = new Set(this.players.map(p => p.seat));
-      for (let i = 0; i < this.numBots; i++) {
-        let seat = 0;
-        while (takenSeats.has(seat)) seat++;
-        takenSeats.add(seat);
-
-        this.players.push({
-          username: pickBotName(),
-          seat,
-          isBot: true,
-          botDifficulty: this.botDifficulty,
-          ready: true,
-        });
+      switch (msg.type) {
+        case "join": this.onJoin(ws, msg); break;
+        case "leave": this.onLeave(ws); break;
+        case "start": this.onStart(ws); break;
+        case "add_bot": this.onAddBot(ws, msg); break;
+        case "remove_seat": this.onRemoveSeat(ws, msg); break;
+        case "set_bot": this.onSetBot(ws, msg); break;
+        case "rules": this.onRules(ws, msg); break;
+        case "action": this.onAction(ws, msg); break;
+        case "ping": this.send(ws, { type: "pong" }); return;
+        default: this.send(ws, { type: "error", message: "Unknown message type" }); return;
       }
-
-      // Sort players by seat and re-assign sequential seats
-      this.players.sort((a, b) => a.seat - b.seat);
-      for (let i = 0; i < this.players.length; i++) {
-        // Update connection seats to match
-        for (const [, conn] of this.connections) {
-          if (conn.username === this.players[i].username && conn.seat === this.players[i].seat) {
-            conn.seat = i;
-          }
-        }
-        this.players[i].seat = i;
-      }
-
-      // Initialize WASM with actual player count
-      const actualPlayers = this.players.length;
-      this.wasm = await CoupWasm.create(actualPlayers);
-      if (this.houseRules.refundOnChallenge === false) {
-        this.wasm.setRefundOnChallenge(false);
-      }
-
-      this.gameStarted = true;
-
-      // Resolve initial chance nodes (deal phase)
-      this.resolveChanceNodes();
-
-      // Run bot turns if it's a bot's turn first
-      this.runBotTurns();
-
-      this.broadcastState();
-    } catch (e: any) {
-      console.error("[GameRoom] Start error:", e.message, e.stack);
-      this.send(ws, { type: "error", message: "Failed to start game: " + e.message });
+    } catch (e) {
+      console.error("[GameRoom] handler error:", (e as Error).message, (e as Error).stack);
+      this.send(ws, { type: "error", message: "Server error — please retry." });
     }
+    await this.scheduleAlarm();
   }
 
-  private async initWasm(): Promise<void> {
-    this.wasm = await CoupWasm.create(this.numPlayers);
-    // Default is ON (official rules). Only disable if explicitly set to false.
-    if (this.houseRules.refundOnChallenge === false) {
-      this.wasm.setRefundOnChallenge(false);
-    }
+  async webSocketClose(ws: WebSocket, code: number): Promise<void> {
+    try { ws.close(code === 1005 || code === 1006 ? 1000 : code, "closed"); } catch { /* already closed */ }
+    await this.onSocketGone(ws);
   }
 
-  // ---- Game Actions ----
-
-  private async handleAction(ws: WebSocket, msg: any): Promise<void> {
-    const conn = this.connections.get(ws);
-    if (!conn) {
-      this.send(ws, { type: "error", message: "Not connected" });
-      return;
-    }
-
-    if (!this.gameStarted || !this.wasm) {
-      this.send(ws, { type: "error", message: "Game not started" });
-      return;
-    }
-
-    if (this.wasm.isDone()) {
-      this.send(ws, { type: "error", message: "Game is over" });
-      return;
-    }
-
-    const action = Number(msg.action);
-    if (isNaN(action) || action < 0 || action >= NUM_ACTIONS) {
-      this.send(ws, { type: "error", message: "Invalid action" });
-      return;
-    }
-
-    // Verify it's this player's turn
-    const activePlayer = this.wasm.getActivePlayer();
-    if (conn.seat !== activePlayer) {
-      this.send(ws, { type: "error", message: "Not your turn" });
-      return;
-    }
-
-    // Verify action is valid
-    const validMask = this.wasm.getValidActions();
-    if (!((validMask >>> action) & 1)) {
-      this.send(ws, { type: "error", message: "Action not valid" });
-      return;
-    }
-
-    try {
-      this.applyAction(action);
-      this.resolveChanceNodes();
-      this.runBotTurns();
-      this.broadcastState();
-
-      if (this.wasm.isDone()) {
-        this.broadcastGameOver();
-      }
-    } catch (e: any) {
-      console.error("[GameRoom] action error:", e.message, e.stack);
-      this.send(ws, { type: "error", message: "Action failed: " + e.message });
-    }
+  async webSocketError(ws: WebSocket): Promise<void> {
+    await this.onSocketGone(ws);
   }
 
-  private applyAction(action: number): void {
-    if (!this.wasm) return;
-
-    const activePlayer = this.wasm.getActivePlayer();
-    const playerName = this.getPlayerName(activePlayer);
-
-    // Log the action
-    this.logAction(action, activePlayer, playerName);
-
-    // Snapshot alive players before the action
-    const aliveBefore = new Set<number>();
-    for (const p of this.players) {
-      if (this.wasm.playerIsAlive(p.seat)) aliveBefore.add(p.seat);
+  private async onSocketGone(ws: WebSocket): Promise<void> {
+    this.closing.add(ws);
+    if (!this.room) return;
+    const { cid } = this.attachment(ws);
+    if (cid && !this.socketsFor(cid, ws).length && this.isSeated(cid)) {
+      this.room.offlineSince[cid] = Date.now();
+      this.room.lastSeen = Date.now();
+      this.save();
+      this.broadcast();
     }
-
-    // Apply via step_with_rng (handles chance internally for simple cases)
-    this.wasm.stepWithRng(action);
-
-    // Detect newly eliminated players
-    for (const seat of aliveBefore) {
-      if (!this.wasm.playerIsAlive(seat)) {
-        this.eliminationOrder.push({ seat, turn: this.turnCounter });
-      }
-    }
-
-    // Track turn changes
-    if (this.wasm.getPhase() === PHASE_MAIN_ACTION) {
-      this.turnCounter++;
-    }
+    await this.scheduleAlarm();
   }
 
-  private flushPasses(): void {
-    if (this.pendingPasses.length === 0) return;
-    const names = this.pendingPasses.splice(0);
-    const text = names.length === 1
-      ? `${names[0]} passes.`
-      : `${names.join(", ")} pass.`;
-    this.history.push({ text, turn: this.turnCounter });
-  }
+  // ---------------------------------------------------------------------------
+  // Lobby
 
-  private logAction(action: number, seat: number, name: string): void {
-    const playerNames = this.getPlayerNames();
+  private onJoin(ws: WebSocket, msg: any): void {
+    const room = this.room!;
+    const cid = typeof msg.cid === "string" && CID_RE.test(msg.cid) ? msg.cid : null;
+    if (!cid) return this.send(ws, { type: "error", message: "Invalid client id", fatal: true });
+    const name = sanitizeName(msg.name) || "Player";
 
-    // Collapse consecutive passes
-    if (action === ACTION_PASS) {
-      this.pendingPasses.push(name);
-      return;
+    // One live socket per client id: a newer tab takes over.
+    for (const other of this.socketsFor(cid, ws)) {
+      this.send(other, { type: "error", message: "This game was opened in another tab.", fatal: true });
+      try { other.close(CLOSE_REPLACED, "Replaced by another tab"); } catch { /* closed */ }
     }
-    this.flushPasses();
+    ws.serializeAttachment({ cid, name } satisfies Attachment);
+    delete room.offlineSince[cid];
+    room.lastSeen = Date.now();
 
-    // Suppress individual exchange discards
-    if (this.wasm && this.wasm.getPhase() === PHASE_EXCHANGE_DISCARD
-        && action >= ACTION_DISCARD_SLOT0 && action <= ACTION_DISCARD_SLOT0 + 3) {
+    if (room.game) {
+      // Reconnect (or spectate). Seat binding is by secret cid, never by name.
+      this.save();
+      this.sendState(ws, true);
+      this.broadcast(ws);
       return;
     }
 
-    let text: string;
-
-    if (action === ACTION_INCOME) {
-      text = `${name} takes Income. +1 coin.`;
-    } else if (action === ACTION_FOREIGN_AID) {
-      text = `${name} takes Foreign Aid. +2 coins.`;
-    } else if (action === ACTION_TAX) {
-      text = `${name} claims Duke for Tax. +3 coins.`;
-    } else if (action === ACTION_EXCHANGE) {
-      text = `${name} claims Ambassador for Exchange.`;
-    } else if (action >= ACTION_COUP_P0 && action <= ACTION_COUP_P0 + 5) {
-      const t = action - ACTION_COUP_P0;
-      text = `${name} Coups ${playerNames[t]}. -7 coins.`;
-    } else if (action >= ACTION_STEAL_P0 && action <= ACTION_STEAL_P0 + 5) {
-      const t = action - ACTION_STEAL_P0;
-      text = `${name} claims Captain to Steal from ${playerNames[t]}.`;
-    } else if (action >= ACTION_ASSASSINATE_P0 && action <= ACTION_ASSASSINATE_P0 + 5) {
-      const t = action - ACTION_ASSASSINATE_P0;
-      text = `${name} claims Assassin to Assassinate ${playerNames[t]}. -3 coins.`;
-    } else if (action === ACTION_CHALLENGE) {
-      text = `${name} challenges!`;
-      // Track who challenged whom for result logging
-      if (this.wasm) {
-        const phase = this.wasm.getPhase();
-        if (phase === PHASE_CHALLENGE_ACTION) {
-          const turnPlayer = this.wasm.getTurnPlayer();
-          const pendingAction = this.wasm.getPendingAction();
-          const role = claimedRole(pendingAction);
-          const cardName = role != null ? (CARD_NAMES[role] ?? null) : null;
-          if (cardName) {
-            this.pendingChallenge = { challenger: seat, claimant: turnPlayer, claimedCard: cardName };
-          }
-        } else if (phase === PHASE_CHALLENGE_BLOCK && this.lastBlocker) {
-          this.pendingChallenge = { challenger: seat, claimant: this.lastBlocker.seat, claimedCard: this.lastBlocker.cardName };
-        }
-      }
-    } else if (action === ACTION_BLOCK_CONTESSA) {
-      text = `${name} blocks with Contessa.`;
-      this.lastBlocker = { seat, cardName: "Contessa" };
-    } else if (action === ACTION_BLOCK_CAPTAIN) {
-      text = `${name} blocks with Captain.`;
-      this.lastBlocker = { seat, cardName: "Captain" };
-    } else if (action === ACTION_BLOCK_AMBASSADOR) {
-      text = `${name} blocks with Ambassador.`;
-      this.lastBlocker = { seat, cardName: "Ambassador" };
-    } else if (action === ACTION_BLOCK_DUKE) {
-      text = `${name} blocks with Duke.`;
-      this.lastBlocker = { seat, cardName: "Duke" };
-    } else if (action >= ACTION_DISCARD_SLOT0 && action <= ACTION_DISCARD_SLOT0 + 3) {
-      text = `${name} loses a card.`;
+    let seat = room.seats.find((s) => s.cid === cid);
+    if (seat) {
+      if (seat.name !== name) seat.name = uniqueName(name, room.seats.filter((s) => s !== seat).map((s) => s.name));
+    } else if (room.seats.length >= MAX_SEATS) {
+      this.send(ws, { type: "error", message: "This room is full — you're watching." });
     } else {
-      text = `${name} performs action ${action}.`;
+      seat = { name: uniqueName(name, room.seats.map((s) => s.name)), cid, bot: null };
+      // The creator always sits first; everyone else joins in arrival order.
+      if (cid === room.hostCid) room.seats.unshift(seat);
+      else room.seats.push(seat);
     }
+    this.ensureHost();
+    this.save();
 
-    // Track claimed roles (persists across full game, unlike history which is sliced)
-    const claimed = claimedRole(action);
-    let claimName: string | null = claimed != null ? (CARD_NAMES[claimed] ?? null) : null;
-    if (!claimName) {
-      if (action === ACTION_BLOCK_CONTESSA) claimName = "Contessa";
-      else if (action === ACTION_BLOCK_CAPTAIN) claimName = "Captain";
-      else if (action === ACTION_BLOCK_AMBASSADOR) claimName = "Ambassador";
-      else if (action === ACTION_BLOCK_DUKE) claimName = "Duke";
+    if (room.autoStart && cid === room.hostCid && room.seats.length >= 2) {
+      room.autoStart = false;
+      this.startGame();
+      return;
     }
-    if (claimName) {
-      if (!this.claimedRoles.has(seat)) this.claimedRoles.set(seat, new Set());
-      this.claimedRoles.get(seat)!.add(claimName);
-    }
+    this.broadcast();
+  }
 
-    this.history.push({ text, turn: this.turnCounter });
-
-    // Emit challenge result after a discard resolves a challenge
-    if (action >= ACTION_DISCARD_SLOT0 && action <= ACTION_DISCARD_SLOT0 + 3 && this.pendingChallenge) {
-      const pc = this.pendingChallenge;
-      const claimantName = playerNames[pc.claimant];
-      if (seat === pc.challenger) {
-        this.history.push({
-          text: `Challenge failed! ${claimantName} reveals ${pc.claimedCard}. (shuffled back, drew replacement)`,
-          turn: this.turnCounter,
-        });
-      } else if (seat === pc.claimant) {
-        this.history.push({
-          text: `Challenge succeeded! ${claimantName} was bluffing.`,
-          turn: this.turnCounter,
-        });
+  private onLeave(ws: WebSocket): void {
+    const room = this.room!;
+    const { cid } = this.attachment(ws);
+    if (!cid) return;
+    if (room.game) {
+      const gd = room.game;
+      const idx = gd.seats.findIndex((s) => s.cid === cid);
+      if (idx >= 0 && !gd.seats[idx].left) {
+        gd.seats[idx].left = true;
+        if (this.game!.isAlive(idx)) this.log(`${gd.seats[idx].name} left the game — a bot plays their cards.`, "info");
+        const humansRemaining = gd.seats.some((s) => s.cid && !s.left);
+        if (!humansRemaining) {
+          this.abortGame();
+        } else {
+          this.rescheduleDecision();
+        }
       }
-      this.pendingChallenge = null;
+    } else {
+      room.seats = room.seats.filter((s) => s.cid !== cid);
+      this.ensureHost();
+    }
+    ws.serializeAttachment({ cid: null, name: null } satisfies Attachment);
+    this.save();
+    this.broadcast();
+    try { ws.close(CLOSE_LEFT, "Left"); } catch { /* closed */ }
+  }
+
+  private onAddBot(ws: WebSocket, msg: any): void {
+    const room = this.room!;
+    if (!this.requireHostInLobby(ws)) return;
+    if (room.seats.length >= MAX_SEATS) return this.send(ws, { type: "error", message: "Room is full" });
+    const bot: BotDifficulty = isDifficulty(msg.difficulty) ? msg.difficulty : "medium";
+    room.seats.push({ name: pickBotName(room.seats.map((s) => s.name)), cid: null, bot });
+    this.save();
+    this.broadcast();
+  }
+
+  private onRemoveSeat(ws: WebSocket, msg: any): void {
+    const room = this.room!;
+    if (!this.requireHostInLobby(ws)) return;
+    const i = Number(msg.index);
+    const seat = room.seats[i];
+    if (!Number.isInteger(i) || !seat || seat.cid === room.hostCid) return;
+    room.seats.splice(i, 1);
+    if (seat.cid) {
+      for (const s of this.socketsFor(seat.cid)) {
+        this.send(s, { type: "error", message: "The host removed you from the room.", fatal: true });
+        s.serializeAttachment({ cid: null, name: null } satisfies Attachment);
+        try { s.close(CLOSE_KICKED, "Removed by host"); } catch { /* closed */ }
+      }
+      delete room.offlineSince[seat.cid];
+    }
+    this.save();
+    this.broadcast();
+  }
+
+  private onSetBot(ws: WebSocket, msg: any): void {
+    const room = this.room!;
+    if (!this.requireHostInLobby(ws)) return;
+    const seat = room.seats[Number(msg.index)];
+    if (!seat || !seat.bot || !isDifficulty(msg.difficulty)) return;
+    seat.bot = msg.difficulty;
+    this.save();
+    this.broadcast();
+  }
+
+  private onRules(ws: WebSocket, msg: any): void {
+    const room = this.room!;
+    if (!this.requireHostInLobby(ws)) return;
+    room.rules = sanitizeRules(msg.rules, room.rules);
+    this.save();
+    this.broadcast();
+  }
+
+  private onStart(ws: WebSocket): void {
+    const room = this.room!;
+    if (!this.requireHostInLobby(ws)) return;
+    if (room.seats.length < 2) return this.send(ws, { type: "error", message: "Add a bot or invite a friend first — Coup needs at least 2 players." });
+    this.startGame();
+  }
+
+  private requireHostInLobby(ws: WebSocket): boolean {
+    const room = this.room!;
+    const { cid } = this.attachment(ws);
+    if (!cid || cid !== room.hostCid) {
+      this.send(ws, { type: "error", message: "Only the host can do that." });
+      return false;
+    }
+    if (room.game) {
+      this.send(ws, { type: "error", message: "The game has already started." });
+      return false;
+    }
+    return true;
+  }
+
+  /** Host is the creator while seated; otherwise the first seated human (preferring online ones). */
+  private ensureHost(): void {
+    const room = this.room!;
+    const humans = room.seats.filter((s) => s.cid);
+    if (room.hostCid && humans.some((s) => s.cid === room.hostCid)) return;
+    const online = humans.find((s) => this.socketsFor(s.cid!).length > 0);
+    room.hostCid = (online ?? humans[0])?.cid ?? room.hostCid;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Game lifecycle
+
+  private startGame(): void {
+    const room = this.room!;
+    const seats: GameSeat[] = shuffle(room.seats).map((s) => ({ ...s }));
+    this.game = CoupGame.create(seats.length, room.rules.refundOnChallenge);
+    const now = Date.now();
+    room.game = {
+      bytes: this.game.bytes,
+      seats,
+      history: [],
+      claims: seats.map(() => []),
+      eliminated: [],
+      turn: 0,
+      step: 0,
+      decisionSince: now,
+      turnAction: -1,
+      turnActor: -1,
+      turnCoins: seats.map((_, i) => this.game!.coins(i)),
+      turnBlock: null,
+      turnBlockFailed: false,
+      due: null,
+    };
+    this.log(`New game — ${seats.length} players. ${seats[this.game.turnPlayer()].name} goes first.`, "info");
+    this.rescheduleDecision();
+    this.save();
+    this.broadcast();
+  }
+
+  private abortGame(): void {
+    const room = this.room!;
+    if (room.game) {
+      const leftCids = new Set(room.game.seats.filter((s) => s.left && s.cid).map((s) => s.cid!));
+      room.seats = room.seats.filter((s) => !s.cid || !leftCids.has(s.cid));
+    }
+    room.game = null;
+    this.game = null;
+    this.ensureHost();
+  }
+
+  private finishGame(): void {
+    const room = this.room!;
+    const gd = room.game!;
+    const g = this.game!;
+    const winner = g.winner();
+    const names = gd.seats.map((s) => s.name);
+    this.log(`${names[winner] ?? "Nobody"} wins!`, "win");
+
+    const standings: GameResult["standings"] = [];
+    // Survivors (normally just the winner; more only on the turn-limit tiebreak).
+    const survivors = gd.seats.map((_, i) => i).filter((i) => g.isAlive(i))
+      .sort((a, b) => (a === winner ? -1 : b === winner ? 1 : g.influence(b) - g.influence(a) || g.coins(b) - g.coins(a)));
+    for (const i of survivors) standings.push({ seat: i, name: names[i], bot: !!gd.seats[i].bot, alive: true });
+    for (let k = gd.eliminated.length - 1; k >= 0; k--) {
+      const e = gd.eliminated[k];
+      standings.push({ seat: e.seat, name: names[e.seat], bot: !!gd.seats[e.seat].bot, alive: false, eliminatedTurn: e.turn });
+    }
+    const finalCards = gd.seats.map((_, i) => ([0, 1] as const).filter((s) => g.cardAlive(i, s)).map((s) => g.cardType(i, s)));
+    const result: GameResult = { winner, winnerName: names[winner] ?? "Nobody", standings, turns: gd.turn, history: gd.history, finalCards };
+
+    // Final board (with the winning blow) so clients can show it before the results screen.
+    this.broadcast();
+    this.abortGame();
+    // Anyone who was watching joins the next game if there's room.
+    for (const ws of this.sockets()) {
+      const a = this.attachment(ws);
+      if (a.cid && a.name && !room.seats.some((s) => s.cid === a.cid) && room.seats.length < MAX_SEATS) {
+        room.seats.push({ name: uniqueName(a.name, room.seats.map((s) => s.name)), cid: a.cid, bot: null });
+      }
+    }
+    this.ensureHost();
+    this.save();
+    for (const ws of this.sockets()) this.send(ws, { type: "game_over", ...result });
+    this.broadcast();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Actions
+
+  private onAction(ws: WebSocket, msg: any): void {
+    const room = this.room!;
+    const gd = room.game;
+    const g = this.game;
+    if (!gd || !g || g.isDone()) return this.send(ws, { type: "error", message: "No game in progress." });
+    const { cid } = this.attachment(ws);
+    const seat = cid ? gd.seats.findIndex((s) => s.cid === cid && !s.left) : -1;
+    if (seat < 0) return this.send(ws, { type: "error", message: "You're not playing in this game." });
+
+    // Stale clicks (double-submit, timer raced the click) are answered with fresh state, not an error.
+    const step = Number(msg.step);
+    if ((Number.isInteger(step) && step !== gd.step) || g.activePlayer() !== seat) return this.sendState(ws);
+    const action = Number(msg.action);
+    if (!g.isValid(action)) return this.send(ws, { type: "error", message: "That move isn't allowed right now." });
+
+    const exchanging = g.phase() === PHASE_EXCHANGE_DISCARD;
+    this.apply(action);
+    // Exchange returns two cards as two engine steps; the client sends both at once.
+    if (exchanging && msg.then != null && !g.isDone() && g.phase() === PHASE_EXCHANGE_DISCARD && g.activePlayer() === seat) {
+      const then = Number(msg.then);
+      if (g.isValid(then)) this.apply(then);
+    }
+    this.afterChange();
+  }
+
+  /** Persist, schedule the next server-driven move, and broadcast. */
+  private afterChange(): void {
+    if (this.game?.isDone()) return this.finishGame();
+    this.rescheduleDecision();
+    this.save();
+    this.broadcast();
+  }
+
+  private log(text: string, kind: HistoryKind): void {
+    const gd = this.room!.game!;
+    gd.history.push({ turn: gd.turn, text, kind });
+    if (gd.history.length > HISTORY_CAP) gd.history.splice(0, gd.history.length - HISTORY_CAP);
+  }
+
+  /** Apply one engine action for the active player and narrate what happened. */
+  private apply(action: number): void {
+    const g = this.game!;
+    const gd = this.room!.game!;
+    if (!g.isValid(action)) throw new Error(`invalid action ${action}`); // before narrating anything
+    const n = gd.seats.length;
+    const N = (s: number) => gd.seats[s]?.name ?? `Player ${s + 1}`;
+    const phase = g.phase();
+    const actor = g.activePlayer();
+    const tp = g.turnPlayer();
+    const pending = g.pendingAction();
+    const blocker = g.blocker();
+    const blockCard = g.blockCard();
+    const aliveBefore = Array.from({ length: n }, (_, i) => [g.cardAlive(i, 0), g.cardAlive(i, 1)]);
+    const coinsBefore = Array.from({ length: n }, (_, i) => g.coins(i));
+    const claim = (seat: number, role: number | null) => {
+      if (role != null && !gd.claims[seat].includes(role)) gd.claims[seat].push(role);
+    };
+
+    if (phase === PHASE_MAIN_ACTION) {
+      gd.turn++;
+      gd.turnAction = action;
+      gd.turnActor = actor;
+      gd.turnCoins = coinsBefore;
+      gd.turnBlock = null;
+      gd.turnBlockFailed = false;
+      const t = actionTarget(action);
+      if (action === ACTION_INCOME) this.log(`${N(actor)} takes Income (+1).`, "action");
+      else if (action === ACTION_FOREIGN_AID) this.log(`${N(actor)} takes Foreign Aid.`, "action");
+      else if (action === ACTION_TAX) this.log(`${N(actor)} claims Duke to take Tax.`, "claim");
+      else if (action === ACTION_EXCHANGE) this.log(`${N(actor)} claims Ambassador to Exchange.`, "claim");
+      else if (isCoup(action)) this.log(`${N(actor)} pays 7 to Coup ${N(t!)}.`, "action");
+      else if (isSteal(action)) this.log(`${N(actor)} claims Captain to steal from ${N(t!)}.`, "claim");
+      else if (isAssassinate(action)) this.log(`${N(actor)} pays 3 and claims Assassin to assassinate ${N(t!)}.`, "claim");
+      claim(actor, claimedRole(action));
+    } else if (action === ACTION_CHALLENGE && phase === PHASE_CHALLENGE_ACTION) {
+      this.log(`${N(actor)} challenges ${N(tp)}'s ${CARD_NAMES[claimedRole(pending) ?? 0]}!`, "challenge");
+    } else if (action === ACTION_CHALLENGE && phase === PHASE_CHALLENGE_BLOCK) {
+      this.log(`${N(actor)} challenges ${N(blocker)}'s ${CARD_NAMES[blockCard]} block!`, "challenge");
+    } else if (isBlock(action)) {
+      const role = blockRole(action)!;
+      this.log(`${N(actor)} blocks, claiming ${CARD_NAMES[role]}.`, "block");
+      claim(actor, role);
+      gd.turnBlock = { seat: actor, card: role };
+    }
+
+    if (!g.step(action)) {
+      // Callers validate first; the engine refusing means our view of the state is wrong.
+      throw new Error(`engine rejected action ${action} in phase ${phase}`);
+    }
+    gd.step++;
+    gd.decisionSince = Date.now();
+    gd.due = null;
+
+    if (action === ACTION_CHALLENGE) {
+      const claimant = phase === PHASE_CHALLENGE_ACTION ? tp : blocker;
+      const role = phase === PHASE_CHALLENGE_ACTION ? claimedRole(pending) ?? 0 : blockCard;
+      const challengerLoses = g.phase() === PHASE_LOSE_CARD && g.activePlayer() === actor;
+      if (challengerLoses) {
+        this.log(`${N(claimant)} reveals a ${CARD_NAMES[role]} — the challenge fails. It's shuffled back and replaced.`, "reveal");
+      } else {
+        const refund = phase === PHASE_CHALLENGE_ACTION && isAssassinate(pending) && this.room!.rules.refundOnChallenge;
+        this.log(`${N(claimant)} was bluffing — no ${CARD_NAMES[role]}!${refund ? " The 3 coins are returned." : ""}`, "reveal");
+        if (phase === PHASE_CHALLENGE_BLOCK) gd.turnBlockFailed = true;
+      }
+    }
+
+    for (let i = 0; i < n; i++) {
+      for (const s of [0, 1] as const) {
+        if (aliveBefore[i][s] && !g.cardAlive(i, s)) this.log(`${N(i)} loses ${CARD_NAMES[g.cardType(i, s)]}.`, "lose");
+      }
+      if ((aliveBefore[i][0] || aliveBefore[i][1]) && !g.isAlive(i)) {
+        gd.eliminated.push({ seat: i, turn: gd.turn });
+        this.log(`${N(i)} is out of the game.`, "elim");
+      }
+    }
+
+    if (phase === PHASE_EXCHANGE_DISCARD && g.phase() !== PHASE_EXCHANGE_DISCARD) {
+      this.log(`${N(actor)} exchanged cards with the deck.`, "action");
+    }
+
+    // Turn resolved: summarize the outcome of the main action.
+    const turnOver = g.phase() === PHASE_MAIN_ACTION || g.isDone();
+    if (turnOver && phase !== PHASE_MAIN_ACTION) this.summarizeTurn(N);
+  }
+
+  private summarizeTurn(N: (s: number) => string): void {
+    const g = this.game!;
+    const gd = this.room!.game!;
+    const a = gd.turnAction;
+    const actor = gd.turnActor;
+    if (actor < 0) return;
+    const gained = g.coins(actor) - gd.turnCoins[actor];
+    if (gd.turnBlock && !gd.turnBlockFailed) {
+      const what = a === ACTION_FOREIGN_AID ? "Foreign Aid" : isSteal(a) ? "The steal" : isAssassinate(a) ? "The assassination" : "The action";
+      this.log(`${what} is blocked by ${N(gd.turnBlock.seat)}.`, "block");
+      return;
+    }
+    if ((a === ACTION_FOREIGN_AID || a === ACTION_TAX) && gained > 0) this.log(`${N(actor)} collects ${gained} coins.`, "action");
+    else if (isSteal(a) && gained > 0) this.log(`${N(actor)} steals ${gained} from ${N(actionTarget(a)!)}.`, "action");
+    else if (isSteal(a) && gd.turnCoins[actionTarget(a)!] === 0 && g.isAlive(actor)) this.log(`${N(actionTarget(a)!)} had nothing to steal.`, "info");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Server-driven moves: bots, timers, away players
+
+  /** Whether a seated human has been disconnected long enough to be auto-played. */
+  private isAway(s: GameSeat): boolean {
+    if (!s.cid) return false;
+    if (s.left) return true;
+    const off = this.room!.offlineSince[s.cid];
+    return off != null && this.socketsFor(s.cid).length === 0 && Date.now() - off >= AWAY_GRACE_MS;
+  }
+
+  private botDelay(phase: number, step: number): number {
+    const jitter = (step * 7919) % 400;
+    if (phase === PHASE_MAIN_ACTION) return 1100 + jitter;
+    if (phase === PHASE_LOSE_CARD) return 900 + jitter / 2;
+    if (phase === PHASE_EXCHANGE_DISCARD) return 1000;
+    return 450 + jitter / 2; // challenge/block windows
+  }
+
+  /**
+   * When (if ever) the server will act for the current decision, and why.
+   * Derived purely from persisted state + presence, so it is safe to recompute
+   * at any time (reconnects, alarms, hibernation wake-ups).
+   */
+  private plan(): { due: number; kind: "bot" | "timeout" | "forced" } | null {
+    const room = this.room!;
+    const gd = room.game;
+    const g = this.game;
+    if (!gd || !g || g.isDone()) return null;
+    // Pause entirely while nobody is connected; resume when someone returns.
+    if (!this.sockets().some((ws) => this.attachment(ws).cid)) return null;
+    const active = g.activePlayer();
+    const phase = g.phase();
+    const s = gd.seats[active];
+    const botPace = gd.decisionSince + this.botDelay(phase, gd.step);
+    if (!s.cid || s.bot || s.left) return { due: botPace, kind: "bot" };
+    const off = room.offlineSince[s.cid];
+    if (off != null && this.socketsFor(s.cid).length === 0) {
+      return { due: Math.max(off + AWAY_GRACE_MS, botPace), kind: "bot" };
+    }
+    if (phase === PHASE_LOSE_CARD && g.validActions().length === 1) {
+      return { due: gd.decisionSince + FORCED_MOVE_DELAY_MS, kind: "forced" };
+    }
+    if (room.rules.responseTimer && (phase === PHASE_CHALLENGE_ACTION || phase === PHASE_BLOCK || phase === PHASE_CHALLENGE_BLOCK)) {
+      return { due: gd.decisionSince + RESPONSE_TIMEOUT_MS, kind: "timeout" };
+    }
+    return null;
+  }
+
+  private rescheduleDecision(): void {
+    const gd = this.room?.game;
+    if (gd) gd.due = this.plan()?.due ?? null;
+  }
+
+  /** Act for the current decision if the plan says it's due. */
+  private actIfDue(now: number): void {
+    const gd = this.room!.game!;
+    const g = this.game!;
+    const p = this.plan();
+    if (!p || now < p.due - 10) return;
+    const active = g.activePlayer();
+    const phase = g.phase();
+    const valid = g.validActions();
+    let action: number;
+    if (p.kind !== "bot") {
+      // Response timer ran out (pass), or only one legal choice.
+      action = valid.includes(ACTION_PASS) ? ACTION_PASS : valid[0];
+      if (p.kind === "timeout") this.log(`${gd.seats[active].name} ran out of time and passes.`, "info");
+    } else {
+      const s = gd.seats[active];
+      action = chooseBotAction(s.bot ?? "medium", this.botView(active));
+      if (!g.isValid(action)) action = valid.includes(ACTION_PASS) ? ACTION_PASS : valid[0];
+      if (s.cid && !s.left && phase === PHASE_MAIN_ACTION) this.log(`${s.name} is away — a bot is playing for them.`, "info");
+    }
+    this.apply(action);
+    // Bots finish an exchange with their second discard right away.
+    if (!g.isDone() && phase === PHASE_EXCHANGE_DISCARD && g.phase() === PHASE_EXCHANGE_DISCARD && g.activePlayer() === active) {
+      const s = gd.seats[active];
+      let second = chooseBotAction(s.bot ?? "medium", this.botView(active));
+      if (!g.isValid(second)) second = g.validActions()[0];
+      this.apply(second);
+    }
+    this.afterChange();
+  }
+
+  private botView(seat: number): BotView {
+    const g = this.game!;
+    const gd = this.room!.game!;
+    const n = gd.seats.length;
+    const revealed = [0, 0, 0, 0, 0];
+    for (let p = 0; p < n; p++) {
+      for (const s of [0, 1] as const) if (!g.cardAlive(p, s)) revealed[g.cardType(p, s)]++; // dead cards are face-up
+    }
+    const slots: (number | null)[] = [
+      g.cardAlive(seat, 0) ? g.cardType(seat, 0) : null,
+      g.cardAlive(seat, 1) ? g.cardType(seat, 1) : null,
+      null,
+      null,
+    ];
+    if (g.phase() === PHASE_EXCHANGE_DISCARD && g.activePlayer() === seat) {
+      const [a, b] = g.exchangeCards();
+      slots[2] = a;
+      slots[3] = b;
+    }
+    return {
+      seat,
+      numPlayers: n,
+      phase: g.phase(),
+      turnPlayer: g.turnPlayer(),
+      pending: g.pendingAction(),
+      blocker: g.blocker(),
+      blockCard: g.blockCard(),
+      actions: g.validActions(),
+      slots,
+      coins: Array.from({ length: n }, (_, p) => g.coins(p)),
+      influence: Array.from({ length: n }, (_, p) => g.influence(p)),
+      revealed,
+      claims: gd.claims.map((c) => new Set(c)),
+    };
+  }
+
+  async alarm(): Promise<void> {
+    const room = this.room;
+    if (!room) return;
+    const now = Date.now();
+    const connected = this.sockets().length > 0;
+
+    if (!connected && now - room.lastSeen > EMPTY_ROOM_TTL_MS) {
+      await this.ctx.storage.deleteAll();
+      this.room = null;
+      this.game = null;
+      return;
+    }
+    if (connected) room.lastSeen = now;
+
+    if (room.game && this.game) {
+      try {
+        this.actIfDue(now);
+      } catch (e) {
+        console.error("[GameRoom] auto-move failed:", (e as Error).message, (e as Error).stack);
+      }
+      this.rescheduleDecision();
+    }
+
+    if (!room.game) {
+      // Drop humans who disconnected from the lobby and never came back.
+      const before = room.seats.length;
+      room.seats = room.seats.filter((s) => !s.cid || room.offlineSince[s.cid] == null || now - room.offlineSince[s.cid] < LOBBY_DROP_MS);
+      if (room.seats.length !== before) {
+        for (const cid of Object.keys(room.offlineSince)) if (!room.seats.some((s) => s.cid === cid)) delete room.offlineSince[cid];
+        this.ensureHost();
+        this.broadcast();
+      }
+    }
+    this.save();
+    await this.scheduleAlarm();
+  }
+
+  private async scheduleAlarm(): Promise<void> {
+    const room = this.room;
+    if (!room) return;
+    const now = Date.now();
+    const times: number[] = [];
+    if (room.game) {
+      this.rescheduleDecision();
+      if (room.game.due != null) times.push(room.game.due);
+    } else {
+      for (const s of room.seats) {
+        const off = s.cid ? room.offlineSince[s.cid] : undefined;
+        if (off != null) times.push(off + LOBBY_DROP_MS);
+      }
+    }
+    if (this.sockets().length === 0) times.push(room.lastSeen + EMPTY_ROOM_TTL_MS + 1000);
+    else times.push(now + EMPTY_ROOM_TTL_MS); // keep a long-stop alarm so idle rooms eventually expire
+    const next = Math.max(now, Math.min(...times));
+    const current = await this.ctx.storage.getAlarm();
+    if (current !== next) await this.ctx.storage.setAlarm(next);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Views
+
+  private broadcast(except?: WebSocket): void {
+    for (const ws of this.sockets()) {
+      if (ws === except) continue;
+      if (this.room?.game) this.sendState(ws);
+      else this.sendLobby(ws);
     }
   }
 
-  private resolveChanceNodes(): void {
-    if (!this.wasm) return;
-
-    // Resolve all consecutive chance nodes
-    let safety = 100;
-    while (!this.wasm.isDone() && this.wasm.isChanceNode() && safety-- > 0) {
-      this.wasm.resolveChance();
-    }
+  private sendLobby(ws: WebSocket): void {
+    const room = this.room!;
+    const { cid } = this.attachment(ws);
+    const seats: LobbySeat[] = room.seats.map((s) => ({
+      name: s.name,
+      bot: s.bot,
+      online: !s.cid || this.socketsFor(s.cid).length > 0,
+      host: !!s.cid && s.cid === room.hostCid,
+      you: !!cid && s.cid === cid,
+    }));
+    this.send(ws, { type: "lobby", code: room.code, seats, rules: room.rules, isHost: !!cid && cid === room.hostCid, maxSeats: MAX_SEATS });
   }
 
-  private runBotTurns(): void {
-    if (!this.wasm) return;
+  private sendState(ws: WebSocket, fullHistory = false): void {
+    const room = this.room!;
+    const gd = room.game;
+    const g = this.game;
+    if (!gd || !g) return this.sendLobby(ws);
+    const { cid } = this.attachment(ws);
+    const you = cid ? gd.seats.findIndex((s) => s.cid === cid && !s.left) : -1;
+    const names = gd.seats.map((s) => s.name);
+    const phase = g.phase();
+    const active = g.activePlayer();
+    const tp = g.turnPlayer();
+    const done = g.isDone();
+    const pending = phase === PHASE_MAIN_ACTION ? undefined : g.pendingAction();
 
-    let safety = 200; // prevent infinite loops
-    while (!this.wasm.isDone() && safety-- > 0) {
-      // Resolve any chance nodes first
-      this.resolveChanceNodes();
-      if (this.wasm.isDone()) break;
-
-      const active = this.wasm.getActivePlayer();
-      const player = this.players.find(p => p.seat === active);
-
-      if (!player || !player.isBot) break; // Human's turn
-
-      const action = chooseBotAction(
-        player.botDifficulty || this.botDifficulty,
-        active,
-        this.wasm,
-      );
-
-      this.applyAction(action);
-    }
-
-    // Final chance resolution after all bot turns
-    if (!this.wasm.isDone()) {
-      this.resolveChanceNodes();
-    }
-  }
-
-  // ---- State Broadcasting ----
-
-  private broadcastState(): void {
-    if (!this.wasm) return;
-    this.flushPasses();
-
-    for (const [ws, conn] of this.connections) {
-      const stateMsg = this.buildStateForPlayer(conn.seat);
-      this.send(ws, stateMsg);
-    }
-  }
-
-  private buildStateForPlayer(seat: number): ServerMessage {
-    const wasm = this.wasm!;
-    const playerNames = this.getPlayerNames();
-    const phase = wasm.getPhase();
-    const activePlayer = wasm.getActivePlayer();
-    const pendingAction = wasm.getPendingAction();
-
-    // Build your own cards (only the requesting player sees their face-down cards)
-    const yourCards: { type: number; alive: boolean }[] = [];
-    yourCards.push({
-      type: wasm.playerCard0Type(seat),
-      alive: wasm.playerCard0Alive(seat),
-    });
-    yourCards.push({
-      type: wasm.playerCard1Type(seat),
-      alive: wasm.playerCard1Alive(seat),
-    });
-
-    // During exchange discard, if it's our turn, also show exchange cards
-    if (phase === PHASE_EXCHANGE_DISCARD && activePlayer === seat) {
-      yourCards.push({
-        type: wasm.exchangeCard0(),
-        alive: true,
-      });
-      yourCards.push({
-        type: wasm.exchangeCard1(),
-        alive: true,
-      });
-    }
-
-    // Build player list
-    const players = this.players.map(p => {
-      const s = p.seat;
-      const alive = wasm.playerIsAlive(s);
-      const c0Alive = wasm.playerCard0Alive(s);
-      const c1Alive = wasm.playerCard1Alive(s);
-      const c0Type = wasm.playerCard0Type(s);
-      const c1Type = wasm.playerCard1Type(s);
-
-      // Influence = number of alive cards
-      const influence = (c0Alive ? 1 : 0) + (c1Alive ? 1 : 0);
-
-      // Revealed cards: dead cards are visible to all
-      const revealed: { type: number }[] = [];
-      if (!c0Alive) revealed.push({ type: c0Type });
-      if (!c1Alive) revealed.push({ type: c1Type });
-
+    const players: PlayerView[] = gd.seats.map((s, i) => {
+      const revealed: number[] = [];
+      for (const slot of [0, 1] as const) if (!g.cardAlive(i, slot)) revealed.push(g.cardType(i, slot));
+      const human = !!s.cid;
+      const online = !human || this.socketsFor(s.cid!).length > 0;
       return {
-        name: p.username,
-        coins: wasm.playerCoins(s),
-        influence,
+        name: s.name,
+        coins: g.coins(i),
+        influence: g.influence(i),
         revealed,
-        isBot: p.isBot,
-        alive,
+        bot: !!s.bot,
+        online,
+        away: this.isAway(s),
+        alive: g.isAlive(i),
+        claims: gd.claims[i].map((r) => CARD_NAMES[r]),
       };
     });
 
-    // Available actions for this player
-    const availableActions: { id: number; label: string }[] = [];
-    if (activePlayer === seat && !wasm.isDone()) {
-      const mask = wasm.getValidActions();
-      const valid = getValidActionsFromMask(mask);
-      for (const a of valid) {
-        availableActions.push({ id: a, label: actionLabel(a, playerNames) });
-      }
-    }
+    const cards = you >= 0 ? ([0, 1] as const).map((s) => ({ type: g.cardType(you, s), alive: g.cardAlive(you, s) })) : [];
+    const drawn = you >= 0 && phase === PHASE_EXCHANGE_DISCARD && active === you ? g.exchangeCards() : undefined;
+    const actions = you >= 0 && active === you && !done
+      ? g.validActions().map((id) => ({ id, label: actionLabel(id, names, you) }))
+      : [];
 
-    // Build context string matching TUI grammar
-    let context: string | undefined;
-    const phaseName = PHASE_NAMES[phase] || "unknown";
-    const isYou = activePlayer === seat;
-    if (phase === PHASE_MAIN_ACTION) {
-      const coins = wasm.playerCoins(activePlayer);
-      if (isYou) {
-        context = coins >= 10 ? "You must Coup (10+ coins)." : "Your turn. Choose an action:";
-      } else {
-        context = `${playerNames[activePlayer]}'s turn.`;
-      }
-    } else if (phase === PHASE_CHALLENGE_ACTION && pendingAction >= 0) {
-      const turnPlayer = wasm.getTurnPlayer();
-      const tpName = turnPlayer === seat ? "You" : playerNames[turnPlayer];
-      const role = claimedRole(pendingAction);
-      const roleName = role != null ? CARD_NAMES[role] : "?";
-      const target = actionTarget(pendingAction);
-      const targetName = target != null ? (target === seat ? "You" : playerNames[target]) : undefined;
-      if (pendingAction >= ACTION_STEAL_P0 && pendingAction <= ACTION_STEAL_P0 + 5) {
-        context = `${tpName} claims ${roleName} to Steal from ${targetName}. Challenge?`;
-      } else if (pendingAction >= ACTION_ASSASSINATE_P0 && pendingAction <= ACTION_ASSASSINATE_P0 + 5) {
-        context = `${tpName} claims ${roleName} to Assassinate ${targetName}. Challenge?`;
-      } else if (pendingAction === ACTION_TAX) {
-        context = `${tpName} claims ${roleName} for Tax. Challenge?`;
-      } else if (pendingAction === ACTION_EXCHANGE) {
-        context = `${tpName} claims ${roleName} for Exchange. Challenge?`;
-      } else {
-        context = `${tpName} made a claim. Challenge?`;
-      }
-    } else if (phase === PHASE_BLOCK && pendingAction >= 0) {
-      const turnPlayer = wasm.getTurnPlayer();
-      const tpName = turnPlayer === seat ? "You" : playerNames[turnPlayer];
-      const target = actionTarget(pendingAction);
-      const targetName = target != null ? (target === seat ? "You" : playerNames[target]) : undefined;
-      if (pendingAction === ACTION_FOREIGN_AID) {
-        context = `${tpName} attempts Foreign Aid. Block with Duke?`;
-      } else if (pendingAction >= ACTION_STEAL_P0 && pendingAction <= ACTION_STEAL_P0 + 5) {
-        context = `${tpName} Steals from ${targetName}. Block?`;
-      } else if (pendingAction >= ACTION_ASSASSINATE_P0 && pendingAction <= ACTION_ASSASSINATE_P0 + 5) {
-        context = `${tpName} Assassinates ${targetName}. Block?`;
-      } else {
-        context = `${tpName} acted. Block?`;
-      }
-    } else if (phase === PHASE_CHALLENGE_BLOCK) {
-      context = "A block was declared. Challenge the block?";
-    } else if (phase === PHASE_LOSE_CARD) {
-      context = isYou ? "You must lose an influence. Choose a card:" : `${playerNames[activePlayer]} must lose an influence.`;
-    } else if (phase === PHASE_EXCHANGE_DISCARD) {
-      context = isYou ? "Ambassador Exchange. Choose cards to keep:" : `${playerNames[activePlayer]} is exchanging cards.`;
-    } else if (pendingAction >= 0) {
-      const turnPlayer = wasm.getTurnPlayer();
-      context = `${playerNames[turnPlayer]} played ${actionLabel(pendingAction, playerNames)}`;
-    }
+    // Countdown shown for timers that matter to people: your own response timer,
+    // or how long until a disconnected player is auto-played.
+    let deadlineMs: number | undefined;
+    const p = done ? null : this.plan();
+    const activeSeat = gd.seats[active];
+    if (p && p.kind === "timeout") deadlineMs = Math.max(0, p.due - Date.now());
+    else if (p && p.kind === "bot" && activeSeat?.cid && !activeSeat.left && !this.isAway(activeSeat)) deadlineMs = Math.max(0, p.due - Date.now());
 
-    return {
+    const histBase = fullHistory ? 0 : Math.max(0, gd.history.length - HISTORY_TAIL);
+    const view: GameView = {
       type: "state",
-      yourSeat: seat,
-      yourCards,
+      code: room.code,
+      you,
+      cards,
+      drawn,
       players,
-      phase: phaseName,
-      activePlayer,
-      isYourTurn: activePlayer === seat,
-      availableActions,
-      history: this.history.slice(-50), // last 50 entries
-      claims: Object.fromEntries(
-        Array.from(this.claimedRoles.entries()).map(([s, roles]) => [s, Array.from(roles)])
-      ),
-      context,
-      pendingAction: pendingAction >= 0 ? pendingAction : undefined,
-      deckSize: wasm.deckTotal(),
+      phase: PHASE_NAMES[phase] ?? "unknown",
+      active,
+      turnPlayer: tp,
+      pending,
+      block: phase === PHASE_CHALLENGE_BLOCK ? { seat: g.blocker(), card: g.blockCard() } : undefined,
+      actions,
+      prompt: this.prompt(you, names),
+      deadlineMs,
+      history: gd.history.slice(histBase),
+      historyBase: histBase,
+      deck: g.deckTotal(),
+      turn: gd.turn,
+      step: gd.step,
+      isHost: !!cid && cid === room.hostCid,
+      rules: room.rules,
     };
+    this.send(ws, view);
   }
 
-  private broadcastGameOver(): void {
-    if (!this.wasm) return;
-    this.flushPasses();
+  /** One-line description of what's happening, from the viewer's perspective. */
+  private prompt(you: number, names: string[]): string {
+    const g = this.game!;
+    const phase = g.phase();
+    const active = g.activePlayer();
+    const tp = g.turnPlayer();
+    const pa = g.pendingAction();
+    const me = active === you;
+    const Name = (s: number) => (s === you ? "You" : names[s]);
+    const name = (s: number) => (s === you ? "you" : names[s]);
+    const t = actionTarget(pa);
 
-    const winner = this.wasm.getWinner();
-    const winnerPlayer = this.players.find(p => p.seat === winner);
-    const winnerName = winnerPlayer?.username || `Player ${winner}`;
-
-    // Build placements: winner first, then reverse elimination order
-    const finalStandings: { seat: number; name: string; alive: boolean; eliminatedTurn?: number }[] = [];
-    finalStandings.push({ seat: winner, name: winnerName, alive: true });
-    for (let i = this.eliminationOrder.length - 1; i >= 0; i--) {
-      const e = this.eliminationOrder[i];
-      const player = this.players.find(p => p.seat === e.seat);
-      finalStandings.push({
-        seat: e.seat,
-        name: player?.username || `Player ${e.seat}`,
-        alive: false,
-        eliminatedTurn: e.turn,
-      });
-    }
-
-    const gameOverMsg: ServerMessage = {
-      type: "game_over",
-      winner,
-      winnerName,
-      finalStandings,
-      totalTurns: this.turnCounter,
-      history: this.history,
+    const describe = (): string => {
+      if (pa === ACTION_FOREIGN_AID) return `${Name(tp)} ${tp === you ? "take" : "takes"} Foreign Aid`;
+      if (pa === ACTION_TAX) return `${Name(tp)} ${tp === you ? "claim" : "claims"} Duke to take Tax`;
+      if (pa === ACTION_EXCHANGE) return `${Name(tp)} ${tp === you ? "claim" : "claims"} Ambassador to Exchange`;
+      if (isSteal(pa)) return `${Name(tp)} ${tp === you ? "claim" : "claims"} Captain to steal from ${name(t!)}`;
+      if (isAssassinate(pa)) return `${Name(tp)} ${tp === you ? "claim" : "claims"} Assassin to assassinate ${name(t!)}`;
+      if (isCoup(pa)) return `${Name(tp)} ${tp === you ? "Coup" : "Coups"} ${name(t!)}`;
+      return `${Name(tp)} ${tp === you ? "act" : "acts"}`;
     };
 
-    for (const [ws] of this.connections) {
-      this.send(ws, gameOverMsg);
-    }
-
-    // Clean up WASM memory and reset room state so players return to a clean lobby
-    this.stopStaleCheck();
-    this.wasm.dispose();
-    this.wasm = null;
-    this.gameStarted = false;
-    this.history = [];
-    this.turnCounter = 0;
-    this.pendingPasses = [];
-    this.claimedRoles.clear();
-    this.eliminationOrder = [];
-    this.players = [];
-    this.connections.clear();
-    this.hostWs = null;
-  }
-
-  // ---- Helpers ----
-
-  private getPlayerNames(): string[] {
-    const names: string[] = [];
-    for (let i = 0; i < 6; i++) {
-      const p = this.players.find(pl => pl.seat === i);
-      names.push(p?.username || `Player ${i}`);
-    }
-    return names;
-  }
-
-  private getPlayerName(seat: number): string {
-    const p = this.players.find(pl => pl.seat === seat);
-    return p?.username || `Player ${seat}`;
-  }
-
-  private startStaleCheck(): void {
-    if (this.staleCheckInterval) return; // already running
-    this.staleCheckInterval = setInterval(() => {
-      const now = Date.now();
-      for (const [ws, conn] of this.connections) {
-        if (now - conn.lastPing > 60_000) {
-          this.connections.delete(ws);
-          if (ws === this.hostWs) this.hostWs = null;
-          try { ws.close(); } catch { /* already closed */ }
-        }
+    switch (phase) {
+      case PHASE_MAIN_ACTION:
+        if (me) return g.coins(you) >= 10 ? "You have 10+ coins — you must Coup." : "Your turn — choose an action.";
+        return `${names[tp]} is choosing an action…`;
+      case PHASE_CHALLENGE_ACTION:
+        return me ? `${describe()}. Challenge the claim?` : `${describe()}. Waiting for ${names[active]} to challenge or pass…`;
+      case PHASE_BLOCK: {
+        if (pa === ACTION_FOREIGN_AID) return me ? `${describe()}. Block it by claiming Duke?` : `${describe()}. Waiting for ${names[active]} to block or pass…`;
+        return me ? `${describe()}. Block?` : `${describe()}. Waiting for ${names[active]} to block or allow…`;
       }
-      // Stop checking if no connections remain
-      if (this.connections.size === 0) {
-        this.stopStaleCheck();
+      case PHASE_CHALLENGE_BLOCK: {
+        const b = g.blocker();
+        const head = `${Name(b)} ${b === you ? "block" : "blocks"} by claiming ${CARD_NAMES[g.blockCard()]}`;
+        return me ? `${head}. Challenge the block?` : `${head}. Waiting for ${names[active]} to challenge or pass…`;
       }
-    }, 30_000);
-  }
-
-  private stopStaleCheck(): void {
-    if (this.staleCheckInterval) {
-      clearInterval(this.staleCheckInterval);
-      this.staleCheckInterval = null;
+      case PHASE_LOSE_CARD:
+        return me ? "You lose an influence — choose a card to reveal." : `${names[active]} must reveal a card…`;
+      case PHASE_EXCHANGE_DISCARD:
+        return me ? "Exchange — choose which cards to keep." : `${names[active]} is exchanging cards…`;
+      default:
+        return "";
     }
   }
 
-  private send(ws: WebSocket, msg: object): void {
+  // ---------------------------------------------------------------------------
+  // Helpers
+
+  private attachment(ws: WebSocket): Attachment {
+    try {
+      return (ws.deserializeAttachment() as Attachment | null) ?? { cid: null, name: null };
+    } catch {
+      return { cid: null, name: null };
+    }
+  }
+
+  /** Open sockets (excluding ones mid-close). */
+  private sockets(): WebSocket[] {
+    return this.ctx.getWebSockets().filter((ws) => !this.closing.has(ws));
+  }
+
+  private socketsFor(cid: string, except?: WebSocket): WebSocket[] {
+    return this.sockets().filter((ws) => ws !== except && this.attachment(ws).cid === cid);
+  }
+
+  private isSeated(cid: string): boolean {
+    const room = this.room!;
+    return room.seats.some((s) => s.cid === cid) || !!room.game?.seats.some((s) => s.cid === cid);
+  }
+
+  private save(): void {
+    if (!this.room) return;
+    if (this.room.game && this.game) this.room.game.bytes = this.game.bytes;
+    void this.ctx.storage.put("room", this.room);
+  }
+
+  private send(ws: WebSocket, msg: ServerMessage): void {
     try {
       ws.send(JSON.stringify(msg));
     } catch {
-      // WebSocket already closed
+      // socket already closed
     }
   }
 }
+
+export { CID_RE };

@@ -3,98 +3,63 @@
 import type { PlayerInfo } from "@/lib/types";
 import { ROLE_NAMES, ROLE_COLORS, ROLE_SHORT, HIDDEN_CARD } from "@/lib/constants";
 
-interface ClaimDisplay {
-  short: string;
-  color: string;
-}
-
 interface PlayerCardProps {
   player: PlayerInfo;
-  seat: number;
   isActive: boolean;
+  isTurn: boolean;
   isTarget?: boolean;
-  claims?: ClaimDisplay[];
+  isBlocker?: boolean;
   lastAction?: string;
-  isThinking?: boolean;
+  onClick?: () => void;
 }
 
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-export default function PlayerCard({ player, seat, isActive, isTarget, claims, lastAction, isThinking }: PlayerCardProps) {
-  const influence = player.influence;
-  const indicator =
-    influence === 2 ? "●" : influence === 1 ? "○" : "☠";
+export default function PlayerCard({ player, isActive, isTurn, isTarget, isBlocker, lastAction, onClick }: PlayerCardProps) {
   const isDead = !player.alive;
+  const status = player.bot ? "bot" : player.away ? "away" : !player.online ? "offline" : null;
+  const border = isTarget ? "border-cursor bg-cursor/5" : isActive ? "border-you" : isTurn ? "border-cursor/60" : "border-border-term";
 
   return (
-    <div className="flex flex-col items-center gap-0.5">
-      {/* Target arrow above */}
-      <div className={`text-cursor text-xs h-4 transition-opacity ${isTarget ? "opacity-100" : "opacity-0"}`}>
-        ▼
-      </div>
-
+    <div className="flex flex-col items-center gap-0.5 min-w-0">
+      <div aria-hidden className={`text-cursor text-xs h-3 leading-3 transition-opacity ${isTarget ? "opacity-100" : "opacity-0"}`}>▼</div>
       <div
-        className={`font-mono text-xs sm:text-sm leading-snug min-w-0 w-full px-2 sm:px-3 py-1 sm:py-2 border transition-colors ${
-          isTarget
-            ? "border-cursor bg-cursor/5"
-            : isActive
-              ? "border-cursor"
-              : "border-border-term"
-        } ${isDead ? "opacity-40" : ""}`}
+        onClick={onClick}
+        aria-label={`${player.name}${isDead ? ", eliminated" : `, ${player.coins} coins, ${player.influence} influence`}${isActive ? ", deciding" : ""}`}
+        className={`font-mono text-xs sm:text-sm leading-snug min-w-0 w-full px-2 sm:px-3 py-1 sm:py-1.5 border transition-colors ${border} ${isDead ? "opacity-40" : ""} ${isActive ? "shadow-[0_0_0_1px_var(--you)]" : ""}`}
       >
-        {/* Line 1: P# Name ● */}
-        <div className="flex items-center gap-1">
-          {isActive && <span className="text-cursor">▶</span>}
-          <span className={isActive ? "text-text-bright" : isDead ? "text-text-dim" : "text-text-default"}>
-            P{seat} {player.name}
+        <div className="flex items-center gap-1 min-w-0">
+          {isTurn && !isDead && <span className="text-cursor shrink-0" aria-hidden>▶</span>}
+          <span className={`truncate ${isActive ? "text-text-bright font-bold" : isDead ? "text-text-dim line-through" : "text-text-default"}`} title={player.name}>
+            {player.name}
           </span>
-          <span className={isDead ? "text-dead" : "text-text-dim"}>{indicator}</span>
-          {isThinking && (
-            <span className="text-text-dim animate-spin-slow">{SPINNER_FRAMES[0]}</span>
-          )}
+          {isActive && !isDead && <span className="thinking-dots text-you shrink-0" aria-hidden />}
         </div>
 
-        {/* Active turn bar */}
-        {isActive && !isDead && (
-          <div className="h-0.5 bg-cursor mt-0.5 rounded-full" />
-        )}
-
-        {/* Line 2: ▓▓ [As] 5● */}
-        <div className="flex items-center gap-1 mt-0.5">
-          {Array.from({ length: influence }).map((_, i) => (
-            <span key={`h-${i}`} className="text-text-dim">{HIDDEN_CARD}</span>
+        <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+          {Array.from({ length: player.influence }).map((_, i) => (
+            <span key={`h-${i}`} className="text-text-dim" aria-hidden>{HIDDEN_CARD}</span>
           ))}
-          {player.revealed.map((card, i) => {
-            const name = ROLE_NAMES[card.type] ?? "?";
-            const short = ROLE_SHORT[name] ?? "??";
-            const color = ROLE_COLORS[name] ?? "#CC0000";
+          {player.revealed.map((type, i) => {
+            const name = ROLE_NAMES[type] ?? "?";
             return (
-              <span key={`r-${i}`} style={{ color }}>[{short}]</span>
+              <span key={`r-${i}`} className="line-through decoration-1" style={{ color: ROLE_COLORS[name] }} title={`${name} (lost)`}>
+                {ROLE_SHORT[name]}
+              </span>
             );
           })}
-          <span className="text-text-default ml-1">{player.coins}●</span>
+          <span className="text-text-default ml-auto tabular-nums" title={`${player.coins} coins`}>{player.coins}●</span>
         </div>
 
-        {/* Line 3: Claimed roles (color-coded abbreviations) */}
-        {claims && claims.length > 0 && !isDead && (
-          <div className="flex items-center gap-1 mt-0.5">
-            {claims.map((c, i) => (
-              <span key={i} className="text-xs" style={{ color: c.color }}>{c.short}</span>
-            ))}
-          </div>
-        )}
+        <div className="flex items-center gap-1 mt-0.5 min-h-[1rem] text-[0.7rem] sm:text-xs">
+          {!isDead && player.claims.map((c) => (
+            <span key={c} style={{ color: ROLE_COLORS[c] }} title={`Has claimed ${c}`}>{ROLE_SHORT[c]}</span>
+          ))}
+          {isBlocker && <span className="text-cursor" title="Blocking">⛨</span>}
+          {status && <span className={`ml-auto ${status === "bot" ? "text-text-dim" : "text-coin-loss"}`}>{status}</span>}
+        </div>
 
-        {/* Line 4: Last action */}
-        {lastAction && !isDead && (
-          <div className="text-text-dim text-xs mt-0.5 truncate">
-            → {lastAction}
-          </div>
-        )}
-      </div>
-
-      {/* Target arrow below */}
-      <div className={`text-cursor text-xs h-4 transition-opacity ${isTarget ? "opacity-100" : "opacity-0"}`}>
-        ▲
+        <div className="text-text-dim text-[0.7rem] sm:text-xs truncate hidden sm:block min-h-[1rem]" title={lastAction}>
+          {lastAction && !isDead ? `→ ${lastAction}` : ""}
+        </div>
       </div>
     </div>
   );
