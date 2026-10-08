@@ -1,7 +1,7 @@
 # Performance Improvement Notes
 
 See the framework-specific notes:
-- [PufferLib performance](performance-puffer.md) — observation generation bottleneck, incremental updates, what NOT to thread
+- [PufferLib performance](performance-puffer.md) — historical notes on the removed 3.0-era binding; the 5.0 env is benchmarked with `make bench-puffer`
 - [OpenSpiel performance](performance-openspiel.md) — heap alloc overhead, explicit chance nodes, when to use which engine
 
 ## Raw C Engine
