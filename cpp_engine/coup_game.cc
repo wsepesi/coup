@@ -1,17 +1,18 @@
-// coup_game.cc -- OpenSpiel Coup implementation
-// Pure C++, no dependency on C engine.
+// coup_game.cc — OpenSpiel adapter over the C engine. See coup_game.h.
 
 #include "coup_game.h"
 
 #include <algorithm>
-#include <cassert>
-#include <cmath>
-#include <numeric>
-#include <sstream>
+#include <cstring>
+#include <utility>
+
+#include "open_spiel/abseil-cpp/absl/strings/str_cat.h"
+#include "open_spiel/abseil-cpp/absl/strings/str_join.h"
+#include "open_spiel/game_parameters.h"
+#include "open_spiel/spiel_utils.h"
 
 namespace open_spiel {
 namespace coup {
-
 namespace {
 
 const GameType kGameType{
@@ -20,17 +21,20 @@ const GameType kGameType{
     GameType::Dynamics::kSequential,
     GameType::ChanceMode::kExplicitStochastic,
     GameType::Information::kImperfectInformation,
-    GameType::Utility::kGeneralSum,
+    GameType::Utility::kZeroSum,
     GameType::RewardModel::kTerminal,
     /*max_num_players=*/kMaxPlayers,
     /*min_num_players=*/kMinPlayers,
     /*provides_information_state_string=*/true,
+    // Tabular CFR/MCCFR key on the (perfect-recall) InformationStateString.
+    // The tensor is a fixed-size summary of it for neural methods (Deep CFR,
+    // NFSP, R-NaD, ...); see CoupState::InformationStateTensor.
     /*provides_information_state_tensor=*/true,
     /*provides_observation_string=*/true,
     /*provides_observation_tensor=*/true,
     /*parameter_specification=*/
-    {{"players", GameParameter(2)},
-     {"refund_on_challenge", GameParameter(true)}},
+    {{"players", GameParameter(kDefaultPlayers)},
+     {"refund_on_challenge", GameParameter(kDefaultRefundOnChallenge)}},
 };
 
 std::shared_ptr<const Game> Factory(const GameParameters& params) {
@@ -39,18 +43,105 @@ std::shared_ptr<const Game> Factory(const GameParameters& params) {
 
 REGISTER_SPIEL_GAME(kGameType, Factory);
 
-const char* CardName(int type) {
-  switch (type) {
-    case kDuke: return "Duke";
-    case kAssassin: return "Assassin";
-    case kCaptain: return "Captain";
-    case kAmbassador: return "Ambassador";
-    case kContessa: return "Contessa";
-    default: return "Unknown";
+// Who is challenged, for which role, and whether they hold it. Mirrors the C
+// engine's step_deterministic CHALLENGE handling.
+bool ChallengedClaimIsTrue(const ::Game& g, int* claimant_out, int* role_out) {
+  int claimant, role;
+  if (get_phase(&g) == PHASE_CHALLENGE_ACTION) {
+    claimant = get_turn_player(&g);
+    role = coup_obs_action_role(get_pending_action(&g));
+  } else {
+    claimant = get_blocker(&g);
+    role = get_block_card(&g);
+  }
+  *claimant_out = claimant;
+  *role_out = role;
+  return (player_card0_alive(&g, claimant) &&
+          player_card0_type(&g, claimant) == role) ||
+         (player_card1_alive(&g, claimant) &&
+          player_card1_type(&g, claimant) == role);
+}
+
+// Thermometer encoding of min(count, width) into `width` bits.
+void Thermometer(int count, int width, float* out) {
+  for (int i = 0; i < width; ++i) out[i] = count > i ? 1.0f : 0.0f;
+}
+
+// Index of a role-claiming main action in the info-state counters, or -1.
+int ClaimActionIndex(int a) {
+  if (a == ACT_TAX) return 0;
+  if (a == ACT_EXCHANGE) return 1;
+  if (a >= ACT_STEAL_P0 && a < ACT_STEAL_P0 + 6) return 2;
+  if (a >= ACT_ASSASSINATE_P0 && a < ACT_ASSASSINATE_P0 + 6) return 3;
+  return -1;
+}
+
+int BlockIndex(int a) {
+  switch (a) {
+    case ACT_BLOCK_DUKE: return 0;
+    case ACT_BLOCK_CONTESSA: return 1;
+    case ACT_BLOCK_CAPTAIN: return 2;
+    case ACT_BLOCK_AMBASSADOR: return 3;
+    default: return -1;
   }
 }
 
+// Number of cards dealt so far (only meaningful during PHASE_DEAL).
+int CardsDealt(const ::Game& g) {
+  return get_phase(&g) == PHASE_DEAL ? get_pending_action(&g)
+                                     : 2 * get_num_players(&g);
+}
+
 }  // namespace
+
+std::string CardName(int card) {
+  switch (card) {
+    case DUKE: return "Duke";
+    case ASSASSIN: return "Assassin";
+    case CAPTAIN: return "Captain";
+    case AMBASSADOR: return "Ambassador";
+    case CONTESSA: return "Contessa";
+    default: return absl::StrCat("Card", card);
+  }
+}
+
+std::string ActionName(int a) {
+  if (a == ACT_INCOME) return "Income";
+  if (a == ACT_FOREIGN_AID) return "ForeignAid";
+  if (a == ACT_TAX) return "Tax";
+  if (a == ACT_EXCHANGE) return "Exchange";
+  if (a >= ACT_COUP_P0 && a < ACT_COUP_P0 + 6)
+    return absl::StrCat("Coup->p", a - ACT_COUP_P0);
+  if (a >= ACT_STEAL_P0 && a < ACT_STEAL_P0 + 6)
+    return absl::StrCat("Steal->p", a - ACT_STEAL_P0);
+  if (a >= ACT_ASSASSINATE_P0 && a < ACT_ASSASSINATE_P0 + 6)
+    return absl::StrCat("Assassinate->p", a - ACT_ASSASSINATE_P0);
+  if (a == ACT_CHALLENGE) return "Challenge";
+  if (a == ACT_PASS) return "Pass";
+  if (a == ACT_BLOCK_CONTESSA) return "Block(Contessa)";
+  if (a == ACT_BLOCK_CAPTAIN) return "Block(Captain)";
+  if (a == ACT_BLOCK_AMBASSADOR) return "Block(Ambassador)";
+  if (a == ACT_BLOCK_DUKE) return "Block(Duke)";
+  if (a >= ACT_DISCARD_SLOT0 && a <= ACT_DISCARD_SLOT3)
+    return absl::StrCat("Discard", a - ACT_DISCARD_SLOT0);
+  return absl::StrCat("Action", a);
+}
+
+std::string PhaseName(int phase) {
+  switch (phase) {
+    case PHASE_DEAL: return "Deal";
+    case PHASE_CHANCE_REDRAW: return "ChanceRedraw";
+    case PHASE_CHANCE_EXCHANGE: return "ChanceExchange";
+    case PHASE_MAIN_ACTION: return "MainAction";
+    case PHASE_CHALLENGE_ACTION: return "ChallengeAction";
+    case PHASE_BLOCK: return "Block";
+    case PHASE_CHALLENGE_BLOCK: return "ChallengeBlock";
+    case PHASE_LOSE_CARD: return "LoseCard";
+    case PHASE_EXCHANGE_DISCARD: return "ExchangeDiscard";
+    case PHASE_RESOLVE: return "Resolve";
+    default: return absl::StrCat("Phase", phase);
+  }
+}
 
 // ===========================================================================
 // CoupGame
@@ -60,1213 +151,850 @@ CoupGame::CoupGame(const GameParameters& params)
     : Game(kGameType, params),
       num_players_(ParameterValue<int>("players")),
       refund_on_challenge_(ParameterValue<bool>("refund_on_challenge")) {
-  assert(num_players_ >= kMinPlayers && num_players_ <= kMaxPlayers);
+  SPIEL_CHECK_GE(num_players_, kMinPlayers);
+  SPIEL_CHECK_LE(num_players_, kMaxPlayers);
 }
 
 std::unique_ptr<State> CoupGame::NewInitialState() const {
-  return std::make_unique<CoupState>(shared_from_this());
+  return std::make_unique<CoupState>(shared_from_this(), num_players_,
+                                     refund_on_challenge_);
 }
 
 // ===========================================================================
-// CoupState -- Construction
+// CoupState
 // ===========================================================================
 
-CoupState::CoupState(std::shared_ptr<const Game> game)
-    : State(game) {
-  int np = NumPlayers();
-  // Initialize deck: 3 of each type.
-  for (int i = 0; i < kNumCardTypes; i++) {
-    deck_[i] = kCardsPerType;
-  }
-  // Initialize players.
-  for (int i = 0; i < kMaxPlayers; i++) {
-    players_[i].coins = kStartingCoins;
-    players_[i].cards[0] = {0, true};
-    players_[i].cards[1] = {0, true};
-  }
-  // Mark unused player slots as dead.
-  for (int i = np; i < kMaxPlayers; i++) {
-    players_[i].cards[0].alive = false;
-    players_[i].cards[1].alive = false;
-    players_[i].coins = 0;
-  }
-  // Start in DEAL phase.
-  phase_ = kDeal;
-  deal_count_ = 0;
-  active_player_ = 0;
-  turn_player_ = 0;
+CoupState::CoupState(std::shared_ptr<const Game> game, int num_players,
+                     bool refund_on_challenge)
+    : State(std::move(game)) {
+  // Both seeds 0 => game_init does NOT auto-deal: the state is left in
+  // PHASE_DEAL so the 2n deal draws are explicit chance nodes. The RNG inside
+  // Game is seeded but never consumed by this adapter.
+  game_init(&g_, num_players, 0, 0);
+  game_set_refund_on_challenge(&g_, refund_on_challenge ? 1 : 0);
+  coup_obs_tracker_reset(&tracker_);
+  events_.reserve(64);
 }
-
-const CoupGame* CoupState::parent_game() const {
-  return static_cast<const CoupGame*>(game_.get());
-}
-
-int CoupState::NumPlayers() const {
-  return parent_game()->NumPlayers();
-}
-
-// ===========================================================================
-// CoupState -- OpenSpiel interface
-// ===========================================================================
 
 Player CoupState::CurrentPlayer() const {
   if (IsTerminal()) return kTerminalPlayerId;
-  if (phase_ == kDeal || phase_ == kChanceRedraw || phase_ == kChanceExchange) {
-    return kChancePlayerId;
-  }
-  return active_player_;
+  if (is_chance_node(&g_)) return kChancePlayerId;
+  return get_active_player(&g_);
 }
 
 bool CoupState::IsTerminal() const {
-  return winner_ >= 0;
+  // The deal is never terminal (guarded here too, since mid-deal most seats
+  // have no living cards yet).
+  return get_phase(&g_) != PHASE_DEAL && is_done(&g_);
+}
+
+std::vector<Action> CoupState::LegalActions() const {
+  if (IsTerminal()) return {};
+  std::vector<Action> actions;
+  if (is_chance_node(&g_)) {
+    ChanceOutcome out[MAX_CHANCE_OUTCOMES];
+    int n = chance_outcomes(&g_, out);
+    actions.reserve(n);
+    for (int i = 0; i < n; ++i) actions.push_back(out[i].outcome);
+    return actions;
+  }
+  uint32_t mask = get_valid_actions(&g_);
+  for (int a = 0; a < kNumActions; ++a) {
+    if (mask & (1u << a)) actions.push_back(a);
+  }
+  return actions;
+}
+
+std::vector<std::pair<Action, double>> CoupState::ChanceOutcomes() const {
+  SPIEL_CHECK_TRUE(IsChanceNode());
+  ChanceOutcome out[MAX_CHANCE_OUTCOMES];
+  int n = chance_outcomes(&g_, out);
+  std::vector<std::pair<Action, double>> outcomes;
+  outcomes.reserve(n);
+  for (int i = 0; i < n; ++i) outcomes.emplace_back(out[i].outcome, out[i].prob);
+  return outcomes;
+}
+
+void CoupState::DoApplyAction(Action action) {
+  LoggedEvent e;
+  e.phase = static_cast<uint8_t>(get_phase(&g_));
+  e.action = static_cast<uint8_t>(action);
+  e.info = 0;
+  e.claimant = 0;
+  e.role = 0;
+
+  if (is_chance_node(&g_)) {
+    SPIEL_CHECK_GE(action, 0);
+    SPIEL_CHECK_LT(action, kNumCardTypes);
+    SPIEL_CHECK_GT(deck_count(&g_, action), 0);
+    switch (e.phase) {
+      case PHASE_DEAL:
+        e.actor = static_cast<uint8_t>(get_pending_action(&g_) / 2);
+        break;
+      case PHASE_CHANCE_REDRAW:
+        e.actor = static_cast<uint8_t>(get_active_player(&g_));
+        e.info = static_cast<uint8_t>(get_exchange_card0(&g_));  // slot
+        break;
+      default:  // PHASE_CHANCE_EXCHANGE
+        e.actor = static_cast<uint8_t>(get_turn_player(&g_));
+        break;
+    }
+    SPIEL_CHECK_EQ(apply_chance(&g_, static_cast<int>(action)), 0);
+  } else {
+    SPIEL_CHECK_FALSE(IsTerminal());
+    SPIEL_CHECK_TRUE(action >= 0 && action < kNumActions &&
+                     (get_valid_actions(&g_) & (1u << action)));
+    int actor = get_active_player(&g_);
+    e.actor = static_cast<uint8_t>(actor);
+    if (e.phase == PHASE_LOSE_CARD) {
+      e.info = static_cast<uint8_t>(action == ACT_DISCARD_SLOT0
+                                        ? player_card0_type(&g_, actor)
+                                        : player_card1_type(&g_, actor));
+    } else if (action == ACT_CHALLENGE) {
+      int claimant, role;
+      e.info = ChallengedClaimIsTrue(g_, &claimant, &role) ? 1 : 0;
+      e.claimant = static_cast<uint8_t>(claimant);
+      e.role = static_cast<uint8_t>(role);
+    } else if (e.phase == PHASE_EXCHANGE_DISCARD) {
+      const int slot = static_cast<int>(action) - ACT_DISCARD_SLOT0;
+      const int cards[4] = {player_card0_type(&g_, actor),
+                            player_card1_type(&g_, actor),
+                            get_exchange_card0(&g_), get_exchange_card1(&g_)};
+      e.info = static_cast<uint8_t>(cards[slot]);
+    }
+    coup_obs_tracker_record(&tracker_, &g_, actor, static_cast<int>(action));
+    SPIEL_CHECK_EQ(step_deterministic(&g_, static_cast<int>(action)), 0);
+  }
+  events_.push_back(e);
+}
+
+void CoupState::UndoAction(Player /*player*/, Action action) {
+  // The engine has no inverse step; replay the prefix. O(history) but only
+  // used by tests/tools, never by the hot path.
+  SPIEL_CHECK_FALSE(history_.empty());
+  SPIEL_CHECK_EQ(history_.back().action, action);
+  const auto* game = static_cast<const CoupGame*>(game_.get());
+  CoupState fresh(game_, num_players_, game->refund_on_challenge());
+  for (auto it = history_.begin(); it + 1 != history_.end(); ++it) {
+    fresh.ApplyAction(it->action);
+  }
+  g_ = fresh.g_;
+  tracker_ = fresh.tracker_;
+  events_ = std::move(fresh.events_);
+  history_ = std::move(fresh.history_);
+  move_number_ = fresh.move_number_;
+}
+
+std::string CoupState::ActionToString(Player player, Action action) const {
+  if (player == kChancePlayerId) {
+    switch (get_phase(&g_)) {
+      case PHASE_DEAL:
+        return absl::StrCat("Deal p", get_pending_action(&g_) / 2, " ",
+                            CardName(action));
+      case PHASE_CHANCE_REDRAW:
+        return absl::StrCat("Redraw p", get_active_player(&g_), " ",
+                            CardName(action));
+      case PHASE_CHANCE_EXCHANGE:
+        return absl::StrCat("ExchangeDraw p", get_turn_player(&g_), " ",
+                            CardName(action));
+      default:
+        return absl::StrCat("Chance ", CardName(action));
+    }
+  }
+  return absl::StrCat("p", player, " ", ActionName(action));
+}
+
+std::string CoupState::InformationStateString(Player player) const {
+  SPIEL_CHECK_GE(player, 0);
+  SPIEL_CHECK_LT(player, num_players_);
+  // Perfect recall, no leaks. Tokens, in order:
+  //   deal<q>:<card|?>          card dealt to seat q (own cards only)
+  //   redraw<q>.s<k>:<card|?>   replacement after a defended challenge; the
+  //                             slot is public (the revealed card's slot)
+  //   draw<q>:<card|?>          exchange draw (own draws only)
+  //   <q>:<action>              public decision by seat q, with
+  //     <q>:Challenge[won|lost] outcome is public (claimant reveals or loses)
+  //     <q>:Lose<k>=<card>      the lost card is turned face up
+  //     <q>:ExchDiscard?        another player's exchange pick (private)
+  std::string s = absl::StrCat("p", player, " n", num_players_);
+  for (const LoggedEvent& e : events_) {
+    const bool own = e.actor == player;
+    switch (e.phase) {
+      case PHASE_DEAL:
+        absl::StrAppend(&s, " deal", e.actor, ":",
+                        own ? CardName(e.action) : "?");
+        break;
+      case PHASE_CHANCE_REDRAW:
+        absl::StrAppend(&s, " redraw", e.actor, ".s", e.info, ":",
+                        own ? CardName(e.action) : "?");
+        break;
+      case PHASE_CHANCE_EXCHANGE:
+        absl::StrAppend(&s, " draw", e.actor, ":",
+                        own ? CardName(e.action) : "?");
+        break;
+      case PHASE_EXCHANGE_DISCARD:
+        if (own) {
+          absl::StrAppend(&s, " ", e.actor, ":ExchDiscard",
+                          e.action - ACT_DISCARD_SLOT0);
+        } else {
+          absl::StrAppend(&s, " ", e.actor, ":ExchDiscard?");
+        }
+        break;
+      case PHASE_LOSE_CARD:
+        absl::StrAppend(&s, " ", e.actor, ":Lose",
+                        e.action - ACT_DISCARD_SLOT0, "=", CardName(e.info));
+        break;
+      default:
+        if (e.action == ACT_CHALLENGE) {
+          absl::StrAppend(&s, " ", e.actor, ":Challenge",
+                          e.info ? "[lost]" : "[won]");
+        } else {
+          absl::StrAppend(&s, " ", e.actor, ":", ActionName(e.action));
+        }
+        break;
+    }
+  }
+  return s;
+}
+
+std::string CoupState::ObservationString(Player player) const {
+  SPIEL_CHECK_GE(player, 0);
+  SPIEL_CHECK_LT(player, num_players_);
+  const int phase = get_phase(&g_);
+  const int dealt = CardsDealt(g_);
+  std::string s = absl::StrCat("p", player, " turn ", g_.turn_count, " ",
+                               PhaseName(phase));
+  if (phase != PHASE_DEAL) {
+    absl::StrAppend(&s, " turn_player=p", get_turn_player(&g_));
+    if (!IsTerminal() && !is_chance_node(&g_)) {
+      absl::StrAppend(&s, " to_act=p", get_active_player(&g_));
+    }
+    if (phase != PHASE_MAIN_ACTION) {
+      absl::StrAppend(&s, " pending=", ActionName(get_pending_action(&g_)));
+    }
+    if (phase == PHASE_CHALLENGE_BLOCK) {
+      absl::StrAppend(&s, " block=p", get_blocker(&g_), "/",
+                      CardName(get_block_card(&g_)));
+    }
+  }
+  for (int q = 0; q < num_players_; ++q) {
+    absl::StrAppend(&s, "\n p", q, " coins=", player_coins(&g_, q), " [");
+    for (int k = 0; k < 2; ++k) {
+      if (k) absl::StrAppend(&s, " ");
+      if (2 * q + k >= dealt) {
+        absl::StrAppend(&s, "-");
+        continue;
+      }
+      int alive = k ? player_card1_alive(&g_, q) : player_card0_alive(&g_, q);
+      int type = k ? player_card1_type(&g_, q) : player_card0_type(&g_, q);
+      if (!alive) {
+        absl::StrAppend(&s, CardName(type), "(dead)");
+      } else if (q == player) {
+        absl::StrAppend(&s, CardName(type));
+      } else {
+        absl::StrAppend(&s, "?");
+      }
+    }
+    absl::StrAppend(&s, "]");
+  }
+  if (phase == PHASE_EXCHANGE_DISCARD && get_turn_player(&g_) == player) {
+    absl::StrAppend(&s, "\n drawn=[", CardName(get_exchange_card0(&g_)), " ",
+                    CardName(get_exchange_card1(&g_)), "]");
+    if (get_first_discard(&g_) != FIRST_DISCARD_NONE) {
+      absl::StrAppend(&s, " first_discard=", get_first_discard(&g_));
+    }
+  }
+  return s;
+}
+
+void CoupState::ObservationTensor(Player player,
+                                  absl::Span<float> values) const {
+  SPIEL_CHECK_GE(player, 0);
+  SPIEL_CHECK_LT(player, num_players_);
+  SPIEL_CHECK_EQ(static_cast<int>(values.size()), kObservationTensorSize);
+  uint8_t buf[COUP_OBS_SIZE];
+  coup_obs_write(&g_, &tracker_, player, buf);
+  for (int i = 0; i < COUP_OBS_SIZE; ++i) values[i] = buf[i];
+}
+
+void CoupState::InformationStateTensor(Player player,
+                                       absl::Span<float> values) const {
+  // Layout (kInfoStateTensorSize floats, all 0/1):
+  //   [0, COUP_OBS_SIZE)  the observation tensor (coup_obs.h)
+  //   then kMaxPlayers relative seats x kInfoSeatSize, whole-game counters
+  //   from public events (thermometer 3 unless noted):
+  //     +0..11  role claims via main action: Tax, Exchange, Steal, Assassinate
+  //     +12..23 blocks: Duke, Contessa, Captain, Ambassador
+  //     +24..26 challenges made, +27..29 of which won, +30..32 of which lost
+  //     +33..37 roles proven when challenged (1 bit per role)
+  //     +38..42 roles caught bluffing (1 bit per role)
+  //   then 5 roles x thermometer 3: cards the observer returned to the deck
+  //   through their own exchanges (private).
+  // Everything is derived from what InformationStateString(player) shows, so
+  // the tensor is a function of the infostate. It is a summary, not an
+  // injective encoding of the full history.
+  SPIEL_CHECK_GE(player, 0);
+  SPIEL_CHECK_LT(player, num_players_);
+  SPIEL_CHECK_EQ(static_cast<int>(values.size()), kInfoStateTensorSize);
+  std::fill(values.begin(), values.end(), 0.0f);
+  ObservationTensor(player, values.subspan(0, kObservationTensorSize));
+
+  int claims[kMaxPlayers][4] = {};
+  int blocks[kMaxPlayers][4] = {};
+  int challenges[kMaxPlayers][3] = {};  // made, won, lost
+  int proven[kMaxPlayers] = {};         // role bitmasks
+  int caught[kMaxPlayers] = {};
+  int returned[kNumCardTypes] = {};
+  for (const LoggedEvent& e : events_) {
+    if (e.phase == PHASE_DEAL || e.phase == PHASE_CHANCE_REDRAW ||
+        e.phase == PHASE_CHANCE_EXCHANGE || e.phase == PHASE_LOSE_CARD) {
+      continue;
+    }
+    if (e.phase == PHASE_EXCHANGE_DISCARD) {
+      if (e.actor == player) ++returned[e.info];
+      continue;
+    }
+    const int ci = ClaimActionIndex(e.action);
+    const int bi = BlockIndex(e.action);
+    if (e.phase == PHASE_MAIN_ACTION && ci >= 0) ++claims[e.actor][ci];
+    if (bi >= 0) ++blocks[e.actor][bi];
+    if (e.action == ACT_CHALLENGE) {
+      ++challenges[e.actor][0];
+      if (e.info) {
+        ++challenges[e.actor][2];
+        proven[e.claimant] |= 1 << e.role;
+      } else {
+        ++challenges[e.actor][1];
+        caught[e.claimant] |= 1 << e.role;
+      }
+    }
+  }
+
+  float* out = values.data() + kObservationTensorSize;
+  for (int r = 0; r < num_players_; ++r) {
+    const int q = (player + r) % num_players_;
+    float* s = out + r * kInfoSeatSize;
+    for (int i = 0; i < 4; ++i) Thermometer(claims[q][i], 3, s + 3 * i);
+    for (int i = 0; i < 4; ++i) Thermometer(blocks[q][i], 3, s + 12 + 3 * i);
+    for (int i = 0; i < 3; ++i) Thermometer(challenges[q][i], 3, s + 24 + 3 * i);
+    for (int c = 0; c < kNumCardTypes; ++c) {
+      s[33 + c] = (proven[q] >> c) & 1;
+      s[38 + c] = (caught[q] >> c) & 1;
+    }
+  }
+  out += kMaxPlayers * kInfoSeatSize;
+  for (int c = 0; c < kNumCardTypes; ++c) Thermometer(returned[c], 3, out + 3 * c);
+}
+
+// ---------------------------------------------------------------------------
+// ResampleFromInfostate
+//
+// Samples a complete history that `player` cannot tell apart from the real
+// one: same public actions, same own cards and draws, and every public
+// revelation (lost cards, challenge outcomes, redraw slots) reproduced
+// exactly when the history is replayed through the engine.
+//
+// Model: the 15 cards are tokens moving between deck, hands and exchange
+// draws. Unobserved choices are resampled: opponents' exchange discard picks
+// uniformly over legal picks (OpenSpiel's convention for unobserved actions),
+// chance draws from the deck. Observations become constraints on a token's
+// role: own draws and revealed cards fix it, a failed claim excludes the role
+// for the claimant's live cards, a proven claim fixes the redraw slot (and
+// excludes the role from slot 0 when the engine picked slot 1).
+//
+// Two passes per attempt:
+//   1. Positions only. With the opponents' discard picks drawn up front, each
+//      chance draw starts a "hand life" (the card's stay in a hand until it
+//      returns to the deck) and every constraint lands on exactly one life.
+//   2. Token flow. Each draw picks a deck token weighted by how likely it is
+//      to satisfy its life's constraints (fixed tokens: 0/1; unfixed tokens:
+//      share of still-unplaced copies of the allowed roles), then applies
+//      them. Unfixed tokens finally get roles drawn uniformly from the
+//      remaining multiset subject to exclusions (exact DP over role counts).
+// Local repairs handle most dead ends: pass 1 re-picks one recent exchange
+// of the seat whose observation failed; pass 2 swaps a needed token out of an
+// unconstrained hand for one that was in the deck all along. An attempt that
+// still dead-ends is discarded and retried (~1.2 attempts on average, a few
+// hundred at worst over ~1.4M resamples of long 6-player games). The result
+// is always a valid, consistent history; its distribution approximates (does
+// not exactly equal) the chance-weighted posterior.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct Constraint {
+  int8_t eq = -1;    // fixed role, or -1
+  uint8_t neq = 0;   // bitmask of excluded roles
+
+  bool Fix(int role) {
+    if (eq >= 0) return eq == role;
+    if (neq & (1 << role)) return false;
+    eq = static_cast<int8_t>(role);
+    return true;
+  }
+  bool Exclude(int role) {
+    if (eq >= 0) return eq != role;
+    neq |= static_cast<uint8_t>(1 << role);
+    return true;
+  }
+  bool Allows(int role) const {
+    return eq >= 0 ? eq == role : !(neq & (1 << role));
+  }
+};
+
+bool IsDraw(int phase) {
+  return phase == PHASE_DEAL || phase == PHASE_CHANCE_REDRAW ||
+         phase == PHASE_CHANCE_EXCHANGE;
+}
+
+class ResampleAttempt {
+ public:
+  ResampleAttempt(int player, const std::vector<LoggedEvent>& events,
+                  const std::function<double()>& rng)
+      : player_(player), events_(events), rng_(rng),
+        life_(events.size()), picks_(events.size(), -1) {}
+
+  // Returns the history to replay, or false if this attempt is inconsistent.
+  bool Run(const std::vector<State::PlayerAction>& history,
+           std::vector<Action>* actions) {
+    if (!PlanLives()) return false;
+    int token_at[kMaxGameEvents];
+    if (!FlowTokens(token_at)) return false;
+    int roles[kDeckSize];
+    if (!AssignRoles(roles)) return false;
+    actions->resize(history.size());
+    for (size_t i = 0; i < history.size(); ++i) {
+      if (IsDraw(events_[i].phase)) {
+        (*actions)[i] = roles[token_at[i]];
+      } else if (picks_[i] >= 0) {
+        (*actions)[i] = ACT_DISCARD_SLOT0 + picks_[i];
+      } else {
+        (*actions)[i] = history[i].action;
+      }
+    }
+    return true;
+  }
+
+  static constexpr int kMaxGameEvents = 1 << 14;
+
+ private:
+  int Uniform(int n) {
+    int k = static_cast<int>(rng_() * n);
+    return k < n ? k : n - 1;
+  }
+
+  // Walks the public view of the history, moving "hand lives" (indexed by
+  // the draw event that started them) around with the same slot rules as the
+  // engine. `on_*` hooks let both passes share the walk. With `plan`, also
+  // draws the opponents' discard picks and records constraints on lives.
+  template <typename DrawFn, typename DiscardFn>
+  bool Walk(DrawFn on_draw, DiscardFn on_return, bool plan) {
+    fail_seat_ = -1;
+    fail_event_ = events_.size();
+    int hand[kMaxPlayers][2];
+    bool alive[kMaxPlayers][2] = {};
+    int xch[2] = {-1, -1};
+    int xch_drawn = 0, dealt = 0, first = -1;
+    int proof_claimant = -1, proof_role = -1;
+    for (size_t i = 0; i < events_.size(); ++i) {
+      const LoggedEvent& e = events_[i];
+      const bool own = e.actor == player_;
+      switch (e.phase) {
+        case PHASE_DEAL: {
+          const int k = dealt++ % 2;
+          hand[e.actor][k] = static_cast<int>(i);
+          alive[e.actor][k] = true;
+          if (!on_draw(i, own)) return false;
+          break;
+        }
+        case PHASE_CHANCE_REDRAW: {
+          // begin_redraw: the proven card (slot e.info) returns to the deck;
+          // the engine prefers slot 0 when it holds the role.
+          const int k = e.info;
+          SPIEL_CHECK_EQ(proof_claimant, e.actor);
+          if (plan && (!life_[hand[e.actor][k]].Fix(proof_role) ||
+                       (k == 1 && alive[e.actor][0] &&
+                        !life_[hand[e.actor][0]].Exclude(proof_role)))) {
+            return Fail(e.actor, i);
+          }
+          on_return(hand[e.actor][k], i);
+          proof_claimant = -1;
+          hand[e.actor][k] = static_cast<int>(i);
+          if (!on_draw(i, own)) return false;
+          break;
+        }
+        case PHASE_CHANCE_EXCHANGE:
+          xch[xch_drawn++ % 2] = static_cast<int>(i);
+          if (!on_draw(i, own)) return false;
+          break;
+        case PHASE_LOSE_CARD: {
+          const int k = e.action - ACT_DISCARD_SLOT0;
+          if (plan && !life_[hand[e.actor][k]].Fix(e.info)) {
+            return Fail(e.actor, i);
+          }
+          alive[e.actor][k] = false;
+          break;
+        }
+        case PHASE_EXCHANGE_DISCARD: {
+          if (!own && plan && picks_[i] < 0) {
+            // Same legality rule as get_valid_actions.
+            unsigned avail = (alive[e.actor][0] ? 1u : 0u) |
+                             (alive[e.actor][1] ? 2u : 0u) | 0xCu;
+            avail &= first < 0 ? 0x7u : ~((2u << first) - 1);
+            int opts[4], n = 0;
+            for (int b = 0; b < 4; ++b) {
+              if (avail & (1u << b)) opts[n++] = b;
+            }
+            SPIEL_CHECK_GT(n, 0);
+            picks_[i] = opts[Uniform(n)];
+          }
+          const int slot =
+              own ? e.action - ACT_DISCARD_SLOT0 : picks_[i];
+          if (first < 0) {
+            first = slot;
+            break;
+          }
+          // Second pick: mirror step_deterministic's refill.
+          int* h = hand[e.actor];
+          const int cards[4] = {h[0], h[1], xch[0], xch[1]};
+          unsigned keep = 0xFu & ~(1u << first) & ~(1u << slot);
+          if (!alive[e.actor][0]) keep &= ~1u;
+          if (!alive[e.actor][1]) keep &= ~2u;
+          on_return(cards[first], i);
+          on_return(cards[slot], i);
+          if (alive[e.actor][0]) {
+            h[0] = cards[__builtin_ctz(keep)];
+            keep &= keep - 1;
+          }
+          if (alive[e.actor][1]) h[1] = cards[__builtin_ctz(keep)];
+          first = -1;
+          break;
+        }
+        default:
+          if (e.action == ACT_CHALLENGE) {
+            if (e.info) {
+              proof_claimant = e.claimant;
+              proof_role = e.role;
+            } else if (plan) {
+              for (int k = 0; k < 2; ++k) {
+                if (alive[e.claimant][k] &&
+                    !life_[hand[e.claimant][k]].Exclude(e.role)) {
+                  return Fail(e.claimant, i);
+                }
+              }
+            }
+          }
+          break;
+      }
+    }
+    // A proven claim whose redraw has not happened yet (the challenger is
+    // still choosing a card to lose): some live slot holds the role.
+    if (plan && proof_claimant >= 0) {
+      int opts[2], n = 0;
+      for (int k = 0; k < 2; ++k) {
+        if (alive[proof_claimant][k] &&
+            life_[hand[proof_claimant][k]].Allows(proof_role)) {
+          opts[n++] = k;
+        }
+      }
+      if (n == 0) return Fail(proof_claimant, events_.size());
+      life_[hand[proof_claimant][opts[Uniform(n)]]].Fix(proof_role);
+    }
+    return true;
+  }
+
+  bool Fail(int seat, size_t event) {
+    fail_seat_ = seat;
+    fail_event_ = event;
+    return false;
+  }
+
+  // Pass 1: draw the opponents' discard picks and collect each hand life's
+  // constraints. When the picks contradict a later observation of seat q,
+  // only one of q's two latest exchanges before it is re-picked (local
+  // repair) rather than starting over.
+  bool PlanLives() {
+    for (int tries = 0; tries < 64; ++tries) {
+      std::fill(life_.begin(), life_.end(), Constraint());
+      if (Walk([&](size_t i, bool own) {
+                 return !own || life_[i].Fix(events_[i].action);
+               },
+               [](int, size_t) {}, /*plan=*/true)) {
+        return true;
+      }
+      if (fail_seat_ < 0 || fail_seat_ == player_) return false;
+      // Second-pick events of fail_seat_'s exchanges before the failure.
+      size_t ex[2];
+      int n = 0;
+      for (size_t i = fail_event_; i-- > 0 && n < 2;) {
+        const LoggedEvent& e = events_[i];
+        if (e.phase == PHASE_EXCHANGE_DISCARD && e.actor == fail_seat_ &&
+            i > 0 && events_[i - 1].phase == PHASE_EXCHANGE_DISCARD) {
+          ex[n++] = i;
+          --i;  // skip the first pick
+        }
+      }
+      if (n == 0) return false;
+      const size_t second = ex[Uniform(n)];
+      picks_[second] = picks_[second - 1] = -1;
+    }
+    return false;
+  }
+
+  // Pass 2: assign a deck token to every hand life.
+  bool FlowTokens(int* token_at) {
+    if (events_.size() > static_cast<size_t>(kMaxGameEvents)) return false;
+    std::vector<int> deck;
+    for (int t = 0; t < kDeckSize; ++t) {
+      deck.push_back(t);
+      holder_[t] = -1;
+      deck_since_[t] = 0;
+    }
+    return Walk(
+        [&](size_t i, bool) {
+          int t = DrawFor(life_[i], &deck);
+          for (int r = 0; t < 0 && r < 4; ++r) {
+            if (!SwapRepair(life_[i], token_at, &deck)) break;
+            t = DrawFor(life_[i], &deck);
+          }
+          if (t < 0) return false;
+          token_at[i] = t;
+          holder_[t] = static_cast<int>(i);
+          return true;
+        },
+        [&](int life, size_t i) {
+          const int t = token_at[life];
+          deck.push_back(t);
+          holder_[t] = -1;
+          deck_since_[t] = i;
+        },
+        /*plan=*/false);
+  }
+
+  // How likely deck token `tok` is to satisfy hand life `life`: 0/1 for a
+  // fixed token, else the share of still-unplaced copies of roles both allow.
+  double Weight(const Constraint& life, const Constraint& tok) const {
+    if (tok.eq >= 0) return life.Allows(tok.eq) ? 1.0 : 0.0;
+    if (unfixed_ == 0) return 0.0;
+    int copies = 0;
+    for (int c = 0; c < kNumCardTypes; ++c) {
+      if (life.Allows(c) && tok.Allows(c)) copies += 3 - fixed_[c];
+    }
+    return double(copies) / unfixed_;
+  }
+
+  // No deck token can satisfy `life`. Find a token X that could, held by an
+  // opponent's unconstrained hand life L, and a deck token Y that has been in
+  // the deck since before L drew X and suits L: then L could equally have
+  // drawn Y, which puts X back in the deck. Swaps one random such pair.
+  bool SwapRepair(const Constraint& life, int* token_at,
+                  std::vector<int>* deck) {
+    std::vector<std::pair<int, int>> pairs;  // (X, index of Y in deck)
+    for (int x = 0; x < kDeckSize; ++x) {
+      const int l = holder_[x];
+      if (l < 0 || life_[l].eq >= 0 || Weight(life, tokens_[x]) <= 0) continue;
+      for (int j = 0; j < static_cast<int>(deck->size()); ++j) {
+        const int y = (*deck)[j];
+        if (deck_since_[y] <= static_cast<size_t>(l) &&
+            Weight(life_[l], tokens_[y]) > 0) {
+          pairs.emplace_back(x, j);
+        }
+      }
+    }
+    if (pairs.empty()) return false;
+    const auto [x, j] = pairs[Uniform(static_cast<int>(pairs.size()))];
+    const int l = holder_[x];
+    const int y = (*deck)[j];
+    for (int c = 0; c < kNumCardTypes; ++c) {
+      if ((life_[l].neq >> c) & 1) tokens_[y].Exclude(c);
+    }
+    (*deck)[j] = x;
+    deck_since_[x] = l;
+    holder_[x] = -1;
+    holder_[y] = l;
+    token_at[l] = y;
+    return true;
+  }
+
+  // Picks a deck token for a hand life and applies the life's constraints.
+  int DrawFor(const Constraint& life, std::vector<int>* deck) {
+    const int n = static_cast<int>(deck->size());
+    double w[kDeckSize], total = 0;
+    for (int i = 0; i < n; ++i) {
+      w[i] = Weight(life, tokens_[(*deck)[i]]);
+      total += w[i];
+    }
+    if (total <= 0) return -1;
+    double u = rng_() * total;
+    int idx = -1;
+    for (int i = 0; i < n && idx < 0; ++i) {
+      if (w[i] > 0 && (u -= w[i]) < 0) idx = i;
+    }
+    if (idx < 0) {  // rounding: take the last candidate
+      for (int i = n - 1; i >= 0 && idx < 0; --i) {
+        if (w[i] > 0) idx = i;
+      }
+    }
+    const int t = (*deck)[idx];
+    (*deck)[idx] = deck->back();
+    deck->pop_back();
+    Constraint& tok = tokens_[t];
+    if (life.eq >= 0 && tok.eq < 0) {
+      if (fixed_[life.eq] == 3 || !tok.Fix(life.eq)) return -1;
+      ++fixed_[life.eq];
+      --unfixed_;
+    }
+    for (int c = 0; c < kNumCardTypes; ++c) {
+      if ((life.neq >> c) & 1) tok.Exclude(c);  // compatible by weight > 0
+    }
+    return t;
+  }
+
+  // Unfixed tokens get a uniformly random arrangement of the remaining
+  // roles that respects their exclusions.
+  bool AssignRoles(int roles_out[kDeckSize]) {
+    int remaining[kNumCardTypes] = {3, 3, 3, 3, 3};
+    std::vector<int> unfixed;
+    for (int t = 0; t < kDeckSize; ++t) {
+      if (tokens_[t].eq >= 0) {
+        if (--remaining[tokens_[t].eq] < 0) return false;
+        roles_out[t] = tokens_[t].eq;
+      } else {
+        unfixed.push_back(t);
+      }
+    }
+    // ways[i][st]: completions of unfixed[i..] given remaining role counts
+    // `st` (base 4, one digit per role).
+    constexpr int kStates = 1 << (2 * kNumCardTypes);
+    const int m = static_cast<int>(unfixed.size());
+    std::vector<double> ways((m + 1) * kStates, 0.0);
+    ways[m * kStates] = 1.0;
+    for (int i = m - 1; i >= 0; --i) {
+      const uint8_t neq = tokens_[unfixed[i]].neq;
+      for (int st = 0; st < kStates; ++st) {
+        double w = 0;
+        for (int c = 0; c < kNumCardTypes; ++c) {
+          const int cnt = (st >> (2 * c)) & 3;
+          if (cnt == 0 || (neq & (1 << c))) continue;
+          w += cnt * ways[(i + 1) * kStates + st - (1 << (2 * c))];
+        }
+        ways[i * kStates + st] = w;
+      }
+    }
+    int st = 0;
+    for (int c = 0; c < kNumCardTypes; ++c) st |= remaining[c] << (2 * c);
+    if (ways[st] <= 0) return false;
+    for (int i = 0; i < m; ++i) {
+      const uint8_t neq = tokens_[unfixed[i]].neq;
+      double u = rng_() * ways[i * kStates + st];
+      int pick = -1;
+      for (int c = 0; c < kNumCardTypes; ++c) {
+        const int cnt = (st >> (2 * c)) & 3;
+        if (cnt == 0 || (neq & (1 << c))) continue;
+        pick = c;
+        u -= cnt * ways[(i + 1) * kStates + st - (1 << (2 * c))];
+        if (u < 0) break;
+      }
+      SPIEL_CHECK_GE(pick, 0);
+      roles_out[unfixed[i]] = pick;
+      st -= 1 << (2 * pick);
+    }
+    return true;
+  }
+
+  const int player_;
+  const std::vector<LoggedEvent>& events_;
+  const std::function<double()>& rng_;
+  std::vector<Constraint> life_;  // per draw event: its hand life
+  std::vector<int> picks_;        // resampled opponent discard slots
+  int fail_seat_ = -1;            // seat whose observation failed (pass 1)
+  size_t fail_event_ = 0;
+  Constraint tokens_[kDeckSize];
+  int fixed_[kNumCardTypes] = {};  // tokens fixed to each role
+  int holder_[kDeckSize];          // pass 2: hand life holding it, or -1
+  size_t deck_since_[kDeckSize];   // pass 2: event it last entered the deck
+  int unfixed_ = kDeckSize;
+};
+
+}  // namespace
+
+std::unique_ptr<State> CoupState::ResampleFromInfostate(
+    int player_id, std::function<double()> rng) const {
+  SPIEL_CHECK_GE(player_id, 0);
+  SPIEL_CHECK_LT(player_id, num_players_);
+  constexpr int kMaxAttempts = 100000;
+  std::vector<Action> actions;
+  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+    ResampleAttempt run(player_id, events_, rng);
+    if (!run.Run(history_, &actions)) continue;
+    const auto* game = static_cast<const CoupGame*>(game_.get());
+    auto state = std::make_unique<CoupState>(game_, num_players_,
+                                             game->refund_on_challenge());
+    for (Action a : actions) state->ApplyAction(a);
+    SPIEL_CHECK_EQ(state->InformationStateString(player_id),
+                   InformationStateString(player_id));
+    return state;
+  }
+  SpielFatalError(absl::StrCat("ResampleFromInfostate: no consistent history "
+                               "found in ", kMaxAttempts, " attempts"));
+}
+
+
+std::string CoupState::ToString() const {
+  const int phase = get_phase(&g_);
+  const int dealt = CardsDealt(g_);
+  std::string s = absl::StrCat("Turn ", g_.turn_count, " phase=",
+                               PhaseName(phase));
+  if (phase != PHASE_DEAL) {
+    absl::StrAppend(&s, " turn_player=p", get_turn_player(&g_),
+                    " active=p", get_active_player(&g_));
+    if (phase != PHASE_MAIN_ACTION) {
+      absl::StrAppend(&s, " pending=", ActionName(get_pending_action(&g_)));
+    }
+    if (phase == PHASE_CHALLENGE_BLOCK) {
+      absl::StrAppend(&s, " block=p", get_blocker(&g_), "/",
+                      CardName(get_block_card(&g_)));
+    }
+    if (phase == PHASE_EXCHANGE_DISCARD) {
+      absl::StrAppend(&s, " drawn=[", CardName(get_exchange_card0(&g_)), " ",
+                      CardName(get_exchange_card1(&g_)), "] first_discard=",
+                      get_first_discard(&g_));
+    }
+  } else {
+    absl::StrAppend(&s, " dealt=", dealt);
+  }
+  if (IsTerminal()) absl::StrAppend(&s, " TERMINAL winner=p", get_winner(&g_));
+  for (int q = 0; q < num_players_; ++q) {
+    absl::StrAppend(&s, "\n p", q, ": coins=", player_coins(&g_, q), " [");
+    for (int k = 0; k < 2; ++k) {
+      if (k) absl::StrAppend(&s, " ");
+      if (2 * q + k >= dealt) {
+        absl::StrAppend(&s, "-");
+        continue;
+      }
+      int alive = k ? player_card1_alive(&g_, q) : player_card0_alive(&g_, q);
+      int type = k ? player_card1_type(&g_, q) : player_card0_type(&g_, q);
+      absl::StrAppend(&s, CardName(type), alive ? "" : "(dead)");
+    }
+    absl::StrAppend(&s, "]");
+  }
+  absl::StrAppend(&s, "\n deck:");
+  for (int c = 0; c < kNumCardTypes; ++c) {
+    absl::StrAppend(&s, " ", CardName(c), "=", deck_count(&g_, c));
+  }
+  return s;
 }
 
 std::vector<double> CoupState::Returns() const {
-  std::vector<double> returns(NumPlayers(), 0.0);
-  if (winner_ >= 0) {
-    for (int i = 0; i < NumPlayers(); i++) {
-      returns[i] = (i == winner_) ? 1.0 : -1.0;
-    }
-  }
+  if (!IsTerminal()) return std::vector<double>(num_players_, 0.0);
+  const int winner = get_winner(&g_);
+  std::vector<double> returns(num_players_, -1.0 / (num_players_ - 1));
+  SPIEL_CHECK_GE(winner, 0);
+  returns[winner] = 1.0;
   return returns;
 }
 
 std::unique_ptr<State> CoupState::Clone() const {
   return std::make_unique<CoupState>(*this);
-}
-
-// ===========================================================================
-// CoupState -- Chance outcomes
-// ===========================================================================
-
-std::vector<std::pair<Action, double>> CoupState::ChanceOutcomes() const {
-  chance_outcomes_cache_.clear();
-  assert(phase_ == kDeal || phase_ == kChanceRedraw ||
-         phase_ == kChanceExchange);
-  int total = DeckTotal();
-  assert(total > 0);
-  for (int i = 0; i < kNumCardTypes; i++) {
-    if (deck_[i] > 0) {
-      chance_outcomes_cache_.push_back({i, static_cast<double>(deck_[i]) / total});
-    }
-  }
-  return chance_outcomes_cache_;
-}
-
-// ===========================================================================
-// CoupState -- Legal actions
-// ===========================================================================
-
-std::vector<Action> CoupState::LegalActions() const {
-  legal_actions_cache_.clear();
-  if (IsTerminal()) return legal_actions_cache_;
-  if (phase_ == kDeal || phase_ == kChanceRedraw ||
-      phase_ == kChanceExchange) {
-    for (int i = 0; i < kNumCardTypes; i++) {
-      if (deck_[i] > 0) legal_actions_cache_.push_back(i);
-    }
-    return legal_actions_cache_;
-  }
-  switch (phase_) {
-    case kMainAction: LegalActionsMainAction(); break;
-    case kChallengeAction: LegalActionsChallengeAction(); break;
-    case kBlock: LegalActionsBlock(); break;
-    case kChallengeBlock: LegalActionsChallengeBlock(); break;
-    case kLoseCard: LegalActionsLoseCard(); break;
-    case kExchangeDiscard: LegalActionsExchangeDiscard(); break;
-    default:
-      assert(false);
-      break;
-  }
-  return legal_actions_cache_;
-}
-
-void CoupState::LegalActionsMainAction() const {
-  auto& actions = legal_actions_cache_;
-  int np = NumPlayers();
-  int coins = players_[active_player_].coins;
-
-  // If 10+ coins, must coup.
-  if (coins >= kForceCoupThreshold) {
-    for (int t = 0; t < np; t++) {
-      if (t != active_player_ && PlayerIsAlive(t)) {
-        actions.push_back(kCoupPlayer0 + t);
-      }
-    }
-    return;
-  }
-
-  // Income always available.
-  actions.push_back(kIncome);
-  // Foreign aid always available.
-  actions.push_back(kForeignAid);
-  // Tax (claim Duke).
-  actions.push_back(kTax);
-  // Exchange (claim Ambassador).
-  actions.push_back(kExchange);
-
-  // Targeted actions.
-  for (int t = 0; t < np; t++) {
-    if (t == active_player_ || !PlayerIsAlive(t)) continue;
-    // Coup (need 7+ coins).
-    if (coins >= kCoupCost) {
-      actions.push_back(kCoupPlayer0 + t);
-    }
-    // Steal (claim Captain) -- target must be alive.
-    actions.push_back(kStealPlayer0 + t);
-    // Assassinate (claim Assassin, need 3+ coins).
-    if (coins >= kAssassinateCost) {
-      actions.push_back(kAssassinatePlayer0 + t);
-    }
-  }
-}
-
-void CoupState::LegalActionsChallengeAction() const {
-  legal_actions_cache_.push_back(kChallenge);
-  legal_actions_cache_.push_back(kPass);
-}
-
-void CoupState::LegalActionsBlock() const {
-  auto& actions = legal_actions_cache_;
-  int pa = pending_action_;
-
-  // Pass is always available.
-  actions.push_back(kPass);
-
-  if (pa == kForeignAid) {
-    actions.push_back(kBlockDuke);
-  } else if (pa >= kStealPlayer0 && pa <= kStealPlayer0 + 5) {
-    actions.push_back(kBlockCaptain);
-    actions.push_back(kBlockAmbassador);
-  } else if (pa >= kAssassinatePlayer0 && pa <= kAssassinatePlayer0 + 5) {
-    actions.push_back(kBlockContessa);
-  }
-}
-
-void CoupState::LegalActionsChallengeBlock() const {
-  legal_actions_cache_.push_back(kChallenge);
-  legal_actions_cache_.push_back(kPass);
-}
-
-void CoupState::LegalActionsLoseCard() const {
-  const auto& p = players_[lose_card_player_];
-  if (p.cards[0].alive) legal_actions_cache_.push_back(kDiscardSlot0);
-  if (p.cards[1].alive) legal_actions_cache_.push_back(kDiscardSlot1);
-}
-
-void CoupState::LegalActionsExchangeDiscard() const {
-  auto& actions = legal_actions_cache_;
-  // The player has their own cards (slots 0,1) and exchange cards (slots 2,3).
-  // Available slots: own alive cards + exchange cards that exist.
-  // Collect which slots are available.
-  bool slot_available[4] = {false, false, false, false};
-  if (players_[turn_player_].cards[0].alive) slot_available[0] = true;
-  if (players_[turn_player_].cards[1].alive) slot_available[1] = true;
-  if (exchange_cards_[0] >= 0) slot_available[2] = true;
-  if (exchange_cards_[1] >= 0) slot_available[3] = true;
-
-  if (first_discard_ < 0) {
-    // First discard: can pick any available slot, BUT must leave at least
-    // one higher-indexed available slot for the second discard (canonical
-    // ordering constraint).
-    for (int s = 0; s < 4; s++) {
-      if (!slot_available[s]) continue;
-      // Check if there exists at least one available slot with index > s.
-      bool has_higher = false;
-      for (int t = s + 1; t < 4; t++) {
-        if (slot_available[t]) { has_higher = true; break; }
-      }
-      if (has_higher) {
-        actions.push_back(kDiscardSlot0 + s);
-      }
-    }
-  } else {
-    // Second discard: only slots with index strictly above first_discard_.
-    for (int s = first_discard_ + 1; s < 4; s++) {
-      if (slot_available[s]) {
-        actions.push_back(kDiscardSlot0 + s);
-      }
-    }
-  }
-}
-
-// ===========================================================================
-// CoupState -- DoApplyAction
-// ===========================================================================
-
-void CoupState::DoApplyAction(Action action) {
-  switch (phase_) {
-    case kDeal:
-      AdvanceDeal(action);
-      break;
-    case kChanceRedraw:
-      // Replace the revealed card with a new draw from deck.
-      {
-        // The claimant's card was shuffled back already. Now draw replacement.
-        // Find which card slot of the claimant to replace.
-        // The claimant had revealed a card during challenge defense. That card
-        // was shuffled back. Now assign the new card.
-        int claimant = challenge_on_block_ ? blocker_ : turn_player_;
-        // Find the dead slot that we just revealed and need to replace.
-        // During challenge defense: the revealed card was marked alive still
-        // (it was shuffled back), so we need to find the slot that had the
-        // claimed card. We stored which slot in claimed_card_.
-        // Actually, let's track this properly. The card was already shuffled
-        // back into the deck (done in ResolveChallenge). Now we just need to
-        // assign the new drawn card to that slot.
-        // The slot was the one with the claimed card type.
-        bool assigned = false;
-        for (int s = 0; s < kCardsPerPlayer; s++) {
-          if (players_[claimant].cards[s].alive &&
-              players_[claimant].cards[s].type == claimed_card_) {
-            players_[claimant].cards[s].type = action;
-            assigned = true;
-            break;
-          }
-        }
-        assert(assigned);
-        DeckRemove(action);
-
-        // Challenger loses influence.
-        lose_card_player_ = challenger_;
-        active_player_ = challenger_;
-        phase_ = kLoseCard;
-        if (challenge_on_block_) {
-          // Block challenge failed (blocker had the card).
-          // Challenger loses card, then block stands -> action cancelled.
-          post_lose_card_phase_ = kResolve;
-          action_blocked_ = true;
-          needs_block_ = false;
-        } else {
-          // Action challenge failed (claimant had the card).
-          // Challenger loses card, then action proceeds (possibly through block).
-          post_lose_card_phase_ = kResolve;
-          action_blocked_ = false;
-          needs_block_ = IsBlockable(pending_action_);
-        }
-      }
-      break;
-    case kChanceExchange:
-      // Draw a card for ambassador exchange.
-      exchange_cards_[exchange_draw_count_] = action;
-      DeckRemove(action);
-      exchange_draw_count_++;
-      if (exchange_draw_count_ >= 2) {
-        // Both cards drawn. Move to exchange discard.
-        phase_ = kExchangeDiscard;
-        active_player_ = turn_player_;
-        first_discard_ = -1;
-      }
-      // Otherwise stay in kChanceExchange for the second draw.
-      break;
-    case kMainAction:
-      ApplyMainAction(action);
-      break;
-    case kChallengeAction:
-      ApplyChallengeAction(action);
-      break;
-    case kBlock:
-      ApplyBlock(action);
-      break;
-    case kChallengeBlock:
-      ApplyChallengeBlock(action);
-      break;
-    case kLoseCard:
-      ApplyLoseCard(action);
-      break;
-    case kExchangeDiscard:
-      ApplyExchangeDiscard(action);
-      break;
-    case kResolve:
-      // Should not happen -- resolve is automatic.
-      assert(false);
-      break;
-  }
-}
-
-// ===========================================================================
-// Phase: DEAL
-// ===========================================================================
-
-void CoupState::AdvanceDeal(int card_type) {
-  int np = NumPlayers();
-  int player_idx = deal_count_ / kCardsPerPlayer;
-  int card_slot = deal_count_ % kCardsPerPlayer;
-
-  players_[player_idx].cards[card_slot].type = card_type;
-  players_[player_idx].cards[card_slot].alive = true;
-  DeckRemove(card_type);
-  deal_count_++;
-
-  if (deal_count_ >= np * kCardsPerPlayer) {
-    // Deal complete. Start main action phase.
-    StartMainAction();
-  }
-  // Otherwise, stay in kDeal for next chance node.
-}
-
-// ===========================================================================
-// Phase: MAIN_ACTION
-// ===========================================================================
-
-void CoupState::StartMainAction() {
-  phase_ = kMainAction;
-  active_player_ = turn_player_;
-  pending_action_ = -1;
-  responded_mask_ = 0;
-  blocker_ = -1;
-  block_card_ = -1;
-  challenger_ = -1;
-  claimed_card_ = -1;
-  action_blocked_ = false;
-  challenge_on_block_ = false;
-  needs_block_ = false;
-  exchange_cards_[0] = -1;
-  exchange_cards_[1] = -1;
-  exchange_draw_count_ = 0;
-  first_discard_ = -1;
-
-  // Pre-set responded_mask for dead players and turn_player.
-  int np = NumPlayers();
-  for (int i = 0; i < np; i++) {
-    if (!PlayerIsAlive(i) || i == turn_player_) {
-      responded_mask_ |= (1 << i);
-    }
-  }
-}
-
-void CoupState::ApplyMainAction(Action action) {
-  pending_action_ = action;
-  AddHistoryEntry(active_player_, action, kMainAction, 0);
-
-  // Deduct assassination cost immediately.
-  if (action >= kAssassinatePlayer0 && action <= kAssassinatePlayer0 + 5) {
-    players_[turn_player_].coins -= kAssassinateCost;
-  }
-
-  // Unchallengeable, unblockable actions resolve immediately.
-  if (action == kIncome) {
-    // +1 coin, advance turn.
-    players_[turn_player_].coins =
-        std::min(players_[turn_player_].coins + 1, kMaxCoins);
-    AdvanceTurn();
-    return;
-  }
-
-  if (action >= kCoupPlayer0 && action <= kCoupPlayer0 + 5) {
-    // Pay 7, target loses influence.
-    players_[turn_player_].coins -= kCoupCost;
-    int target = action - kCoupPlayer0;
-    lose_card_player_ = target;
-    active_player_ = target;
-    phase_ = kLoseCard;
-    post_lose_card_phase_ = kResolve;
-    action_blocked_ = false;
-    return;
-  }
-
-  // Challengeable actions: tax, exchange, steal, assassinate, foreign_aid.
-  // Foreign aid is not challengeable but is blockable.
-  if (action == kForeignAid) {
-    // Foreign aid: not challengeable, but blockable by anyone claiming Duke.
-    // Go to BLOCK phase -- cycle through other players.
-    phase_ = kBlock;
-    // Reset responded_mask: turn_player already set, dead players set.
-    // Find first responder.
-    active_player_ = NextResponder(turn_player_);
-    if (responded_mask_ == ((1 << NumPlayers()) - 1)) {
-      // No one can block (shouldn't happen in valid game).
-      ApplyResolve();
-    }
-    return;
-  }
-
-  // Challengeable actions: tax, exchange, steal, assassinate.
-  if (IsChallengeable(action)) {
-    // Determine the claimed card.
-    claimed_card_ = GetClaimedCard(action);
-    // Go to CHALLENGE_ACTION phase. Cycle through opponents.
-    phase_ = kChallengeAction;
-    active_player_ = NextResponder(turn_player_);
-    return;
-  }
-
-  // Should not reach here.
-  assert(false);
-}
-
-// ===========================================================================
-// Phase: CHALLENGE_ACTION
-// ===========================================================================
-
-void CoupState::ApplyChallengeAction(Action action) {
-  AddHistoryEntry(active_player_, action, kChallengeAction, 0);
-
-  if (action == kChallenge) {
-    challenger_ = active_player_;
-    // Check if claimant (turn_player_) actually has the claimed card.
-    bool has_card = false;
-    for (int s = 0; s < kCardsPerPlayer; s++) {
-      if (players_[turn_player_].cards[s].alive &&
-          players_[turn_player_].cards[s].type == claimed_card_) {
-        has_card = true;
-        break;
-      }
-    }
-
-    if (has_card) {
-      // Claimant has the card. Shuffle it back, draw replacement (chance node).
-      // Challenger will lose influence after.
-      challenge_on_block_ = false;
-      // Shuffle the claimed card back into deck.
-      DeckAdd(claimed_card_);
-      // Move to chance node for redraw.
-      phase_ = kChanceRedraw;
-    } else {
-      // Claimant doesn't have the card. Claimant loses influence.
-      // Action is cancelled.
-      if (parent_game()->refund_on_challenge() &&
-          pending_action_ >= kAssassinatePlayer0 &&
-          pending_action_ <= kAssassinatePlayer0 + 5) {
-        players_[turn_player_].coins += kAssassinateCost;
-      }
-      lose_card_player_ = turn_player_;
-      active_player_ = turn_player_;
-      phase_ = kLoseCard;
-      post_lose_card_phase_ = kResolve;
-      action_blocked_ = true;  // Action doesn't go through.
-    }
-    return;
-  }
-
-  if (action == kPass) {
-    // This player passes on challenging.
-    responded_mask_ |= (1 << active_player_);
-    // Check if all have responded.
-    int full_mask = (1 << NumPlayers()) - 1;
-    if ((responded_mask_ & full_mask) == full_mask) {
-      // No one challenged. Move to block phase if blockable, else resolve.
-      if (IsBlockable(pending_action_)) {
-        phase_ = kBlock;
-        // Reset responded mask for block phase.
-        responded_mask_ = 0;
-        int np = NumPlayers();
-        for (int i = 0; i < np; i++) {
-          if (!PlayerIsAlive(i)) {
-            responded_mask_ |= (1 << i);
-          }
-        }
-        // For steal/assassinate: only target can block.
-        // For foreign aid: anyone except turn_player can block (handled above).
-        int target = GetTarget(pending_action_);
-        if (target >= 0) {
-          // Only target can block steal/assassinate.
-          for (int i = 0; i < np; i++) {
-            if (i != target) {
-              responded_mask_ |= (1 << i);
-            }
-          }
-          // Check if target is still alive (might have died earlier).
-          int full_mask2 = (1 << np) - 1;
-          if ((responded_mask_ & full_mask2) == full_mask2) {
-            // Target is dead; no one to block. Resolve.
-            ApplyResolve();
-            return;
-          }
-          active_player_ = target;
-        } else {
-          // Foreign aid -- shouldn't be here (handled in ApplyMainAction).
-          assert(false);
-        }
-      } else {
-        // Unchallengeable + unblockable? Tax and exchange are challengeable
-        // but not blockable (well, exchange is just not blockable).
-        // Tax and exchange: no block, resolve.
-        ApplyResolve();
-      }
-    } else {
-      // Next responder.
-      active_player_ = NextResponder(active_player_);
-    }
-    return;
-  }
-
-  assert(false);
-}
-
-// ===========================================================================
-// Phase: BLOCK
-// ===========================================================================
-
-void CoupState::ApplyBlock(Action action) {
-  AddHistoryEntry(active_player_, action, kBlock, 0);
-
-  if (action == kPass) {
-    responded_mask_ |= (1 << active_player_);
-    int full_mask = (1 << NumPlayers()) - 1;
-    if ((responded_mask_ & full_mask) == full_mask) {
-      // No one blocked. Resolve the action.
-      ApplyResolve();
-    } else {
-      active_player_ = NextResponder(active_player_);
-    }
-    return;
-  }
-
-  // A block was declared.
-  blocker_ = active_player_;
-  if (action == kBlockContessa) {
-    block_card_ = kContessa;
-  } else if (action == kBlockCaptain) {
-    block_card_ = kCaptain;
-  } else if (action == kBlockAmbassador) {
-    block_card_ = kAmbassador;
-  } else if (action == kBlockDuke) {
-    block_card_ = kDuke;
-  } else {
-    assert(false);
-  }
-
-  // The block can be challenged. Cycle through other players.
-  phase_ = kChallengeBlock;
-  responded_mask_ = 0;
-  int np = NumPlayers();
-  for (int i = 0; i < np; i++) {
-    if (!PlayerIsAlive(i) || i == blocker_) {
-      responded_mask_ |= (1 << i);
-    }
-  }
-  active_player_ = NextResponder(blocker_);
-  // If no one can challenge (all dead/responded), block stands.
-  int full_mask = (1 << np) - 1;
-  if ((responded_mask_ & full_mask) == full_mask) {
-    // Block stands, action cancelled.
-    action_blocked_ = true;
-    ApplyResolve();
-  }
-}
-
-// ===========================================================================
-// Phase: CHALLENGE_BLOCK
-// ===========================================================================
-
-void CoupState::ApplyChallengeBlock(Action action) {
-  AddHistoryEntry(active_player_, action, kChallengeBlock, 0);
-
-  if (action == kChallenge) {
-    challenger_ = active_player_;
-    // Check if blocker has the block_card_.
-    bool has_card = false;
-    for (int s = 0; s < kCardsPerPlayer; s++) {
-      if (players_[blocker_].cards[s].alive &&
-          players_[blocker_].cards[s].type == block_card_) {
-        has_card = true;
-        break;
-      }
-    }
-
-    if (has_card) {
-      // Blocker has the card. Shuffle back, redraw. Challenger loses influence.
-      challenge_on_block_ = true;
-      claimed_card_ = block_card_;
-      DeckAdd(block_card_);
-      phase_ = kChanceRedraw;
-    } else {
-      // Blocker doesn't have it. Blocker loses influence. Block fails.
-      // Action goes through after.
-      lose_card_player_ = blocker_;
-      active_player_ = blocker_;
-      phase_ = kLoseCard;
-      post_lose_card_phase_ = kResolve;
-      action_blocked_ = false;  // Block failed, action proceeds.
-    }
-    return;
-  }
-
-  if (action == kPass) {
-    responded_mask_ |= (1 << active_player_);
-    int full_mask = (1 << NumPlayers()) - 1;
-    if ((responded_mask_ & full_mask) == full_mask) {
-      // No one challenged the block. Block stands.
-      action_blocked_ = true;
-      ApplyResolve();
-    } else {
-      active_player_ = NextResponder(active_player_);
-    }
-    return;
-  }
-
-  assert(false);
-}
-
-// ===========================================================================
-// Phase: LOSE_CARD
-// ===========================================================================
-
-void CoupState::ApplyLoseCard(Action action) {
-  AddHistoryEntry(lose_card_player_, action, kLoseCard, 0);
-
-  int slot = action - kDiscardSlot0;  // 0 or 1
-  assert(slot == 0 || slot == 1);
-  assert(players_[lose_card_player_].cards[slot].alive);
-
-  players_[lose_card_player_].cards[slot].alive = false;
-
-  CheckGameOver();
-  if (IsTerminal()) return;
-
-  // Transition to the post-lose-card phase.
-  if (needs_block_) {
-    // After a failed action challenge, the action needs to go through BLOCK.
-    needs_block_ = false;
-    int target = GetTarget(pending_action_);
-    if (target >= 0 && PlayerIsAlive(target)) {
-      phase_ = kBlock;
-      responded_mask_ = 0;
-      int np = NumPlayers();
-      for (int i = 0; i < np; i++) {
-        if (!PlayerIsAlive(i) || i != target) {
-          responded_mask_ |= (1 << i);
-        }
-      }
-      active_player_ = target;
-      return;
-    }
-    // Target is dead (killed by challenge?), resolve directly.
-    ApplyResolve();
-  } else {
-    phase_ = post_lose_card_phase_;
-    if (phase_ == kResolve) {
-      ApplyResolve();
-    }
-  }
-}
-
-// ===========================================================================
-// Phase: EXCHANGE_DISCARD
-// ===========================================================================
-
-void CoupState::ApplyExchangeDiscard(Action action) {
-  AddHistoryEntry(turn_player_, action, kExchangeDiscard, 0);
-
-  int slot = action - kDiscardSlot0;  // 0-3
-
-  if (first_discard_ < 0) {
-    // First discard.
-    first_discard_ = slot;
-    // Return the card from this slot to the deck.
-    int card_type = -1;
-    if (slot < 2) {
-      card_type = players_[turn_player_].cards[slot].type;
-      // Mark this slot as "discarded" -- we'll clean up after second discard.
-    } else {
-      card_type = exchange_cards_[slot - 2];
-    }
-    DeckAdd(card_type);
-
-    // Always need a second discard (player keeps N alive cards, discards 2).
-    // Stay in EXCHANGE_DISCARD phase for second pick.
-    return;
-  }
-
-  // Second discard.
-  int second_slot = slot;
-  assert(second_slot > first_discard_);
-
-  // Return this card to deck.
-  int card_type = -1;
-  if (second_slot < 2) {
-    card_type = players_[turn_player_].cards[second_slot].type;
-  } else {
-    card_type = exchange_cards_[second_slot - 2];
-  }
-  DeckAdd(card_type);
-
-  // Now assign the kept cards to the player's alive slots.
-  // Collect the kept cards (slots NOT in {first_discard_, second_slot}).
-  std::vector<int> kept_types;
-  for (int s = 0; s < 4; s++) {
-    if (s == first_discard_ || s == second_slot) continue;
-    if (s < 2) {
-      if (players_[turn_player_].cards[s].alive) {
-        kept_types.push_back(players_[turn_player_].cards[s].type);
-      }
-    } else {
-      if (exchange_cards_[s - 2] >= 0) {
-        kept_types.push_back(exchange_cards_[s - 2]);
-      }
-    }
-  }
-
-  // Assign kept cards to alive slots.
-  int ki = 0;
-  for (int s = 0; s < kCardsPerPlayer; s++) {
-    if (players_[turn_player_].cards[s].alive) {
-      assert(ki < static_cast<int>(kept_types.size()));
-      players_[turn_player_].cards[s].type = kept_types[ki++];
-    }
-  }
-
-  // Clean up exchange state.
-  exchange_cards_[0] = -1;
-  exchange_cards_[1] = -1;
-  first_discard_ = -1;
-
-  // Exchange complete, advance turn.
-  AdvanceTurn();
-}
-
-// ===========================================================================
-// Phase: RESOLVE
-// ===========================================================================
-
-void CoupState::ApplyResolve() {
-  // If action was blocked or cancelled (by failed challenge), just advance.
-  if (action_blocked_) {
-    AdvanceTurn();
-    return;
-  }
-
-  int pa = pending_action_;
-
-  if (pa == kForeignAid) {
-    players_[turn_player_].coins =
-        std::min(players_[turn_player_].coins + 2, kMaxCoins);
-    AdvanceTurn();
-  } else if (pa == kTax) {
-    players_[turn_player_].coins =
-        std::min(players_[turn_player_].coins + 3, kMaxCoins);
-    AdvanceTurn();
-  } else if (pa == kExchange) {
-    // Draw 2 cards from deck (chance nodes).
-    phase_ = kChanceExchange;
-    exchange_draw_count_ = 0;
-    exchange_cards_[0] = -1;
-    exchange_cards_[1] = -1;
-  } else if (pa >= kStealPlayer0 && pa <= kStealPlayer0 + 5) {
-    int target = pa - kStealPlayer0;
-    int stolen = std::min(2, players_[target].coins);
-    players_[target].coins -= stolen;
-    players_[turn_player_].coins =
-        std::min(players_[turn_player_].coins + stolen, kMaxCoins);
-    AdvanceTurn();
-  } else if (pa >= kAssassinatePlayer0 && pa <= kAssassinatePlayer0 + 5) {
-    // 3 coins already deducted. Target loses influence.
-    int target = pa - kAssassinatePlayer0;
-    if (PlayerIsAlive(target)) {
-      lose_card_player_ = target;
-      active_player_ = target;
-      phase_ = kLoseCard;
-      post_lose_card_phase_ = kResolve;
-      // Set action_blocked_ to true so that when we come back to resolve
-      // after lose_card, we just advance turn.
-      action_blocked_ = true;
-    } else {
-      // Target already dead (from challenge?). Just advance.
-      AdvanceTurn();
-    }
-  } else if (pa >= kCoupPlayer0 && pa <= kCoupPlayer0 + 5) {
-    // Coup was already handled (lose_card before resolve). Advance turn.
-    AdvanceTurn();
-  } else if (pa == kIncome) {
-    // Should have been resolved immediately.
-    AdvanceTurn();
-  } else {
-    // Unknown action.
-    assert(false);
-  }
-}
-
-// ===========================================================================
-// Helpers
-// ===========================================================================
-
-int CoupState::DeckTotal() const {
-  int total = 0;
-  for (int i = 0; i < kNumCardTypes; i++) total += deck_[i];
-  return total;
-}
-
-void CoupState::DeckRemove(int card_type) {
-  assert(card_type >= 0 && card_type < kNumCardTypes);
-  assert(deck_[card_type] > 0);
-  deck_[card_type]--;
-}
-
-void CoupState::DeckAdd(int card_type) {
-  assert(card_type >= 0 && card_type < kNumCardTypes);
-  deck_[card_type]++;
-}
-
-bool CoupState::PlayerIsAlive(int p) const {
-  return players_[p].IsAlive();
-}
-
-int CoupState::CountAlivePlayers() const {
-  int count = 0;
-  for (int i = 0; i < NumPlayers(); i++) {
-    if (PlayerIsAlive(i)) count++;
-  }
-  return count;
-}
-
-void CoupState::CheckGameOver() {
-  int alive_count = 0;
-  int last_alive = -1;
-  for (int i = 0; i < NumPlayers(); i++) {
-    if (PlayerIsAlive(i)) {
-      alive_count++;
-      last_alive = i;
-    }
-  }
-  if (alive_count == 1) {
-    winner_ = last_alive;
-    return;
-  }
-  // Max turns tiebreaker: most alive cards, then most coins
-  if (turn_count_ >= kMaxTurns && alive_count > 1) {
-    int best = -1;
-    int best_cards = -1, best_coins = -1;
-    for (int i = 0; i < NumPlayers(); i++) {
-      if (!PlayerIsAlive(i)) continue;
-      int cards = players_[i].NumAliveCards();
-      int coins = players_[i].coins;
-      if (cards > best_cards || (cards == best_cards && coins > best_coins)) {
-        best = i;
-        best_cards = cards;
-        best_coins = coins;
-      }
-    }
-    winner_ = best;
-  }
-}
-
-int CoupState::NextAlivePlayer(int from) const {
-  int np = NumPlayers();
-  int p = (from + 1) % np;
-  while (p != from) {
-    if (PlayerIsAlive(p)) return p;
-    p = (p + 1) % np;
-  }
-  return from;  // only one alive
-}
-
-int CoupState::NextResponder(int from) const {
-  int np = NumPlayers();
-  int p = (from + 1) % np;
-  int full_mask = (1 << np) - 1;
-  while ((responded_mask_ & full_mask) != full_mask) {
-    if (!(responded_mask_ & (1 << p))) {
-      return p;
-    }
-    p = (p + 1) % np;
-  }
-  // All have responded -- shouldn't be called in this case.
-  return -1;
-}
-
-void CoupState::AdvanceTurn() {
-  turn_count_++;
-  CheckGameOver();
-  if (IsTerminal()) return;
-  turn_player_ = NextAlivePlayer(turn_player_);
-  StartMainAction();
-}
-
-int CoupState::GetTarget(int action) const {
-  if (action >= kCoupPlayer0 && action <= kCoupPlayer0 + 5) {
-    return action - kCoupPlayer0;
-  }
-  if (action >= kStealPlayer0 && action <= kStealPlayer0 + 5) {
-    return action - kStealPlayer0;
-  }
-  if (action >= kAssassinatePlayer0 && action <= kAssassinatePlayer0 + 5) {
-    return action - kAssassinatePlayer0;
-  }
-  return -1;  // No target.
-}
-
-int CoupState::GetClaimedCard(int action) const {
-  if (action == kTax) return kDuke;
-  if (action == kExchange) return kAmbassador;
-  if (action >= kStealPlayer0 && action <= kStealPlayer0 + 5) return kCaptain;
-  if (action >= kAssassinatePlayer0 && action <= kAssassinatePlayer0 + 5) {
-    return kAssassin;
-  }
-  return -1;
-}
-
-bool CoupState::IsChallengeable(int action) const {
-  return action == kTax || action == kExchange ||
-         (action >= kStealPlayer0 && action <= kStealPlayer0 + 5) ||
-         (action >= kAssassinatePlayer0 && action <= kAssassinatePlayer0 + 5);
-}
-
-bool CoupState::IsBlockable(int action) const {
-  // Steal and assassinate are blockable by the target.
-  // Foreign aid is blockable by anyone (but handled separately).
-  return (action >= kStealPlayer0 && action <= kStealPlayer0 + 5) ||
-         (action >= kAssassinatePlayer0 && action <= kAssassinatePlayer0 + 5);
-}
-
-void CoupState::AddHistoryEntry(int acting_player, int action, int phase,
-                                int result) {
-  history_buffer_.push_back({acting_player, action, phase, result});
-}
-
-// ===========================================================================
-// CoupState -- ActionToString
-// ===========================================================================
-
-std::string CoupState::ActionToString(Player player, Action action) const {
-  if (phase_ == kDeal || phase_ == kChanceRedraw ||
-      phase_ == kChanceExchange) {
-    return std::string("Deal:") + CardName(action);
-  }
-  switch (action) {
-    case kIncome: return "Income";
-    case kForeignAid: return "ForeignAid";
-    case kTax: return "Tax";
-    case kExchange: return "Exchange";
-    case kChallenge: return "Challenge";
-    case kPass: return "Pass";
-    case kBlockContessa: return "BlockContessa";
-    case kBlockCaptain: return "BlockCaptain";
-    case kBlockAmbassador: return "BlockAmbassador";
-    case kBlockDuke: return "BlockDuke";
-    case kDiscardSlot0: return "DiscardSlot0";
-    case kDiscardSlot1: return "DiscardSlot1";
-    case kDiscardSlot2: return "DiscardSlot2";
-    case kDiscardSlot3: return "DiscardSlot3";
-    default: break;
-  }
-  if (action >= kCoupPlayer0 && action <= kCoupPlayer0 + 5) {
-    return "Coup->" + std::to_string(action - kCoupPlayer0);
-  }
-  if (action >= kStealPlayer0 && action <= kStealPlayer0 + 5) {
-    return "Steal->" + std::to_string(action - kStealPlayer0);
-  }
-  if (action >= kAssassinatePlayer0 && action <= kAssassinatePlayer0 + 5) {
-    return "Assassinate->" + std::to_string(action - kAssassinatePlayer0);
-  }
-  return "Unknown(" + std::to_string(action) + ")";
-}
-
-// ===========================================================================
-// CoupState -- ToString
-// ===========================================================================
-
-std::string CoupState::ToString() const {
-  std::ostringstream ss;
-  ss << "Phase=" << phase_ << " Turn=" << turn_player_
-     << " Active=" << active_player_ << " Pending=" << pending_action_
-     << " Winner=" << winner_ << "\n";
-  for (int i = 0; i < NumPlayers(); i++) {
-    ss << "P" << i << ": coins=" << players_[i].coins;
-    for (int s = 0; s < kCardsPerPlayer; s++) {
-      ss << " [" << CardName(players_[i].cards[s].type)
-         << (players_[i].cards[s].alive ? "*" : "X") << "]";
-    }
-    ss << "\n";
-  }
-  ss << "Deck:";
-  for (int i = 0; i < kNumCardTypes; i++) {
-    ss << " " << CardName(i) << "=" << deck_[i];
-  }
-  ss << "\n";
-  return ss.str();
-}
-
-// ===========================================================================
-// CoupState -- InformationStateString
-// ===========================================================================
-
-std::string CoupState::InformationStateString(Player player) const {
-  // Encodes: own cards, public information, full action history.
-  // Two states are in the same information set iff this string matches.
-  std::ostringstream ss;
-  ss << "p" << player << ":";
-
-  // Own cards (private).
-  for (int s = 0; s < kCardsPerPlayer; s++) {
-    ss << players_[player].cards[s].type
-       << (players_[player].cards[s].alive ? "a" : "d");
-  }
-  ss << "c" << players_[player].coins;
-
-  // Public info for all players: revealed cards, coins, alive status.
-  ss << "|pub:";
-  for (int i = 0; i < NumPlayers(); i++) {
-    ss << "P" << i << ":";
-    for (int s = 0; s < kCardsPerPlayer; s++) {
-      if (!players_[i].cards[s].alive) {
-        // Revealed card: type is public.
-        ss << players_[i].cards[s].type << "d";
-      } else {
-        // Face-down: type hidden from others, but we include for self above.
-        ss << "?a";
-      }
-    }
-    ss << "c" << players_[i].coins << ";";
-  }
-
-  // Phase info.
-  ss << "|ph:" << phase_ << ",t:" << turn_player_ << ",a:" << active_player_
-     << ",pa:" << pending_action_;
-
-  // Responded mask + block info.
-  ss << ",rm:" << static_cast<int>(responded_mask_);
-  if (blocker_ >= 0) ss << ",bl:" << blocker_ << ":" << block_card_;
-
-  // Exchange cards (only visible to turn_player_).
-  if (player == turn_player_ && phase_ == kExchangeDiscard) {
-    ss << ",ex:" << exchange_cards_[0] << "," << exchange_cards_[1];
-    if (first_discard_ >= 0) ss << ",fd:" << first_discard_;
-  }
-
-  // Full action history from State::history_.
-  ss << "|hist:";
-  for (const auto& h : history_) {
-    ss << h.action << ",";
-  }
-
-  return ss.str();
-}
-
-// ===========================================================================
-// CoupState -- InformationStateTensor
-// ===========================================================================
-
-void CoupState::InformationStateTensor(Player player,
-                                       absl::Span<float> values) const {
-  FillObservationTensor(player, values);
-}
-
-void CoupState::FillObservationTensor(Player player,
-                                      absl::Span<float> values) const {
-  assert(static_cast<int>(values.size()) >= kObservationTensorSize);
-  std::fill(values.begin(), values.begin() + kObservationTensorSize, 0.0f);
-  int offset = 0;
-
-  // 0-71: all players' cards — absolute encoding (6 players x 12 floats)
-  // Per card: type one-hot (5) + alive flag (1)
-  // Type visible if: (a) observer's own card, or (b) card is dead/revealed.
-  for (int p = 0; p < kMaxPlayers; p++) {
-    int base = p * 12;
-    if (p < NumPlayers()) {
-      bool is_self = (p == player);
-      // Card 0.
-      bool c0_alive = players_[p].cards[0].alive;
-      if (is_self || !c0_alive) {
-        values[base + players_[p].cards[0].type] = 1.0f;
-      }
-      values[base + 5] = c0_alive ? 1.0f : 0.0f;
-      // Card 1.
-      bool c1_alive = players_[p].cards[1].alive;
-      if (is_self || !c1_alive) {
-        values[base + 6 + players_[p].cards[1].type] = 1.0f;
-      }
-      values[base + 11] = c1_alive ? 1.0f : 0.0f;
-    }
-  }
-  offset = 72;
-
-  // 72-77: all_coins normalized /12 (6)
-  for (int i = 0; i < kMaxPlayers; i++) {
-    if (i < NumPlayers()) {
-      values[offset + i] =
-          static_cast<float>(players_[i].coins) / kMaxCoins;
-    }
-  }
-  offset += 6;
-
-  // 78-83: alive_mask (6)
-  for (int i = 0; i < kMaxPlayers; i++) {
-    if (i < NumPlayers() && PlayerIsAlive(i)) {
-      values[offset + i] = 1.0f;
-    }
-  }
-  offset += 6;
-
-  // 84-90: phase one-hot (7 phases: MAIN_ACTION through EXCHANGE_DISCARD)
-  // Map: MAIN_ACTION=0, CHALLENGE_ACTION=1, BLOCK=2, CHALLENGE_BLOCK=3,
-  //       LOSE_CARD=4, EXCHANGE_DISCARD=5, RESOLVE=6
-  // Chance phases are not encoded here (they map to nothing).
-  if (phase_ >= kMainAction && phase_ <= kResolve) {
-    values[offset + (phase_ - kMainAction)] = 1.0f;
-  }
-  offset += 7;
-
-  // 91-96: active_player one-hot (6)
-  if (active_player_ >= 0 && active_player_ < kMaxPlayers) {
-    values[offset + active_player_] = 1.0f;
-  }
-  offset += 6;
-
-  // 97-102: turn_player one-hot (6)
-  values[offset + turn_player_] = 1.0f;
-  offset += 6;
-
-  // 103-134: pending_action one-hot (32)
-  if (pending_action_ >= 0 && pending_action_ < kNumActions) {
-    values[offset + pending_action_] = 1.0f;
-  }
-  offset += 32;
-
-  // 135-140: responded_mask (6)
-  for (int i = 0; i < kMaxPlayers; i++) {
-    values[offset + i] = (responded_mask_ & (1 << i)) ? 1.0f : 0.0f;
-  }
-  offset += 6;
-
-  // 141-150: exchange_cards one-hot x 2 (10 = 2 x 5)
-  // Only visible to turn_player during exchange.
-  if (player == turn_player_ &&
-      (phase_ == kExchangeDiscard || phase_ == kChanceExchange)) {
-    if (exchange_cards_[0] >= 0 && exchange_cards_[0] < kNumCardTypes) {
-      values[offset + exchange_cards_[0]] = 1.0f;
-    }
-    if (exchange_cards_[1] >= 0 && exchange_cards_[1] < kNumCardTypes) {
-      values[offset + 5 + exchange_cards_[1]] = 1.0f;
-    }
-  }
-  offset += 10;
-
-  // 151-406: history x 4 floats each (256 = 64 x 4)
-  // Use State::history_ to fill. Each action encoded as:
-  //   acting_player/6, action/32, phase/10, result_flags
-  // We use our history_buffer_ which tracks acting_player, action, phase,
-  // result.
-  int hist_start = std::max(0, static_cast<int>(history_buffer_.size()) -
-                                   kHistoryLength);
-  for (int i = hist_start; i < static_cast<int>(history_buffer_.size()); i++) {
-    int idx = i - hist_start;
-    if (idx >= kHistoryLength) break;
-    int base = offset + idx * kHistoryEntrySize;
-    values[base + 0] =
-        static_cast<float>(history_buffer_[i].acting_player) / 6.0f;
-    values[base + 1] =
-        static_cast<float>(history_buffer_[i].action) / 32.0f;
-    values[base + 2] =
-        static_cast<float>(history_buffer_[i].phase) / 10.0f;
-    values[base + 3] = static_cast<float>(history_buffer_[i].result);
-  }
-  // offset += 256;  // total = 407
-}
-
-// ===========================================================================
-// CoupState -- ObservationString / ObservationTensor
-// ===========================================================================
-
-std::string CoupState::ObservationString(Player player) const {
-  // For now, reuse InformationStateString. A proper observation string
-  // would exclude full history for a more compact representation.
-  return InformationStateString(player);
-}
-
-void CoupState::ObservationTensor(Player player,
-                                  absl::Span<float> values) const {
-  FillObservationTensor(player, values);
 }
 
 }  // namespace coup
