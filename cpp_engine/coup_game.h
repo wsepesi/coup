@@ -15,7 +15,8 @@
 //                 returned cards. A function of InformationStateString, but
 //                 a fixed-size summary (not injective over histories).
 //   - Resample  = ResampleFromInfostate samples a full history consistent with
-//                 one player's infostate (see coup_game.cc), for IS-MCTS etc.
+//                 one player's infostate, for IS-MCTS etc. The sampler is the
+//                 C search API's coup_resample (c_engine/coup_search.c).
 //   - Chance    = C chance nodes (deal, challenge redraw, exchange draws).
 //                 Outcome index = card type (0..4). The RNG embedded in `Game`
 //                 is never used: game_init(g, n, 0, 0) leaves the deal as
@@ -36,9 +37,10 @@
 
 #include "open_spiel/spiel.h"
 
-// Both headers carry their own extern "C" guards.
+// All three headers carry their own extern "C" guards.
 #include "coup_core.h"
 #include "coup_obs.h"
+#include "coup_search.h"
 
 namespace open_spiel {
 namespace coup {
@@ -57,35 +59,18 @@ inline constexpr int kInfoSeatSize = 43;
 inline constexpr int kInfoStateTensorSize =
     kObservationTensorSize + kMaxPlayers * kInfoSeatSize + 5 * 3;
 
-// Upper bound on player decisions in one turn (one main action):
-//   1 main action
-//   + 3 response windows (challenge-action, block, challenge-block), each at
-//     most n-1 decisions (every other player passes, or someone acts)
-//   + 3 LOSE_CARD decisions (lost challenge on the action, lost challenge on
-//     the block, assassination/coup resolution)
-//   + 2 EXCHANGE_DISCARD picks
-// = 3n + 3. Loose (no single turn hits every term) but sound. A game has at
-// most MAX_TURNS turns: every turn ends in advance_turn() (turn_count++) or
-// game over, and is_done() fires at turn_count >= MAX_TURNS.
-inline int MaxDecisionsPerTurn(int num_players) { return 3 * num_players + 3; }
-// Chance nodes: 2n deal + at most 3 per turn (one redraw after a defended
-// action challenge + two exchange draws; a defended block challenge redraw
-// cannot co-occur with an exchange).
-inline int MaxChancePerTurn() { return 3; }
+// Game-length bounds; derivation in c_engine/coup_search.h
+// (COUP_MAX_DECISIONS_PER_TURN = 3n + 3, COUP_MAX_CHANCE_PER_TURN = 3).
+inline int MaxDecisionsPerTurn(int num_players) {
+  return COUP_MAX_DECISIONS_PER_TURN(num_players);
+}
+inline int MaxChancePerTurn() { return COUP_MAX_CHANCE_PER_TURN; }
 
-// One entry per applied action (chance or decision). Holds the extra facts
-// needed to render each player's information state without replaying.
-struct LoggedEvent {
-  uint8_t phase;   // engine phase BEFORE the action
-  uint8_t actor;   // decision: acting seat; chance: seat receiving the card
-  uint8_t action;  // decision: absolute action; chance: card type drawn
-  uint8_t info;    // LOSE_CARD: revealed card type;
-                   // CHALLENGE: 1 if the claim was true (challenger loses);
-                   // CHANCE_REDRAW: hand slot being replaced;
-                   // EXCHANGE_DISCARD: type of the discarded card (private)
-  uint8_t claimant;  // CHALLENGE: seat whose claim is challenged
-  uint8_t role;      // CHALLENGE: the challenged role
-};
+// One entry per applied action (chance or decision): the C search API's
+// event (phase before, actor, action, info, claimant, role), recorded by
+// coup_event_make. Holds the extra facts needed to render each player's
+// information state without replaying, and feeds coup_resample.
+using LoggedEvent = CoupLogEvent;
 
 class CoupGame;
 
