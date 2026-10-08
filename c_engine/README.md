@@ -28,4 +28,4 @@ make test-c    # from repo root
 - Stochasticity factored: `chance_outcomes()` for CFR enumeration, `step_with_rng()` for sampling
 - Action masking via 32-bit bitmask from `get_valid_actions()`
 
-See `plans/plan.md` for the full game rules spec, action indices, and observation layout.
+See the comments in `coup_core.h` for the state layout, phase machine and action indices, and `coup_obs.h` for the RL observation layout.

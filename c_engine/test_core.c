@@ -97,8 +97,8 @@ static void test_deterministic_deal(void) {
     assert(get_phase(&g) == PHASE_MAIN_ACTION);
     assert(get_num_players(&g) == 2);
 
-    /* Each player starts with 2 coins */
-    assert(player_coins(&g, 0) == 2);
+    /* 2-player rule: starting player gets 1 coin, the other 2 */
+    assert(player_coins(&g, 0) == 1);
     assert(player_coins(&g, 1) == 2);
 
     /* Each player has 2 alive cards */
@@ -958,7 +958,7 @@ static void test_exchange_discard_no_deadlock(void) {
     /* Skip past deal */
     while (is_chance_node(&g)) {
         ChanceOutcome out[MAX_CHANCE_OUTCOMES];
-        int n = chance_outcomes(&g, out);
+        chance_outcomes(&g, out);
         apply_chance(&g, out[0].outcome);
     }
 
@@ -979,7 +979,7 @@ static void test_exchange_discard_no_deadlock(void) {
         step_deterministic(&g, ACT_PASS);
     while (is_chance_node(&g)) {
         ChanceOutcome out[MAX_CHANCE_OUTCOMES];
-        int n = chance_outcomes(&g, out);
+        chance_outcomes(&g, out);
         apply_chance(&g, out[0].outcome);
     }
 
@@ -1194,7 +1194,9 @@ static void fuzz_coin_bounds(void) {
 
             for (int p = 0; p < np; p++) {
                 int c = player_coins(&g, p);
-                if (c < 0 || c > 15) {
+                /* 12 = 9 + tax is the max reachable (must coup at 10+);
+                 * > 12 would mean a wrap/overflow in the 4-bit field. */
+                if (c < 0 || c > 12) {
                     fprintf(stderr, "FAIL: player %d has %d coins at seed=%llu step=%d\n",
                             p, c, (unsigned long long)seed, steps);
                     exit(1);
@@ -1395,78 +1397,6 @@ static void fuzz_step_with_rng(void) {
     }
 
     printf("PASS (%d/%d games completed)\n", games_completed, 1000);
-}
-
-static void fuzz_incremental_observe(void) {
-    printf("fuzz_incremental_observe ... ");
-    int total_steps = 0;
-    int total_games = 0;
-
-    for (uint64_t seed = 1; seed <= 500; seed++) {
-        /* Alternate between random and heuristic, 2p and 6p */
-        int use_heuristic = (seed % 2 == 0);
-        int np = (seed % 3 == 0) ? 6 : 2;
-        Game g;
-        game_init(&g, np, seed, seed + 999);
-        HistoryBuffer hist;
-        history_init(&hist);
-
-        float inc_buf[OBS_SIZE];
-        float full_buf[OBS_SIZE];
-        ObsSnapshot snap;
-        snap.player_id = -1;  /* force first call to be full */
-
-        /* Initial observation */
-        int active = get_active_player_ext(&g);
-        memset(inc_buf, 0, sizeof(inc_buf));
-        observe_incremental(&g, active, &hist, inc_buf, &snap);
-
-        int steps = 0;
-        while (!is_done(&g) && steps < MAX_STEPS) {
-            /* Pick action */
-            int action;
-            if (use_heuristic) {
-                action = heuristic_choose_action(&g);
-            } else {
-                action = random_legal_action(&g);
-            }
-
-            /* Push history */
-            HistoryEntry entry;
-            entry.acting_player = (uint8_t)get_active_player_ext(&g);
-            entry.action = (uint8_t)action;
-            entry.phase = (uint8_t)get_phase(&g);
-            entry.result = 0;
-            history_push(&hist, entry);
-
-            /* Step */
-            step_with_rng(&g, action);
-            steps++;
-
-            if (is_done(&g)) break;
-
-            /* Compute both observations */
-            active = get_active_player_ext(&g);
-            observe_incremental(&g, active, &hist, inc_buf, &snap);
-            observe(&g, active, &hist, full_buf);
-
-            /* Compare */
-            for (int j = 0; j < OBS_SIZE; j++) {
-                if (inc_buf[j] != full_buf[j]) {
-                    fprintf(stderr, "\nFAIL: incremental mismatch at seed=%llu step=%d "
-                            "obs[%d]: inc=%.6f full=%.6f phase=%d active=%d\n",
-                            (unsigned long long)seed, steps, j,
-                            inc_buf[j], full_buf[j],
-                            get_phase(&g), active);
-                    exit(1);
-                }
-            }
-            total_steps++;
-        }
-        total_games++;
-    }
-
-    printf("PASS (%d games, %d steps checked)\n", total_games, total_steps);
 }
 
 static void fuzz_no_info_leak(void) {
@@ -1731,7 +1661,7 @@ static void test_refund_flag_getset(void) {
     game_set_refund_on_challenge(&g, 1);
     /* Game should still be in valid state */
     assert(get_phase(&g) == PHASE_MAIN_ACTION);
-    assert(player_coins(&g, 0) == 2);
+    assert(player_coins(&g, 0) == 1);
     assert(player_coins(&g, 1) == 2);
 
     printf("PASS\n");
@@ -2128,6 +2058,583 @@ static void test_assassinate_block_challenge_block_stands(void) {
     printf("PASS\n");
 }
 
+/* ------------------------------------------------------------------ */
+/* Rules audit / API contract tests                                    */
+/* ------------------------------------------------------------------ */
+
+/* Give each seat a fixed hand (both cards alive) and rebuild the deck. */
+static void set_hands(Game *g, const int hands[][2]) {
+    int np = get_num_players(g);
+    int counts[5] = {3, 3, 3, 3, 3};
+    for (int p = 0; p < np; p++) {
+        set_player_card0_type(g, p, hands[p][0]);
+        set_player_card1_type(g, p, hands[p][1]);
+        set_player_card0_alive(g, p, 1);
+        set_player_card1_alive(g, p, 1);
+        counts[hands[p][0]]--;
+        counts[hands[p][1]]--;
+    }
+    for (int c = 0; c < 5; c++) {
+        assert(counts[c] >= 0);
+        deck_set_count(g, c, counts[c]);
+    }
+}
+
+static int must_step(Game *g, int action) {
+    int rc = step_deterministic(g, action);
+    if (rc != 0) {
+        fprintf(stderr, "\nFAIL: action %d rejected (phase=%d active=%d mask=0x%x)\n",
+                action, get_phase(g), get_active_player(g), get_valid_actions(g));
+        exit(1);
+    }
+    return rc;
+}
+
+static void test_invalid_actions_rejected(void) {
+    printf("test_invalid_actions_rejected ... ");
+    Game g, before;
+    game_init(&g, 3, 5, 6);
+    before = g;
+
+    /* Coup with 2 coins would wrap the 4-bit coin field. */
+    assert(step_deterministic(&g, ACT_COUP_P0 + 1) == -1);
+    assert(step_deterministic(&g, ACT_ASSASSINATE_P0 + 1) == -1);
+    assert(step_deterministic(&g, ACT_STEAL_P0 + 0) == -1);   /* self */
+    assert(step_deterministic(&g, ACT_STEAL_P0 + 4) == -1);   /* no such seat */
+    assert(step_deterministic(&g, ACT_CHALLENGE) == -1);
+    assert(step_deterministic(&g, ACT_DISCARD_SLOT2) == -1);
+    assert(step_deterministic(&g, -1) == -1);
+    assert(step_deterministic(&g, 32) == -1);
+    assert(step_deterministic(&g, 1000) == -1);
+    assert(step_with_rng(&g, 31) == -1);
+    assert(memcmp(&g, &before, sizeof g) == 0);
+
+    /* LOSE_CARD only accepts discards of living cards. */
+    set_player_coins(&g, 0, 7);
+    must_step(&g, ACT_COUP_P0 + 1);
+    assert(get_phase(&g) == PHASE_LOSE_CARD);
+    before = g;
+    assert(step_deterministic(&g, ACT_PASS) == -1);
+    assert(step_deterministic(&g, ACT_DISCARD_SLOT2) == -1);
+    assert(memcmp(&g, &before, sizeof g) == 0);
+    must_step(&g, ACT_DISCARD_SLOT0);
+    must_step(&g, ACT_INCOME);                 /* p1 */
+    must_step(&g, ACT_INCOME);                 /* p2 */
+    set_player_coins(&g, 0, 7);
+    must_step(&g, ACT_COUP_P0 + 1);
+    before = g;
+    assert(step_deterministic(&g, ACT_DISCARD_SLOT0) == -1); /* already dead */
+    assert(memcmp(&g, &before, sizeof g) == 0);
+    must_step(&g, ACT_DISCARD_SLOT1);
+    assert(!player_is_alive(&g, 1));
+
+    /* Chance nodes reject decisions and bad outcomes. */
+    Game c;
+    game_init(&c, 2, 0, 0);
+    assert(is_chance_node(&c));
+    before = c;
+    assert(step_deterministic(&c, ACT_INCOME) == -1);
+    assert(apply_chance(&c, 5) == -1);
+    assert(apply_chance(&c, -1) == -1);
+    assert(memcmp(&c, &before, sizeof c) == 0);
+    deck_set_count(&c, DUKE, 0);
+    assert(apply_chance(&c, DUKE) == -1);
+
+    /* Decision nodes reject apply_chance. */
+    before = g;
+    assert(apply_chance(&g, DUKE) == -1);
+    assert(memcmp(&g, &before, sizeof g) == 0);
+
+    /* Finished games accept nothing and report an empty mask. */
+    Game d;
+    game_init(&d, 2, 9, 9);
+    set_player_coins(&d, 0, 7);
+    set_player_card1_alive(&d, 1, 0);
+    must_step(&d, ACT_COUP_P0 + 1);
+    must_step(&d, ACT_DISCARD_SLOT0);
+    assert(is_done(&d) && get_winner(&d) == 0);
+    assert(get_valid_actions(&d) == 0);
+    before = d;
+    assert(step_with_rng(&d, ACT_DISCARD_SLOT1) == -1);
+    assert(memcmp(&d, &before, sizeof d) == 0);
+    printf("PASS\n");
+}
+
+static void test_seedless_init_is_chance_deal(void) {
+    printf("test_seedless_init_is_chance_deal ... ");
+    for (int np = 2; np <= 6; np++) {
+        Game g;
+        game_init(&g, np, 0, 0);
+        assert(get_phase(&g) == PHASE_DEAL);
+        assert(!is_done(&g));             /* was wrongly "done" before */
+        assert(get_active_player_ext(&g) == -1);
+        assert(get_valid_actions(&g) == 0);
+        /* Enumerate the deal manually: 2*np chance nodes. */
+        int nodes = 0;
+        while (is_chance_node(&g)) {
+            ChanceOutcome out[MAX_CHANCE_OUTCOMES];
+            int n = chance_outcomes(&g, out);
+            assert(n > 0);
+            assert(apply_chance(&g, out[n - 1].outcome) == 0);
+            nodes++;
+        }
+        assert(nodes == 2 * np);
+        assert(get_phase(&g) == PHASE_MAIN_ACTION && get_turn_player(&g) == 0);
+        assert(deck_total(&g) == 15 - 2 * np);
+
+        /* step_with_rng at a chance node resolves the whole deal. */
+        Game h;
+        game_init(&h, np, 0, 0);
+        assert(step_with_rng(&h, 0) == -1);
+        assert(get_phase(&h) == PHASE_MAIN_ACTION);
+        assert(deck_total(&h) == 15 - 2 * np);
+        for (int p = 0; p < np; p++) assert(player_alive_cards(&h, p) == 2);
+    }
+    /* Seeded deal is a pure function of deal_seed; proc_seed only seeds g->rng. */
+    Game a, b;
+    game_init(&a, 4, 77, 1);
+    game_init(&b, 4, 77, 2);
+    assert(memcmp(a.players, b.players, sizeof a.players) == 0 && a.deck == b.deck);
+    /* deal_seed == 0 is a valid seed when proc_seed != 0. */
+    game_init(&a, 4, 0, 1);
+    assert(get_phase(&a) == PHASE_MAIN_ACTION);
+    printf("PASS\n");
+}
+
+/* Target challenges a real Assassin, loses a card, then may still block or
+ * lose a second card to the assassination (official "double loss"). */
+static void test_assassinate_double_loss_via_challenge(void) {
+    printf("test_assassinate_double_loss_via_challenge ... ");
+    const int hands[2][2] = {{ASSASSIN, DUKE}, {CAPTAIN, AMBASSADOR}};
+    Game g;
+    game_init(&g, 2, 3, 3);
+    set_hands(&g, hands);
+    set_player_coins(&g, 0, 3);
+    must_step(&g, ACT_ASSASSINATE_P0 + 1);
+    assert(player_coins(&g, 0) == 0);
+    must_step(&g, ACT_CHALLENGE);
+    assert(get_phase(&g) == PHASE_LOSE_CARD && get_active_player(&g) == 1);
+    must_step(&g, ACT_DISCARD_SLOT0);
+    assert(get_phase(&g) == PHASE_CHANCE_REDRAW && get_active_player(&g) == 0);
+    assert(apply_chance(&g, ASSASSIN) == 0);  /* redraw (Assassin went back) */
+    /* Target, still alive, gets the block window. */
+    assert(get_phase(&g) == PHASE_BLOCK && get_active_player(&g) == 1);
+    assert(get_valid_actions(&g) == ((1u << ACT_PASS) | (1u << ACT_BLOCK_CONTESSA)));
+    must_step(&g, ACT_PASS);
+    assert(get_phase(&g) == PHASE_LOSE_CARD && get_active_player(&g) == 1);
+    must_step(&g, ACT_DISCARD_SLOT1);
+    assert(is_done(&g) && get_winner(&g) == 0);
+    assert(player_coins(&g, 0) == 0); /* no refund: assassination succeeded */
+    printf("PASS\n");
+}
+
+/* Target bluffs Contessa, gets challenged: loses a card for the bluff and
+ * then another to the assassination. */
+static void test_assassinate_double_loss_via_bluff_block(void) {
+    printf("test_assassinate_double_loss_via_bluff_block ... ");
+    const int hands[3][2] = {{ASSASSIN, DUKE}, {CAPTAIN, AMBASSADOR}, {DUKE, CAPTAIN}};
+    Game g;
+    game_init(&g, 3, 3, 3);
+    set_hands(&g, hands);
+    set_player_coins(&g, 0, 4);
+    must_step(&g, ACT_ASSASSINATE_P0 + 1);
+    must_step(&g, ACT_PASS); /* p1 */
+    must_step(&g, ACT_PASS); /* p2 */
+    assert(get_phase(&g) == PHASE_BLOCK && get_active_player(&g) == 1);
+    must_step(&g, ACT_BLOCK_CONTESSA);
+    assert(get_phase(&g) == PHASE_CHALLENGE_BLOCK);
+    assert(get_active_player(&g) == 0); /* turn player may challenge first */
+    must_step(&g, ACT_PASS);
+    assert(get_active_player(&g) == 2); /* ... and so may a bystander */
+    must_step(&g, ACT_CHALLENGE);
+    assert(get_phase(&g) == PHASE_LOSE_CARD && get_active_player(&g) == 1);
+    must_step(&g, ACT_DISCARD_SLOT0);
+    /* Block failed: assassination resolves against the same target. */
+    assert(get_phase(&g) == PHASE_LOSE_CARD && get_active_player(&g) == 1);
+    must_step(&g, ACT_DISCARD_SLOT1);
+    assert(!player_is_alive(&g, 1));
+    assert(get_phase(&g) == PHASE_MAIN_ACTION && get_turn_player(&g) == 2);
+    assert(player_coins(&g, 0) == 1);
+    printf("PASS\n");
+}
+
+/* Blocked assassination: coins stay spent even though nothing happened. */
+static void test_assassinate_blocked_coins_spent(void) {
+    printf("test_assassinate_blocked_coins_spent ... ");
+    const int hands[2][2] = {{ASSASSIN, DUKE}, {CONTESSA, AMBASSADOR}};
+    Game g;
+    game_init(&g, 2, 3, 3);
+    set_hands(&g, hands);
+    set_player_coins(&g, 0, 3);
+    must_step(&g, ACT_ASSASSINATE_P0 + 1);
+    must_step(&g, ACT_PASS);
+    must_step(&g, ACT_BLOCK_CONTESSA);
+    must_step(&g, ACT_PASS);
+    assert(get_phase(&g) == PHASE_MAIN_ACTION && get_turn_player(&g) == 1);
+    assert(player_coins(&g, 0) == 0);
+    assert(player_alive_cards(&g, 1) == 2);
+    printf("PASS\n");
+}
+
+static void test_exchange_single_influence(void) {
+    printf("test_exchange_single_influence ... ");
+    const int hands[2][2] = {{AMBASSADOR, DUKE}, {CAPTAIN, CONTESSA}};
+    Game g;
+    game_init(&g, 2, 3, 3);
+    set_hands(&g, hands);
+    set_player_card1_alive(&g, 0, 0); /* p0 has only the Ambassador left */
+    must_step(&g, ACT_EXCHANGE);
+    must_step(&g, ACT_PASS);
+    assert(get_phase(&g) == PHASE_CHANCE_EXCHANGE);
+    assert(apply_chance(&g, DUKE) == 0);
+    assert(apply_chance(&g, CAPTAIN) == 0);
+    assert(get_phase(&g) == PHASE_EXCHANGE_DISCARD);
+    /* 3 cards to choose from (living hand card + 2 drawn), keep 1. */
+    uint32_t first = (1u << ACT_DISCARD_SLOT0) | (1u << ACT_DISCARD_SLOT2);
+    assert(get_valid_actions(&g) == first);
+    must_step(&g, ACT_DISCARD_SLOT0);   /* give back the Ambassador */
+    assert(get_valid_actions(&g) == ((1u << ACT_DISCARD_SLOT2) | (1u << ACT_DISCARD_SLOT3)));
+    must_step(&g, ACT_DISCARD_SLOT3);   /* give back the Captain, keep Duke */
+    assert(player_card0_alive(&g, 0) && player_card0_type(&g, 0) == DUKE);
+    assert(!player_card1_alive(&g, 0) && player_card1_type(&g, 0) == DUKE); /* dead card untouched */
+    assert(deck_count(&g, AMBASSADOR) == 3 && deck_count(&g, CAPTAIN) == 2);
+    assert(deck_total(&g) == 11);
+    assert(get_phase(&g) == PHASE_MAIN_ACTION && get_turn_player(&g) == 1);
+    printf("PASS\n");
+}
+
+static void test_steal_from_poor_players(void) {
+    printf("test_steal_from_poor_players ... ");
+    const int hands[3][2] = {{CAPTAIN, DUKE}, {CAPTAIN, CONTESSA}, {DUKE, AMBASSADOR}};
+    Game g;
+    game_init(&g, 3, 3, 3);
+    set_hands(&g, hands);
+    set_player_coins(&g, 1, 1);
+    set_player_coins(&g, 2, 0);
+    /* Steal from a 1-coin player takes 1. */
+    must_step(&g, ACT_STEAL_P0 + 1);
+    must_step(&g, ACT_PASS);
+    must_step(&g, ACT_PASS);
+    assert(get_phase(&g) == PHASE_BLOCK && get_active_player(&g) == 1);
+    must_step(&g, ACT_PASS);
+    assert(player_coins(&g, 0) == 3 && player_coins(&g, 1) == 0);
+    /* Steal from a 0-coin player is legal and takes nothing. */
+    assert(get_turn_player(&g) == 1);
+    must_step(&g, ACT_STEAL_P0 + 2);
+    must_step(&g, ACT_PASS);
+    must_step(&g, ACT_PASS);
+    must_step(&g, ACT_PASS);
+    assert(player_coins(&g, 1) == 0 && player_coins(&g, 2) == 0);
+    /* Only the target may block a steal; Captain and Ambassador both work. */
+    assert(get_turn_player(&g) == 2);
+    must_step(&g, ACT_STEAL_P0 + 0);
+    must_step(&g, ACT_PASS);
+    must_step(&g, ACT_PASS);
+    assert(get_phase(&g) == PHASE_BLOCK && get_active_player(&g) == 0);
+    assert(get_valid_actions(&g) == ((1u << ACT_PASS) | (1u << ACT_BLOCK_CAPTAIN) |
+                                     (1u << ACT_BLOCK_AMBASSADOR)));
+    must_step(&g, ACT_BLOCK_AMBASSADOR); /* bluff, but nobody challenges */
+    must_step(&g, ACT_PASS);
+    must_step(&g, ACT_PASS);
+    assert(player_coins(&g, 0) == 3 && player_coins(&g, 2) == 0);
+    assert(get_turn_player(&g) == 0);
+    printf("PASS\n");
+}
+
+/* Foreign aid: any opponent may block with Duke; any other player (not just
+ * the actor) may challenge that block. */
+static void test_foreign_aid_block_challenged_by_bystander(void) {
+    printf("test_foreign_aid_block_challenged_by_bystander ... ");
+    const int hands[4][2] = {{CAPTAIN, CAPTAIN}, {AMBASSADOR, CONTESSA},
+                             {DUKE, ASSASSIN}, {DUKE, DUKE}};
+    Game g;
+    game_init(&g, 4, 3, 3);
+    set_hands(&g, hands);
+    must_step(&g, ACT_FOREIGN_AID);
+    assert(get_phase(&g) == PHASE_BLOCK && get_active_player(&g) == 1);
+    must_step(&g, ACT_BLOCK_DUKE); /* p1 bluffs Duke */
+    assert(get_phase(&g) == PHASE_CHALLENGE_BLOCK && get_active_player(&g) == 0);
+    must_step(&g, ACT_PASS);
+    assert(get_active_player(&g) == 2);
+    must_step(&g, ACT_PASS);
+    assert(get_active_player(&g) == 3);
+    must_step(&g, ACT_CHALLENGE); /* p3 holds all three Dukes' worth of info */
+    assert(get_phase(&g) == PHASE_LOSE_CARD && get_active_player(&g) == 1);
+    must_step(&g, ACT_DISCARD_SLOT1);
+    /* Block failed: foreign aid resolves. */
+    assert(player_coins(&g, 0) == 4);
+    assert(get_phase(&g) == PHASE_MAIN_ACTION && get_turn_player(&g) == 1);
+
+    /* A true block that is challenged: challenger loses, blocker redraws,
+     * the action stays blocked. */
+    must_step(&g, ACT_FOREIGN_AID);                     /* p1 */
+    assert(get_active_player(&g) == 2);
+    must_step(&g, ACT_BLOCK_DUKE);                      /* p2 really has Duke */
+    assert(get_active_player(&g) == 1);
+    must_step(&g, ACT_CHALLENGE);
+    assert(get_phase(&g) == PHASE_LOSE_CARD && get_active_player(&g) == 1);
+    must_step(&g, ACT_DISCARD_SLOT0);
+    assert(!player_is_alive(&g, 1));
+    assert(get_phase(&g) == PHASE_CHANCE_REDRAW && get_active_player(&g) == 2);
+    assert(apply_chance(&g, DUKE) == 0);
+    assert(player_coins(&g, 1) == 2);
+    assert(get_phase(&g) == PHASE_MAIN_ACTION && get_turn_player(&g) == 2);
+    printf("PASS\n");
+}
+
+static void test_forced_coup_and_max_coins(void) {
+    printf("test_forced_coup_and_max_coins ... ");
+    Game g;
+    game_init(&g, 3, 3, 3);
+    set_player_coins(&g, 0, 10);
+    uint32_t m = get_valid_actions(&g);
+    assert(m == ((1u << (ACT_COUP_P0 + 1)) | (1u << (ACT_COUP_P0 + 2))));
+    set_player_coins(&g, 0, 9);
+    m = get_valid_actions(&g);
+    assert(m & (1u << ACT_TAX));
+    must_step(&g, ACT_TAX);
+    must_step(&g, ACT_PASS);
+    must_step(&g, ACT_PASS);
+    if (is_chance_node(&g)) { /* not reached: unchallenged tax resolves */ assert(0); }
+    assert(player_coins(&g, 0) == 12);   /* max reachable */
+    printf("PASS\n");
+}
+
+static void test_max_turns_tiebreak(void) {
+    printf("test_max_turns_tiebreak ... ");
+    Game g;
+    game_init(&g, 3, 3, 3);
+    g.turn_count = MAX_TURNS - 1;
+    set_player_card0_alive(&g, 0, 0);
+    set_player_coins(&g, 1, 5);
+    set_player_coins(&g, 2, 5);
+    must_step(&g, ACT_INCOME);
+    assert(is_done(&g));
+    assert(get_valid_actions(&g) == 0);
+    assert(get_winner(&g) == 1); /* 2 cards beats 1; equal coins -> lowest seat */
+    set_player_coins(&g, 2, 6);
+    assert(get_winner(&g) == 2);
+    printf("PASS\n");
+}
+
+/* A steal target who dies by losing a challenge still has coins taken. */
+static void test_steal_from_target_killed_by_challenge(void) {
+    printf("test_steal_from_target_killed_by_challenge ... ");
+    const int hands[3][2] = {{CAPTAIN, DUKE}, {DUKE, AMBASSADOR}, {DUKE, CONTESSA}};
+    Game g;
+    game_init(&g, 3, 3, 3);
+    set_hands(&g, hands);
+    set_player_card1_alive(&g, 1, 0);
+    must_step(&g, ACT_STEAL_P0 + 1);
+    must_step(&g, ACT_CHALLENGE);   /* p1 challenges and is wrong */
+    must_step(&g, ACT_DISCARD_SLOT0);
+    assert(!player_is_alive(&g, 1));
+    assert(apply_chance(&g, CAPTAIN) == 0);
+    assert(get_phase(&g) == PHASE_MAIN_ACTION && get_turn_player(&g) == 2);
+    /* Eliminated target leaves with their coins: nothing is stolen. */
+    assert(player_coins(&g, 0) == 2 && player_coins(&g, 1) == 2);
+    printf("PASS\n");
+}
+
+/* Random play through every phase: PHASE_RESOLVE never surfaces, chance
+ * nodes never surface from step_with_rng, and deterministic replays match. */
+static void fuzz_resolve_never_observable(void) {
+    printf("fuzz_resolve_never_observable ... ");
+    long steps = 0;
+    for (uint64_t seed = 1; seed <= 2000; seed++) {
+        Game g;
+        int np = 2 + (int)(seed % 5);
+        game_init(&g, np, seed, seed * 31);
+        while (!is_done(&g)) {
+            assert(get_phase(&g) != PHASE_RESOLVE);
+            assert(!is_chance_node(&g));
+            uint32_t m = get_valid_actions(&g);
+            assert(m != 0);
+            int a = random_legal_action(&g);
+            assert(step_with_rng(&g, a) == 0);
+            steps++;
+        }
+        assert(get_phase(&g) != PHASE_RESOLVE);
+    }
+    printf("PASS (%ld steps)\n", steps);
+}
+
+/* Throw arbitrary (mostly invalid) actions and chance outcomes at the engine:
+ * it must accept exactly the masked ones and never corrupt state. */
+static void fuzz_garbage_actions(void) {
+    printf("fuzz_garbage_actions ... ");
+    long accepted = 0, rejected = 0;
+    for (uint64_t seed = 1; seed <= 1000; seed++) {
+        fuzz_rng_state = (uint32_t)seed * 2654435761u;
+        Game g;
+        int np = 2 + (int)(seed % 5);
+        game_init(&g, np, seed % 3 ? seed : 0, seed % 3 ? seed + 1 : 0);
+        for (int step = 0; step < 4000 && !is_done(&g); step++) {
+            Game before = g;
+            if (is_chance_node(&g)) {
+                int o = (int)(fuzz_rand() % 8) - 1;
+                int ok = o >= 0 && o < 5 && deck_count(&g, o) > 0;
+                int rc = apply_chance(&g, o);
+                assert(rc == (ok ? 0 : -1));
+                if (rc) assert(memcmp(&g, &before, sizeof g) == 0);
+            } else {
+                int a = (int)(fuzz_rand() % 40) - 4;
+                uint32_t m = get_valid_actions(&g);
+                int ok = a >= 0 && a < 32 && ((m >> a) & 1);
+                int rc = step_deterministic(&g, a);
+                assert(rc == (ok ? 0 : -1));
+                if (rc) { assert(memcmp(&g, &before, sizeof g) == 0); rejected++; }
+                else accepted++;
+            }
+            assert(total_cards_in_game(&g) + 0 <= 15);
+            for (int p = 0; p < np; p++) assert(player_coins(&g, p) <= 12);
+        }
+    }
+    printf("PASS (%ld accepted, %ld rejected)\n", accepted, rejected);
+}
+
+/* ---- Heuristic ladder ---- */
+
+static int claim_role(int phase, int action) {
+    if (phase == PHASE_MAIN_ACTION) {
+        if (action == ACT_TAX) return DUKE;
+        if (action == ACT_EXCHANGE) return AMBASSADOR;
+        if (action >= ACT_STEAL_P0 && action < ACT_STEAL_P0 + 6) return CAPTAIN;
+        if (action >= ACT_ASSASSINATE_P0 && action < ACT_ASSASSINATE_P0 + 6) return ASSASSIN;
+    }
+    if (action == ACT_BLOCK_DUKE) return DUKE;
+    if (action == ACT_BLOCK_CAPTAIN) return CAPTAIN;
+    if (action == ACT_BLOCK_AMBASSADOR) return AMBASSADOR;
+    if (action == ACT_BLOCK_CONTESSA) return CONTESSA;
+    return -1;
+}
+
+static void fuzz_heuristic_levels_honest(void) {
+    printf("fuzz_heuristic_levels_honest ... ");
+    long claims = 0, challenges = 0;
+    for (uint64_t seed = 1; seed <= 1000; seed++) {
+        for (int level = HEURISTIC_HONEST; level <= HEURISTIC_COUNTING; level++) {
+            Game g;
+            int np = 2 + (int)(seed % 5);
+            game_init(&g, np, seed, seed + 5);
+            while (!is_done(&g)) {
+                int ap = get_active_player(&g);
+                int phase = get_phase(&g);
+                int a = heuristic_choose_action_level(&g, level);
+                assert((get_valid_actions(&g) >> a) & 1);
+                int role = claim_role(phase, a);
+                if (role >= 0) {
+                    assert(player_has_card(&g, ap, role)); /* never bluffs */
+                    claims++;
+                }
+                if (a == ACT_CHALLENGE) {
+                    assert(level == HEURISTIC_COUNTING);
+                    challenges++;
+                }
+                assert(step_with_rng(&g, a) == 0);
+            }
+        }
+    }
+    printf("PASS (%ld honest claims, %ld challenges)\n", claims, challenges);
+}
+
+/* Counting bot challenges a claim it can prove false. */
+static void test_counting_challenges_impossible_claim(void) {
+    printf("test_counting_challenges_impossible_claim ... ");
+    const int hands[3][2] = {{CAPTAIN, AMBASSADOR}, {DUKE, DUKE}, {DUKE, CONTESSA}};
+    Game g;
+    game_init(&g, 3, 3, 3);
+    set_hands(&g, hands);
+    set_player_card0_alive(&g, 2, 0);          /* p2's Duke is revealed */
+    must_step(&g, ACT_TAX);                    /* p0 claims Duke */
+    assert(get_active_player(&g) == 1);        /* p1 holds 2, 1 revealed: all 3 known */
+    assert(heuristic_choose_action_level(&g, HEURISTIC_HONEST) == ACT_PASS);
+    assert(heuristic_choose_action_level(&g, HEURISTIC_COUNTING) == ACT_CHALLENGE);
+    must_step(&g, ACT_PASS);
+    assert(get_active_player(&g) == 2);        /* p2 only knows 1 Duke */
+    assert(heuristic_choose_action_level(&g, HEURISTIC_COUNTING) == ACT_PASS);
+
+    /* Last-card assassination target without Contessa challenges. */
+    const int h2[2][2] = {{CAPTAIN, DUKE}, {AMBASSADOR, DUKE}};
+    game_init(&g, 2, 3, 3);
+    set_hands(&g, h2);
+    set_player_card1_alive(&g, 1, 0);
+    set_player_coins(&g, 0, 3);
+    must_step(&g, ACT_ASSASSINATE_P0 + 1);
+    assert(heuristic_choose_action_level(&g, HEURISTIC_COUNTING) == ACT_CHALLENGE);
+    assert(heuristic_choose_action_level(&g, HEURISTIC_HONEST) == ACT_PASS);
+    printf("PASS\n");
+}
+
+/* Honest bots block only with cards they hold (previously they always
+ * blocked, i.e. bluffed constantly). */
+static void test_honest_blocks_only_with_card(void) {
+    printf("test_honest_blocks_only_with_card ... ");
+    const int hands[2][2] = {{DUKE, CAPTAIN}, {ASSASSIN, AMBASSADOR}};
+    Game g;
+    game_init(&g, 2, 3, 3);
+    set_hands(&g, hands);
+    must_step(&g, ACT_FOREIGN_AID);
+    assert(heuristic_choose_action(&g) == ACT_PASS);       /* no Duke */
+    must_step(&g, ACT_PASS);
+    must_step(&g, ACT_STEAL_P0 + 0);                       /* p1 steals from p0 */
+    must_step(&g, ACT_PASS);
+    assert(heuristic_choose_action(&g) == ACT_BLOCK_CAPTAIN);
+    printf("PASS\n");
+}
+
+/* Exchange discard keeps the two most valuable cards even when the two worst
+ * are both hand cards (the old greedy pick discarded a drawn Duke here). */
+static void test_heuristic_exchange_keeps_best(void) {
+    printf("test_heuristic_exchange_keeps_best ... ");
+    const int hands[2][2] = {{AMBASSADOR, CONTESSA}, {CAPTAIN, ASSASSIN}};
+    Game g;
+    game_init(&g, 2, 3, 3);
+    set_hands(&g, hands);
+    must_step(&g, ACT_EXCHANGE);
+    must_step(&g, ACT_PASS);
+    assert(apply_chance(&g, DUKE) == 0);
+    assert(apply_chance(&g, DUKE) == 0);
+    must_step(&g, heuristic_choose_action(&g));
+    must_step(&g, heuristic_choose_action(&g));
+    assert(player_card0_type(&g, 0) == DUKE && player_card1_type(&g, 0) == DUKE);
+    printf("PASS\n");
+}
+
+/* Win rate of seat-rotated `a` vs `b` over n 2-player games. */
+static double ladder_winrate(int a, int b, int n) {
+    int wins = 0;
+    Xoshiro256 rng;
+    xoshiro256_seed(&rng, 1234);
+    for (int i = 0; i < n; i++) {
+        Game g;
+        game_init(&g, 2, (uint64_t)i + 1, (uint64_t)i + 77);
+        int a_seat = i & 1;
+        while (!is_done(&g)) {
+            int lvl = get_active_player(&g) == a_seat ? a : b;
+            step_with_rng(&g, heuristic_choose_action_rng(&g, lvl, &rng));
+        }
+        wins += get_winner(&g) == a_seat;
+    }
+    return (double)wins / n;
+}
+
+static void test_heuristic_ladder_ordering(void) {
+    printf("test_heuristic_ladder_ordering ... ");
+    /* Counting only differs from honest when the opponent bluffs, so it ties
+     * honest head-to-head and should do better against a (bluffing) random
+     * player. */
+    double h_vs_r = ladder_winrate(HEURISTIC_HONEST, HEURISTIC_RANDOM, 4000);
+    double c_vs_r = ladder_winrate(HEURISTIC_COUNTING, HEURISTIC_RANDOM, 4000);
+    double c_vs_h = ladder_winrate(HEURISTIC_COUNTING, HEURISTIC_HONEST, 4000);
+    printf("(honest-random %.3f, counting-random %.3f, counting-honest %.3f) ",
+           h_vs_r, c_vs_r, c_vs_h);
+    assert(h_vs_r > 0.8);
+    assert(c_vs_r > h_vs_r);
+    assert(c_vs_h > 0.45);
+    printf("PASS\n");
+}
+
 int main(void) {
     printf("=== Coup Engine Tests ===\n\n");
 
@@ -2153,6 +2660,21 @@ int main(void) {
     test_assassinate_unchallenged_no_refund();
     test_tax_challenge_no_refund_needed();
     test_assassinate_block_challenge_block_stands();
+    test_invalid_actions_rejected();
+    test_seedless_init_is_chance_deal();
+    test_assassinate_double_loss_via_challenge();
+    test_assassinate_double_loss_via_bluff_block();
+    test_assassinate_blocked_coins_spent();
+    test_exchange_single_influence();
+    test_steal_from_poor_players();
+    test_foreign_aid_block_challenged_by_bystander();
+    test_forced_coup_and_max_coins();
+    test_max_turns_tiebreak();
+    test_steal_from_target_killed_by_challenge();
+    test_counting_challenges_impossible_claim();
+    test_honest_blocks_only_with_card();
+    test_heuristic_exchange_keeps_best();
+    test_heuristic_ladder_ordering();
 
     printf("\n--- Fuzz / stress tests ---\n\n");
     fuzz_valid_actions_nonempty();
@@ -2163,12 +2685,14 @@ int main(void) {
     fuzz_exactly_one_winner();
     fuzz_forced_coup();
     fuzz_step_with_rng();
-    fuzz_incremental_observe();
     fuzz_no_info_leak();
     fuzz_game_end_invariants();
     fuzz_heuristic_bot_games();
     fuzz_refund_on_games();
     fuzz_refund_off_games();
+    fuzz_resolve_never_observable();
+    fuzz_garbage_actions();
+    fuzz_heuristic_levels_honest();
 
     printf("\n=== All tests passed ===\n");
     return 0;

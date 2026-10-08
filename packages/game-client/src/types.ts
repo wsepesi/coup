@@ -21,7 +21,7 @@ export enum Phase {
   Resolve = 9,
 }
 
-// Flat action space 0-31 matching plan.md §4
+// Flat action space 0-31 matching c_engine/coup_core.h
 export enum Action {
   Income = 0,
   ForeignAid = 1,
