@@ -29,10 +29,14 @@ src/
     page.tsx          Landing page
     lobby/[code]/     Room page: lobby -> game -> results -> rematch (one WebSocket)
     game/[code]/      Redirects to /lobby/[code]
-  components/         React components
-  hooks/              Keyboard + history tracking hooks
+  components/         React components (GameBoard = Table + HistoryPanel + action pickers)
+  hooks/              Keyboard hook
   lib/                Protocol types, room WebSocket hook (ws.ts), identity/API (identity.ts)
 ```
+
+## Game screen principle
+
+Play like in person, with perfect recall. The table (`Table.tsx`) shows only what you'd see sitting there: coins, face-down cards, face-up lost cards, what each player said this turn, your own hand, the deck. The history (`HistoryPanel.tsx`) is the complete written record, as a transcript (**everything**) or one column per player (**swimlanes**); `H` switches. Don't add anything derived from the history (odds, card counting, claim tracking, threat labels): players do that reasoning themselves.
 
 ## Stack
 

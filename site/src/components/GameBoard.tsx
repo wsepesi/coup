@@ -1,16 +1,13 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useMemo } from "react";
 import type { GameState } from "@/lib/types";
 import { actionTarget } from "@/lib/constants";
-import PlayerCard from "./PlayerCard";
-import HandDisplay from "./HandDisplay";
+import Table from "./Table";
 import ActionPicker from "./ActionPicker";
 import ExchangePicker from "./ExchangePicker";
-import HistoryLog from "./HistoryLog";
+import HistoryPanel from "./HistoryPanel";
 import PhaseIndicator from "./PhaseIndicator";
-import DeckTracker from "./DeckTracker";
-import { useGameTracker } from "@/hooks/useGameTracker";
 
 interface GameBoardProps {
   state: GameState;
@@ -21,32 +18,35 @@ interface GameBoardProps {
   onRules: () => void;
 }
 
+// Layout: the table and your controls on the left, the full history on the
+// right (stacked on narrow screens). The screen shows what you'd see in person
+// plus a complete written record of the game; it does no analysis for you.
 export default function GameBoard({ state, busy, onAction, onQuit, onRules }: GameBoardProps) {
   const { you, cards, players, active, turnPlayer, actions, history, prompt, deck, phase } = state;
   const spectating = you < 0;
   const me = spectating ? null : players[you];
   const isYourTurn = !spectating && active === you && actions.length > 0;
   const exchanging = isYourTurn && phase === "exchange_discard" && !!state.drawn;
+  const turn = phase === "action" ? state.turn + 1 : Math.max(1, state.turn);
 
-  const { lastActions, deckEvents } = useGameTracker(history, players);
-  const [hoverTarget, setHoverTarget] = useState<number | null>(null);
-  const handleTargetHover = useCallback((seat: number | null) => setHoverTarget(seat), []);
-
-  // Target of the action being resolved (shown on the board for everyone).
-  const pendingTarget = state.pending != null ? actionTarget(state.pending) : null;
-  const target = hoverTarget ?? pendingTarget;
-
-  // Opponents in seat order starting after you, so the table reads clockwise.
-  const n = players.length;
-  const start = spectating ? 0 : you + 1;
-  const opponents = Array.from({ length: spectating ? n : n - 1 }, (_, k) => (start + k) % n);
+  const target = state.pending != null && phase !== "action" ? actionTarget(state.pending) : null;
+  const turnEntries = useMemo(
+    () => (phase === "action" ? [] : history.filter((e) => e.turn === state.turn)),
+    [history, phase, state.turn],
+  );
+  const seats = useMemo(
+    () => players.map((p) => ({ name: p.name, coins: p.coins, influence: p.influence, alive: p.alive })),
+    [players],
+  );
 
   return (
-    <div className="h-dvh flex flex-col p-2 sm:p-3 max-w-3xl mx-auto gap-1.5 sm:gap-2 overflow-hidden">
-      <div className="flex items-center justify-between text-xs text-text-dim shrink-0">
-        <span>
-          room <span className="text-text-default tracking-widest">{state.code}</span>
-          {spectating && <span className="ml-2 text-cursor">· spectating</span>}
+    <div className="min-h-dvh lg:h-dvh flex flex-col p-2 sm:p-3 gap-2 max-w-[1800px] mx-auto">
+      <div className="flex items-center justify-between text-xs text-text-dim shrink-0 border-b border-border-term pb-1.5">
+        <span className="flex items-baseline gap-4">
+          <span className="text-text-bright font-bold tracking-[0.2em] text-sm">COUP</span>
+          <span>room <span className="text-text-default tracking-widest">{state.code}</span></span>
+          {spectating && <span className="text-cursor">spectating</span>}
+          {me && !me.alive && <span className="text-cursor">you're out — watching</span>}
         </span>
         <span className="flex gap-2">
           <button onClick={onRules} className="border border-border-term px-2 py-0.5 hover:text-text-default" aria-label="Rules">? rules</button>
@@ -56,73 +56,47 @@ export default function GameBoard({ state, busy, onAction, onQuit, onRules }: Ga
         </span>
       </div>
 
-      <div
-        className="grid gap-1 sm:gap-2 shrink-0"
-        style={{ gridTemplateColumns: `repeat(${Math.min(opponents.length, 3)}, minmax(0, 1fr))` }}
-      >
-        {opponents.map((seat) => (
-          <PlayerCard
-            key={seat}
-            player={players[seat]}
-            isActive={seat === active}
-            isTurn={seat === turnPlayer}
-            isTarget={target === seat}
-            isBlocker={state.block?.seat === seat}
-            lastAction={lastActions.get(seat)}
-          />
-        ))}
-      </div>
-
-      <div className="shrink-0">
-        <PhaseIndicator prompt={prompt} isYourTurn={isYourTurn} deadline={state.deadline} deck={deck} turn={phase === "action" ? state.turn + 1 : Math.max(1, state.turn)} />
-      </div>
-
-      <div className="flex gap-1 sm:gap-2 flex-1 min-h-0">
-        <div className="hidden sm:block w-44 shrink-0">
-          <DeckTracker deckSize={deck} events={deckEvents} players={players} yourCards={cards} />
-        </div>
-        <div className="flex-1 min-w-0">
-          <HistoryLog entries={history} />
-        </div>
-      </div>
-
-      {me && (
-        <div className={`shrink-0 ${target === you ? "ring-1 ring-cursor" : ""} ${!me.alive ? "opacity-60" : ""}`}>
-          <div className="text-center text-xs mb-0.5">
-            <span className={active === you ? "text-you font-bold" : "text-text-dim"}>
-              {me.name} (you){!me.alive && " — eliminated, watching"}
-            </span>
-          </div>
-          {!exchanging && (
-            <HandDisplay
-              cards={cards}
-              coins={me.coins}
-              claims={me.claims}
-              selectable={isYourTurn && phase === "lose_card" && !busy}
-              onSelect={(slot) => onAction(28 + slot)}
-            />
-          )}
-        </div>
-      )}
-
-      {isYourTurn && (
-        <div className="shrink-0">
-          {exchanging ? (
-            <ExchangePicker cards={cards} drawn={state.drawn!} disabled={busy} onConfirm={([a, b]) => onAction(a, b)} />
-          ) : (
-            <ActionPicker
-              actions={actions}
-              onAction={(a) => onAction(a)}
+      <div className="flex-1 min-h-0 flex flex-col lg:flex-row gap-3">
+        <div className="lg:w-1/2 lg:min-w-0 flex flex-col gap-2 min-h-0">
+          <div className="h-[22rem] sm:h-[26rem] lg:h-auto lg:flex-1 lg:min-h-0">
+            <Table
               players={players}
-              phase={phase}
+              you={you}
               cards={cards}
-              coins={me?.coins ?? 0}
-              disabled={busy}
-              onTargetHover={handleTargetHover}
+              turnPlayer={turnPlayer}
+              active={active}
+              target={target}
+              deck={deck}
+              turn={turn}
+              turnEntries={turnEntries}
             />
+          </div>
+          <div className="shrink-0">
+            <PhaseIndicator prompt={prompt} isYourTurn={isYourTurn} deadline={state.deadline} deck={deck} turn={turn} />
+          </div>
+          {isYourTurn && (
+            <div className="shrink-0">
+              {exchanging ? (
+                <ExchangePicker cards={cards} drawn={state.drawn!} disabled={busy} onConfirm={([a, b]) => onAction(a, b)} />
+              ) : (
+                <ActionPicker
+                  actions={actions}
+                  onAction={(a) => onAction(a)}
+                  players={players}
+                  phase={phase}
+                  cards={cards}
+                  coins={me?.coins ?? 0}
+                  disabled={busy}
+                />
+              )}
+            </div>
           )}
         </div>
-      )}
+
+        <div className="lg:w-1/2 lg:min-w-0 h-[70vh] lg:h-auto min-h-0">
+          <HistoryPanel entries={history} seats={seats} you={you} />
+        </div>
+      </div>
     </div>
   );
 }

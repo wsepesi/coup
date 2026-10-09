@@ -30,13 +30,13 @@ const CATEGORY_OF = (id: number): Category | null =>
   id >= 4 && id <= 9 ? "coup" : id >= 10 && id <= 15 ? "steal" : id >= 16 && id <= 21 ? "assassinate" : null;
 
 const MAIN_INFO: Record<number, { label: string; hint: string; color?: string }> = {
-  [ACTION.INCOME]: { label: "Income", hint: "+1 coin, safe" },
-  [ACTION.FOREIGN_AID]: { label: "Foreign Aid", hint: "+2, Duke can block" },
+  [ACTION.INCOME]: { label: "Income", hint: "+1 coin" },
+  [ACTION.FOREIGN_AID]: { label: "Foreign Aid", hint: "+2 coins" },
   [ACTION.TAX]: { label: "Tax", hint: "claim Duke, +3", color: ROLE_COLORS.Duke },
   [ACTION.EXCHANGE]: { label: "Exchange", hint: "claim Ambassador", color: ROLE_COLORS.Ambassador },
 };
 const CATEGORY_INFO: Record<Category, { label: string; hint: string; color?: string }> = {
-  coup: { label: "Coup", hint: "pay 7, unstoppable" },
+  coup: { label: "Coup", hint: "pay 7" },
   steal: { label: "Steal", hint: "claim Captain, take 2", color: ROLE_COLORS.Captain },
   assassinate: { label: "Assassinate", hint: "claim Assassin, pay 3", color: ROLE_COLORS.Assassin },
 };
@@ -72,19 +72,19 @@ function buildOptions(actions: ActionInfo[], phase: string, category: Category |
     return out;
   }
   return actions.map((a) => {
-    if (a.id === ACTION.CHALLENGE) return { label: "Challenge!", hint: "call the bluff", action: a.id, tone: "danger" };
-    if (a.id === ACTION.PASS) return { label: phase === "block" ? "Allow" : "Pass", hint: phase === "block" ? "don't block" : "let it happen", action: a.id, tone: "muted" };
+    if (a.id === ACTION.CHALLENGE) return { label: "Challenge!", hint: "challenge the claim", action: a.id, tone: "danger" };
+    if (a.id === ACTION.PASS) return { label: phase === "block" ? "Allow" : "Pass", hint: phase === "block" ? "don't block" : "no challenge", action: a.id, tone: "muted" };
     if (BLOCK_ROLE[a.id]) return { label: `Block`, hint: `claim ${BLOCK_ROLE[a.id]}`, action: a.id, tone: "block", color: ROLE_COLORS[BLOCK_ROLE[a.id]] };
     if (a.id >= ACTION.DISCARD0 && a.id <= ACTION.DISCARD0 + 1) {
       const c = cards[a.id - ACTION.DISCARD0];
       const name = c ? ROLE_NAMES[c.type] : "card";
-      return { label: `Lose ${name}`, hint: "reveal this card", action: a.id, color: ROLE_COLORS[name as string] };
+      return { label: `Lose ${name}`, hint: "turn this card face up", action: a.id, color: ROLE_COLORS[name as string] };
     }
     return { label: a.label, action: a.id };
   });
 }
 
-export default function ActionPicker({ actions, onAction, players, phase, cards, coins, disabled, onTargetHover }: ActionPickerProps) {
+export default function ActionPicker({ actions, onAction, players, phase, cards, disabled, onTargetHover }: ActionPickerProps) {
   const [selected, setSelected] = useState(0);
   const [category, setCategory] = useState<Category | null>(null);
   const options = useMemo(() => buildOptions(actions, phase, category, players, cards), [actions, phase, category, players, cards]);
@@ -160,9 +160,6 @@ export default function ActionPicker({ actions, onAction, players, phase, cards,
             </button>
           )}
         </div>
-      )}
-      {phase === "action" && !category && coins >= 7 && coins < 10 && (
-        <div className="text-xs text-text-dim mb-1">You can afford a Coup.</div>
       )}
       <div className="grid gap-1" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }} role="group" aria-label="Your options">
         {options.map((opt, i) => {

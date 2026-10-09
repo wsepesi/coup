@@ -52,7 +52,8 @@ import {
 export const MAX_SEATS = 6;
 const NAME_MAX = 20;
 const HISTORY_TAIL = 40;
-const HISTORY_CAP = 3000;
+// Whole-game history (perfect recall). A 6-player MAX_TURNS game logs well under this.
+const HISTORY_CAP = 12000;
 const RESPONSE_TIMEOUT_MS = 20_000; // challenge/block windows for connected humans
 const AWAY_GRACE_MS = 30_000; // disconnected human is auto-played after this
 const LOBBY_DROP_MS = 60_000; // disconnected human is removed from the lobby after this
@@ -349,7 +350,7 @@ export class GameRoom implements DurableObject {
       const idx = gd.seats.findIndex((s) => s.cid === cid);
       if (idx >= 0 && !gd.seats[idx].left) {
         gd.seats[idx].left = true;
-        if (this.game!.isAlive(idx)) this.log(`${gd.seats[idx].name} left the game — a bot plays their cards.`, "info");
+        if (this.game!.isAlive(idx)) this.log(`${gd.seats[idx].name} left the game — a bot plays their cards.`, "info", idx);
         const humansRemaining = gd.seats.some((s) => s.cid && !s.left);
         if (!humansRemaining) {
           this.abortGame();
@@ -491,7 +492,7 @@ export class GameRoom implements DurableObject {
     const g = this.game!;
     const winner = g.winner();
     const names = gd.seats.map((s) => s.name);
-    this.log(`${names[winner] ?? "Nobody"} wins!`, "win");
+    this.log(`${names[winner] ?? "Nobody"} wins!`, "win", winner);
 
     const standings: GameResult["standings"] = [];
     // Survivors (normally just the winner; more only on the turn-limit tiebreak).
@@ -557,9 +558,9 @@ export class GameRoom implements DurableObject {
     this.broadcast();
   }
 
-  private log(text: string, kind: HistoryKind): void {
+  private log(text: string, kind: HistoryKind, seat?: number): void {
     const gd = this.room!.game!;
-    gd.history.push({ turn: gd.turn, text, kind });
+    gd.history.push(seat == null ? { turn: gd.turn, text, kind } : { turn: gd.turn, text, kind, seat });
     if (gd.history.length > HISTORY_CAP) gd.history.splice(0, gd.history.length - HISTORY_CAP);
   }
 
@@ -590,23 +591,25 @@ export class GameRoom implements DurableObject {
       gd.turnBlock = null;
       gd.turnBlockFailed = false;
       const t = actionTarget(action);
-      if (action === ACTION_INCOME) this.log(`${N(actor)} takes Income (+1).`, "action");
-      else if (action === ACTION_FOREIGN_AID) this.log(`${N(actor)} takes Foreign Aid.`, "action");
-      else if (action === ACTION_TAX) this.log(`${N(actor)} claims Duke to take Tax.`, "claim");
-      else if (action === ACTION_EXCHANGE) this.log(`${N(actor)} claims Ambassador to Exchange.`, "claim");
-      else if (isCoup(action)) this.log(`${N(actor)} pays 7 to Coup ${N(t!)}.`, "action");
-      else if (isSteal(action)) this.log(`${N(actor)} claims Captain to steal from ${N(t!)}.`, "claim");
-      else if (isAssassinate(action)) this.log(`${N(actor)} pays 3 and claims Assassin to assassinate ${N(t!)}.`, "claim");
+      if (action === ACTION_INCOME) this.log(`${N(actor)} takes Income (+1).`, "action", actor);
+      else if (action === ACTION_FOREIGN_AID) this.log(`${N(actor)} takes Foreign Aid.`, "action", actor);
+      else if (action === ACTION_TAX) this.log(`${N(actor)} claims Duke to take Tax.`, "claim", actor);
+      else if (action === ACTION_EXCHANGE) this.log(`${N(actor)} claims Ambassador to Exchange.`, "claim", actor);
+      else if (isCoup(action)) this.log(`${N(actor)} pays 7 to Coup ${N(t!)}.`, "action", actor);
+      else if (isSteal(action)) this.log(`${N(actor)} claims Captain to steal from ${N(t!)}.`, "claim", actor);
+      else if (isAssassinate(action)) this.log(`${N(actor)} pays 3 and claims Assassin to assassinate ${N(t!)}.`, "claim", actor);
       claim(actor, claimedRole(action));
     } else if (action === ACTION_CHALLENGE && phase === PHASE_CHALLENGE_ACTION) {
-      this.log(`${N(actor)} challenges ${N(tp)}'s ${CARD_NAMES[claimedRole(pending) ?? 0]}!`, "challenge");
+      this.log(`${N(actor)} challenges ${N(tp)}'s ${CARD_NAMES[claimedRole(pending) ?? 0]}!`, "challenge", actor);
     } else if (action === ACTION_CHALLENGE && phase === PHASE_CHALLENGE_BLOCK) {
-      this.log(`${N(actor)} challenges ${N(blocker)}'s ${CARD_NAMES[blockCard]} block!`, "challenge");
+      this.log(`${N(actor)} challenges ${N(blocker)}'s ${CARD_NAMES[blockCard]} block!`, "challenge", actor);
     } else if (isBlock(action)) {
       const role = blockRole(action)!;
-      this.log(`${N(actor)} blocks, claiming ${CARD_NAMES[role]}.`, "block");
+      this.log(`${N(actor)} blocks, claiming ${CARD_NAMES[role]}.`, "block", actor);
       claim(actor, role);
       gd.turnBlock = { seat: actor, card: role };
+    } else if (action === ACTION_PASS) {
+      this.log(`${N(actor)} passes.`, "pass", actor);
     }
 
     if (!g.step(action)) {
@@ -622,26 +625,26 @@ export class GameRoom implements DurableObject {
       const role = phase === PHASE_CHALLENGE_ACTION ? claimedRole(pending) ?? 0 : blockCard;
       const challengerLoses = g.phase() === PHASE_LOSE_CARD && g.activePlayer() === actor;
       if (challengerLoses) {
-        this.log(`${N(claimant)} reveals a ${CARD_NAMES[role]} — the challenge fails. It's shuffled back and replaced.`, "reveal");
+        this.log(`${N(claimant)} reveals a ${CARD_NAMES[role]} — the challenge fails. It's shuffled back and replaced.`, "reveal", claimant);
       } else {
         const refund = phase === PHASE_CHALLENGE_ACTION && isAssassinate(pending) && this.room!.rules.refundOnChallenge;
-        this.log(`${N(claimant)} was bluffing — no ${CARD_NAMES[role]}!${refund ? " The 3 coins are returned." : ""}`, "reveal");
+        this.log(`${N(claimant)} was bluffing — no ${CARD_NAMES[role]}!${refund ? " The 3 coins are returned." : ""}`, "reveal", claimant);
         if (phase === PHASE_CHALLENGE_BLOCK) gd.turnBlockFailed = true;
       }
     }
 
     for (let i = 0; i < n; i++) {
       for (const s of [0, 1] as const) {
-        if (aliveBefore[i][s] && !g.cardAlive(i, s)) this.log(`${N(i)} loses ${CARD_NAMES[g.cardType(i, s)]}.`, "lose");
+        if (aliveBefore[i][s] && !g.cardAlive(i, s)) this.log(`${N(i)} loses ${CARD_NAMES[g.cardType(i, s)]}.`, "lose", i);
       }
       if ((aliveBefore[i][0] || aliveBefore[i][1]) && !g.isAlive(i)) {
         gd.eliminated.push({ seat: i, turn: gd.turn });
-        this.log(`${N(i)} is out of the game.`, "elim");
+        this.log(`${N(i)} is out of the game.`, "elim", i);
       }
     }
 
     if (phase === PHASE_EXCHANGE_DISCARD && g.phase() !== PHASE_EXCHANGE_DISCARD) {
-      this.log(`${N(actor)} exchanged cards with the deck.`, "action");
+      this.log(`${N(actor)} exchanged cards with the deck.`, "action", actor);
     }
 
     // Turn resolved: summarize the outcome of the main action.
@@ -658,12 +661,12 @@ export class GameRoom implements DurableObject {
     const gained = g.coins(actor) - gd.turnCoins[actor];
     if (gd.turnBlock && !gd.turnBlockFailed) {
       const what = a === ACTION_FOREIGN_AID ? "Foreign Aid" : isSteal(a) ? "The steal" : isAssassinate(a) ? "The assassination" : "The action";
-      this.log(`${what} is blocked by ${N(gd.turnBlock.seat)}.`, "block");
+      this.log(`${what} is blocked by ${N(gd.turnBlock.seat)}.`, "block", actor);
       return;
     }
-    if ((a === ACTION_FOREIGN_AID || a === ACTION_TAX) && gained > 0) this.log(`${N(actor)} collects ${gained} coins.`, "action");
-    else if (isSteal(a) && gained > 0) this.log(`${N(actor)} steals ${gained} from ${N(actionTarget(a)!)}.`, "action");
-    else if (isSteal(a) && gd.turnCoins[actionTarget(a)!] === 0 && g.isAlive(actor)) this.log(`${N(actionTarget(a)!)} had nothing to steal.`, "info");
+    if ((a === ACTION_FOREIGN_AID || a === ACTION_TAX) && gained > 0) this.log(`${N(actor)} collects ${gained} coins.`, "action", actor);
+    else if (isSteal(a) && gained > 0) this.log(`${N(actor)} steals ${gained} from ${N(actionTarget(a)!)}.`, "action", actor);
+    else if (isSteal(a) && gd.turnCoins[actionTarget(a)!] === 0 && g.isAlive(actor)) this.log(`${N(actionTarget(a)!)} had nothing to steal.`, "info", actor);
   }
 
   // ---------------------------------------------------------------------------
@@ -733,12 +736,12 @@ export class GameRoom implements DurableObject {
     if (p.kind !== "bot") {
       // Response timer ran out (pass), or only one legal choice.
       action = valid.includes(ACTION_PASS) ? ACTION_PASS : valid[0];
-      if (p.kind === "timeout") this.log(`${gd.seats[active].name} ran out of time and passes.`, "info");
+      if (p.kind === "timeout") this.log(`${gd.seats[active].name} ran out of time.`, "info", active);
     } else {
       const s = gd.seats[active];
       action = chooseBotAction(s.bot ?? "medium", this.botView(active));
       if (!g.isValid(action)) action = valid.includes(ACTION_PASS) ? ACTION_PASS : valid[0];
-      if (s.cid && !s.left && phase === PHASE_MAIN_ACTION) this.log(`${s.name} is away — a bot is playing for them.`, "info");
+      if (s.cid && !s.left && phase === PHASE_MAIN_ACTION) this.log(`${s.name} is away — a bot is playing for them.`, "info", active);
     }
     this.apply(action);
     // Bots finish an exchange with their second discard right away.

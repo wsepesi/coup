@@ -4,7 +4,7 @@ import { useState, useCallback } from "react";
 import type { GameResult, LobbyView } from "@/lib/types";
 import { ROLE_NAMES, ROLE_COLORS } from "@/lib/constants";
 import { useKeyboard } from "@/hooks/useKeyboard";
-import { HistoryOverlay } from "./HistoryLog";
+import { HistoryOverlay } from "./HistoryPanel";
 
 interface GameOverProps {
   result: GameResult;
@@ -95,7 +95,13 @@ export default function GameOver({ result, lobby, youName, onRematch, onLobby, o
         </div>
       </div>
       {showHistory && (
-        <HistoryOverlay entries={result.history} onClose={() => setShowHistory(false)} onCopy={copyHistory} copied={copied} />
+        <HistoryOverlay
+          entries={result.history}
+          seats={[...result.standings].sort((a, b) => a.seat - b.seat).map((s) => ({ name: s.name, alive: s.alive }))}
+          onClose={() => setShowHistory(false)}
+          onCopy={copyHistory}
+          copied={copied}
+        />
       )}
     </main>
   );
