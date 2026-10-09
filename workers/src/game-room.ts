@@ -83,6 +83,12 @@ interface GameData {
   seats: GameSeat[];
   history: HistoryEntry[];
   claims: number[][];
+  /** Roles each seat currently claims to hold: claimed, and not since shown, caught bluffing, lost face up, or exchanged away. */
+  held?: number[][];
+  /** Cards seen going into the deck since anyone last drew from it (private: only `seat` saw them). */
+  shuffledIn?: { cards: number[]; seat: number; private: boolean; turn: number; via: "reveal" | "exchange" } | null;
+  /** Alive hand + drawn cards while an exchange is being resolved. */
+  exchangePool?: number[] | null;
   eliminated: { seat: number; turn: number }[];
   turn: number;
   /** Incremented on every applied action — identifies the current decision. */
@@ -458,6 +464,9 @@ export class GameRoom implements DurableObject {
       seats,
       history: [],
       claims: seats.map(() => []),
+      held: seats.map(() => []),
+      shuffledIn: null,
+      exchangePool: null,
       eliminated: [],
       turn: 0,
       step: 0,
@@ -579,9 +588,16 @@ export class GameRoom implements DurableObject {
     const blockCard = g.blockCard();
     const aliveBefore = Array.from({ length: n }, (_, i) => [g.cardAlive(i, 0), g.cardAlive(i, 1)]);
     const coinsBefore = Array.from({ length: n }, (_, i) => g.coins(i));
+    const held = (gd.held ??= gd.seats.map(() => []));
     const claim = (seat: number, role: number | null) => {
-      if (role != null && !gd.claims[seat].includes(role)) gd.claims[seat].push(role);
+      if (role == null) return;
+      if (!gd.claims[seat].includes(role)) gd.claims[seat].push(role);
+      if (!held[seat].includes(role)) held[seat].push(role);
     };
+    const unclaim = (seat: number, role: number) => {
+      held[seat] = held[seat].filter((r) => r !== role);
+    };
+    const handOf = (seat: number) => ([0, 1] as const).filter((s) => g.cardAlive(seat, s)).map((s) => g.cardType(seat, s));
 
     if (phase === PHASE_MAIN_ACTION) {
       gd.turn++;
@@ -624,7 +640,10 @@ export class GameRoom implements DurableObject {
       const claimant = phase === PHASE_CHALLENGE_ACTION ? tp : blocker;
       const role = phase === PHASE_CHALLENGE_ACTION ? claimedRole(pending) ?? 0 : blockCard;
       const challengerLoses = g.phase() === PHASE_LOSE_CARD && g.activePlayer() === actor;
+      unclaim(claimant, role);
       if (challengerLoses) {
+        // Shown, shuffled back, and a replacement drawn: the deck now holds a card everyone saw.
+        gd.shuffledIn = { cards: [role], seat: claimant, private: false, turn: gd.turn, via: "reveal" };
         this.log(`${N(claimant)} reveals a ${CARD_NAMES[role]} — the challenge fails. It's shuffled back and replaced.`, "reveal", claimant);
       } else {
         const refund = phase === PHASE_CHALLENGE_ACTION && isAssassinate(pending) && this.room!.rules.refundOnChallenge;
@@ -635,16 +654,34 @@ export class GameRoom implements DurableObject {
 
     for (let i = 0; i < n; i++) {
       for (const s of [0, 1] as const) {
-        if (aliveBefore[i][s] && !g.cardAlive(i, s)) this.log(`${N(i)} loses ${CARD_NAMES[g.cardType(i, s)]}.`, "lose", i);
+        if (aliveBefore[i][s] && !g.cardAlive(i, s)) {
+          this.log(`${N(i)} loses ${CARD_NAMES[g.cardType(i, s)]}.`, "lose", i);
+          unclaim(i, g.cardType(i, s));
+        }
       }
       if ((aliveBefore[i][0] || aliveBefore[i][1]) && !g.isAlive(i)) {
+        held[i] = [];
         gd.eliminated.push({ seat: i, turn: gd.turn });
         this.log(`${N(i)} is out of the game.`, "elim", i);
       }
     }
 
+    if (phase !== PHASE_EXCHANGE_DISCARD && g.phase() === PHASE_EXCHANGE_DISCARD) {
+      // Two cards drawn: whatever was known to be in the deck may be in a hand now.
+      const ex = g.activePlayer();
+      gd.shuffledIn = null;
+      gd.exchangePool = [...handOf(ex), ...g.exchangeCards()];
+    }
     if (phase === PHASE_EXCHANGE_DISCARD && g.phase() !== PHASE_EXCHANGE_DISCARD) {
       this.log(`${N(actor)} exchanged cards with the deck.`, "action", actor);
+      held[actor] = [];
+      const returned = [...(gd.exchangePool ?? [])];
+      for (const c of handOf(actor)) {
+        const k = returned.indexOf(c);
+        if (k >= 0) returned.splice(k, 1);
+      }
+      gd.shuffledIn = gd.exchangePool ? { cards: returned, seat: actor, private: true, turn: gd.turn, via: "exchange" } : null;
+      gd.exchangePool = null;
     }
 
     // Turn resolved: summarize the outcome of the main action.
@@ -900,7 +937,7 @@ export class GameRoom implements DurableObject {
         online,
         away: this.isAway(s),
         alive: g.isAlive(i),
-        claims: gd.claims[i].map((r) => CARD_NAMES[r]),
+        claims: (gd.held?.[i] ?? []).map((r) => CARD_NAMES[r]),
       };
     });
 
@@ -937,6 +974,9 @@ export class GameRoom implements DurableObject {
       history: gd.history.slice(histBase),
       historyBase: histBase,
       deck: g.deckTotal(),
+      shuffledIn: gd.shuffledIn && (!gd.shuffledIn.private || gd.shuffledIn.seat === you)
+        ? { cards: gd.shuffledIn.cards, seat: gd.shuffledIn.seat, turn: gd.shuffledIn.turn, via: gd.shuffledIn.via }
+        : undefined,
       turn: gd.turn,
       step: gd.step,
       isHost: !!cid && cid === room.hostCid,

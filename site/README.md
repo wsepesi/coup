@@ -36,7 +36,7 @@ src/
 
 ## Game screen principle
 
-Play like in person, with perfect recall. The table (`Table.tsx`) shows only what you'd see sitting there: coins, face-down cards, face-up lost cards, what each player said this turn, your own hand, the deck. The history (`HistoryPanel.tsx`) is the complete written record, as a transcript (**everything**) or one column per player (**swimlanes**); `H` switches. Don't add anything derived from the history (odds, card counting, claim tracking, threat labels): players do that reasoning themselves.
+Play like in person, with perfect recall. The table (`Table.tsx`) shows only what you'd see sitting there: coins, face-down cards, face-up lost cards, what each player said this turn, your own hand, the deck. Two recall aids, both kept by the server: under each seat, the roles that player currently claims (dropped when they show it, are caught bluffing it, lose it face up, or exchange); in the centre, the cards you saw go into the deck (a card shown to beat a challenge, or your own exchange returns), cleared on the next draw. The history (`HistoryPanel.tsx`) is the complete written record, oldest first, as a transcript (**everything**) or one column per player (**swimlanes**); `H` switches. Don't add anything else derived from the history (odds, card counting, threat labels): players do that reasoning themselves.
 
 ## Stack
 
