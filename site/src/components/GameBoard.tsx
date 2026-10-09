@@ -67,6 +67,7 @@ export default function GameBoard({ state, busy, onAction, onQuit, onRules }: Ga
               active={active}
               target={target}
               deck={deck}
+              shuffledIn={state.shuffledIn}
               turn={turn}
               turnEntries={turnEntries}
             />

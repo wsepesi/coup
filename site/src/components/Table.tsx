@@ -5,7 +5,9 @@ import { ROLE_NAMES, ROLE_COLORS } from "@/lib/constants";
 
 // What you'd see sitting at the table: each player's coins, face-down cards,
 // face-up (lost) cards, what they said this turn, plus your own hand, the
-// deck, and who the current action points at. Nothing inferred.
+// deck, and who the current action points at. Two recall aids the server
+// keeps: the roles each player currently claims, and the cards you saw go
+// into the deck since anyone last drew from it.
 
 interface TableProps {
   players: PlayerInfo[];
@@ -16,6 +18,7 @@ interface TableProps {
   /** Seat targeted by the pending action, if any. */
   target: number | null;
   deck: number;
+  shuffledIn?: { cards: number[]; seat: number; turn: number; via: "reveal" | "exchange" };
   turn: number;
   /** History of the current turn (for "passes", "blocks, claiming Duke" under each seat). */
   turnEntries: HistoryEntry[];
@@ -38,7 +41,7 @@ function lastWords(entries: HistoryEntry[], seat: number, name: string): string 
   return null;
 }
 
-export default function Table({ players, you, cards, turnPlayer, active, target, deck, turn, turnEntries }: TableProps) {
+export default function Table({ players, you, cards, turnPlayer, active, target, deck, shuffledIn, turn, turnEntries }: TableProps) {
   const n = players.length;
   const base = you >= 0 ? you : 0;
   const pos = players.map((_, s) => seatPosition((s - base + n) % n, n));
@@ -58,6 +61,22 @@ export default function Table({ players, you, cards, turnPlayer, active, target,
       <div className="absolute left-1/2 top-[46%] -translate-x-1/2 -translate-y-1/2 text-center text-xs text-text-dim leading-relaxed">
         <div>turn {turn}</div>
         <div><span aria-hidden>▮▮▮</span> deck {deck}</div>
+        {shuffledIn && shuffledIn.cards.length > 0 && (
+          <div className="mt-1 pt-1 border-t border-dotted border-border-term max-w-[12rem]">
+            <div className="text-[0.7rem]">shuffled in</div>
+            <div>
+              {shuffledIn.cards.map((t, i) => (
+                <span key={i}>
+                  {i > 0 && ", "}
+                  <span style={{ color: ROLE_COLORS[ROLE_NAMES[t]] }}>{ROLE_NAMES[t]}</span>
+                </span>
+              ))}
+            </div>
+            <div className="text-[0.7rem]">
+              T{shuffledIn.turn} · {shuffledIn.seat === you ? "your" : `${players[shuffledIn.seat]?.name}'s`} {shuffledIn.via}
+            </div>
+          </div>
+        )}
       </div>
 
       {players.map((p, s) => {
@@ -99,6 +118,14 @@ export default function Table({ players, you, cards, turnPlayer, active, target,
                     ))}
                   </>}
             </div>
+            {!dead && (
+              <div className="flex flex-wrap gap-x-1.5 mt-0.5 pt-0.5 border-t border-dotted border-border-term text-[0.7rem] sm:text-xs">
+                <span className="text-text-dim">claims</span>
+                {p.claims.length === 0
+                  ? <span className="text-text-dim">—</span>
+                  : p.claims.map((r) => <span key={r} style={{ color: ROLE_COLORS[r] }}>{r}</span>)}
+              </div>
+            )}
             {!dead && (said || s === active) && (
               <div className="text-text-dim text-[0.7rem] sm:text-xs truncate" title={said ?? undefined}>
                 {s === active ? "deciding…" : said}

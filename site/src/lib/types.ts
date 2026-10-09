@@ -60,6 +60,7 @@ export interface PlayerInfo {
   online: boolean;
   away: boolean;
   alive: boolean;
+  /** Roles this seat currently claims to hold (dropped when shown, caught bluffing, lost, or exchanged away). */
   claims: string[];
 }
 
@@ -86,6 +87,8 @@ export interface GameView {
   history: HistoryEntry[];
   historyBase: number;
   deck: number;
+  /** Cards you saw go into the deck since anyone last drew from it. */
+  shuffledIn?: { cards: number[]; seat: number; turn: number; via: "reveal" | "exchange" };
   turn: number;
   step: number;
   isHost: boolean;

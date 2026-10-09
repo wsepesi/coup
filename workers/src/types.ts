@@ -168,6 +168,7 @@ export interface PlayerView {
   /** Human seat currently auto-played (disconnected past grace, or left). */
   away: boolean;
   alive: boolean;
+  /** Roles this seat currently claims to hold (dropped when shown, caught bluffing, lost, or exchanged away). */
   claims: string[];
 }
 
@@ -194,6 +195,8 @@ export interface GameView {
   history: HistoryEntry[];
   historyBase: number;
   deck: number;
+  /** Cards you saw go into the deck since anyone last drew from it: a card shown to win a challenge (public) or your own exchange returns. */
+  shuffledIn?: { cards: number[]; seat: number; turn: number; via: "reveal" | "exchange" };
   turn: number;
   /** Decision counter; echo it with actions so stale clicks are ignored. */
   step: number;

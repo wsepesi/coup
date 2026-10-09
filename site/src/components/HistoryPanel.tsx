@@ -1,10 +1,10 @@
 "use client";
 
-import { useState, useEffect, useMemo, Fragment } from "react";
+import { useState, useEffect, useLayoutEffect, useMemo, useRef, Fragment } from "react";
 import type { HistoryEntry, HistoryKind } from "@/lib/types";
 
 // The table's perfect recall: every logged event, presented two ways.
-//   everything — the full written transcript, grouped by turn, newest first.
+//   everything — the full written transcript, grouped by turn, oldest first.
 //   swimlanes  — one column per player, one row per turn; each cell is what
 //                that player did during that turn (acted, passed, blocked,
 //                challenged, revealed, lost a card).
@@ -46,7 +46,7 @@ function groupByTurn(entries: HistoryEntry[]): Turn[] {
     if (last && last.turn === e.turn) last.entries.push(e);
     else turns.push({ turn: e.turn, entries: [e] });
   }
-  return turns.reverse(); // newest first
+  return turns; // oldest first; the panel keeps itself scrolled to the newest
 }
 
 /** "Theo passes." → "passes" when it sits in Theo's own column. */
@@ -59,7 +59,7 @@ function Everything({ turns }: { turns: Turn[] }) {
   return (
     <div className="px-3 py-1">
       {turns.map((t, i) => (
-        <div key={t.turn} className={`py-1.5 ${i > 0 ? "border-t border-dotted border-border-term/60" : ""} ${i === 0 ? "bg-selection-bg/20 -mx-3 px-3" : ""}`}>
+        <div key={t.turn} className={`py-1.5 ${i > 0 ? "border-t border-dotted border-border-term/60" : ""} ${i === turns.length - 1 ? "bg-selection-bg/20 -mx-3 px-3" : ""}`}>
           {t.entries.map((e, k) => (
             <div key={k} className="flex gap-2 text-xs sm:text-[0.8rem] leading-snug">
               <span className="w-7 shrink-0 text-right text-text-dim tabular-nums">{k === 0 ? (t.turn > 0 ? t.turn : "—") : ""}</span>
@@ -105,7 +105,7 @@ function Swimlanes({ turns, seats, you }: { turns: Turn[]; seats: Seat[]; you: n
         const actor = t.entries.find((e) => e.seat != null && (e.kind === "action" || e.kind === "claim"))?.seat;
         return (
           <Fragment key={t.turn}>
-            <div className={`grid border-b border-dotted border-border-term/60 ${ti === 0 ? "bg-selection-bg/20" : ""}`} style={{ gridTemplateColumns: cols }}>
+            <div className={`grid border-b border-dotted border-border-term/60 ${ti === turns.length - 1 ? "bg-selection-bg/20" : ""}`} style={{ gridTemplateColumns: cols }}>
               <span className="px-1.5 py-1.5 text-text-dim tabular-nums">{t.turn > 0 ? t.turn : "—"}</span>
               {bySeat.map((list, s) => (
                 <div key={s} className={`px-2 py-1.5 border-l border-border-term/50 ${s === actor ? "bg-selection-bg/40" : ""}`}>
@@ -145,6 +145,18 @@ export default function HistoryPanel({ entries, seats, you = -1, tab: tabProp, o
   const setTab = onTab ?? setOwn;
   const turns = useMemo(() => groupByTurn(entries), [entries]);
 
+  // Follow new events at the bottom, unless the reader has scrolled up.
+  const scroller = useRef<HTMLDivElement>(null);
+  const following = useRef(true);
+  const onScroll = () => {
+    const el = scroller.current;
+    if (el) following.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
+  useLayoutEffect(() => {
+    const el = scroller.current;
+    if (el && following.current) el.scrollTop = el.scrollHeight;
+  }, [entries, tab]);
+
   // H flips between the two views.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -175,10 +187,10 @@ export default function HistoryPanel({ entries, seats, you = -1, tab: tabProp, o
         ))}
         <span className="ml-auto flex items-center gap-2 px-2 text-text-dim">
           {toolbar}
-          <span className="hidden sm:inline">newest first · H to switch</span>
+          <span className="hidden sm:inline">oldest first · H to switch</span>
         </span>
       </div>
-      <div className="flex-1 min-h-0 overflow-auto" role="tabpanel" aria-live="polite" aria-relevant="additions">
+      <div ref={scroller} onScroll={onScroll} className="flex-1 min-h-0 overflow-auto" role="tabpanel" aria-live="polite" aria-relevant="additions">
         {entries.length === 0 ? (
           <div className="p-3 text-text-dim text-sm">Game starting…</div>
         ) : tab === "everything" ? (
