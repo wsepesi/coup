@@ -50,9 +50,12 @@ add_subdirectory("${OS}" "${CMAKE_CURRENT_BINARY_DIR}/open_spiel" EXCLUDE_FROM_A
 # ---------------------------------------------------------------------------
 # The one and only rules engine: c_engine/coup_core.c, compiled as C.
 # ---------------------------------------------------------------------------
-add_library(coup_core STATIC ${C_ENGINE_DIR}/coup_core.c)
+# coup_search.c is the opt-in search API (public state, hand space,
+# resampler); the adapter uses its event recorder and resampler.
+add_library(coup_core STATIC ${C_ENGINE_DIR}/coup_core.c ${C_ENGINE_DIR}/coup_search.c)
 target_include_directories(coup_core PUBLIC ${C_ENGINE_DIR})
-set_source_files_properties(${C_ENGINE_DIR}/coup_core.c PROPERTIES LANGUAGE C)
+set_source_files_properties(${C_ENGINE_DIR}/coup_core.c ${C_ENGINE_DIR}/coup_search.c
+  PROPERTIES LANGUAGE C)
 
 # ---------------------------------------------------------------------------
 # OpenSpiel adapter (registers the game "coup").
@@ -114,7 +117,7 @@ if(COUP_BUILD_PYSPIEL)
       "the pyspiel target (is OPEN_SPIEL_BUILD_WITH_PYTHON=OFF in the env?)")
   endif()
   add_library(coup_game_pyobj OBJECT coup_game.cc
-    ${C_ENGINE_DIR}/coup_core.c)
+    ${C_ENGINE_DIR}/coup_core.c ${C_ENGINE_DIR}/coup_search.c)
   target_include_directories(coup_game_pyobj PRIVATE
     ${OPEN_SPIEL_DIR} ${OS}/abseil-cpp ${OS}/json/include ${C_ENGINE_DIR})
   target_sources(pyspiel PRIVATE $<TARGET_OBJECTS:coup_game_pyobj>)

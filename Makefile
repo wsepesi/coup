@@ -3,12 +3,14 @@
 # Flags for the C test targets (override for sanitizer runs, see test-san)
 CTESTFLAGS ?= -O2 -std=c11 -Wall -Wextra
 
-# C engine tests
+# C engine tests (core, PRNG, search API)
 test-c:
 	cc $(CTESTFLAGS) -o c_engine/test_core c_engine/test_core.c c_engine/coup_core.c -I c_engine/ -lm
 	./c_engine/test_core
 	cc $(CTESTFLAGS) -o c_engine/test_prng c_engine/test_prng.c -I c_engine/
 	./c_engine/test_prng
+	cc $(CTESTFLAGS) -o c_engine/test_search c_engine/test_search.c c_engine/coup_search.c c_engine/coup_core.c -I c_engine/ -lm
+	./c_engine/test_search
 
 # Text renderer tests
 test-text:
@@ -104,7 +106,7 @@ bench:
 
 # Clean build artifacts
 clean:
-	rm -f c_engine/test_core c_engine/test_prng c_engine/test_text_render c_engine/*.o profiling/bench_c
+	rm -f c_engine/test_core c_engine/test_prng c_engine/test_search c_engine/test_text_render c_engine/*.o profiling/bench_c
 	rm -f puffer/test_coup_env puffer/test_coup_env_bench
 	rm -rf cpp_engine/build cpp_engine/build-py
 	find . -name "__pycache__" -type d -exec rm -rf {} +

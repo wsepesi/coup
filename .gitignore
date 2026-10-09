@@ -15,6 +15,7 @@ __pycache__/
 # C/C++ test binaries
 c_engine/test_core
 c_engine/test_prng
+c_engine/test_search
 c_engine/test_text_render
 cpp_engine/build/
 
